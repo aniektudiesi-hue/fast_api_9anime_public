@@ -1,5 +1,7 @@
 fastapi
-beautifulsoup4
-httpx
-lxml
 uvicorn
+httpx[http2]
+selectolax
+brotli
+lxml
+python-multipart
