@@ -26,7 +26,7 @@ class ORJSONResponse(JSONResponse):
 app = FastAPI(
     title="Hyper-Optimized 9Anime Scraper",
     description="Ultra-low latency scraping API targeting sub-millisecond responses.",
-    version="3.0.0",
+    version="3.1.0",
     default_response_class=ORJSONResponse
 )
 
@@ -90,6 +90,7 @@ class SimpleCache:
 # Initialize caches for different endpoints
 search_cache = SimpleCache(ttl=600)  # 10 mins
 episode_cache = SimpleCache(ttl=300) # 5 mins
+suggest_cache = SimpleCache(ttl=600) # 10 mins
 
 # =========================
 # 🔹 MIDDLEWARE FOR LATENCY TRACKING
@@ -173,6 +174,22 @@ async def get_episodes_logic(anime_id: str) -> List[Dict[str, str]]:
     episode_cache.set(anime_id, results)
     return results
 
+async def get_suggestions_logic(query: str) -> List[Dict[str, Any]]:
+    cached = suggest_cache.get(query)
+    if cached: return cached
+
+    encoded_query = quote(query.strip())
+    url = f"{BASE_URL_9ANIME}/ajax/search/suggest?keyword={encoded_query}"
+    
+    data = await fetch_with_retry(url, is_json=True)
+    if not data or "result" not in data:
+        return []
+
+    # The suggestion API returns a list of objects with title, image, and link
+    results = data.get("result", [])
+    suggest_cache.set(query, results)
+    return results
+
 # =========================
 # 🔹 ROUTES
 # =========================
@@ -187,6 +204,18 @@ async def search(query: str):
         "status": "success",
         "latency_ms": f"{latency_ms:.3f}", # More precision
         "results_found": len(results),
+        "results": results
+    }
+
+@app.get("/suggest/{query}")
+async def suggest(query: str):
+    start_time = time.perf_counter()
+    results = await get_suggestions_logic(query)
+    latency_ms = (time.perf_counter() - start_time) * 1000
+    
+    return {
+        "status": "success",
+        "latency_ms": f"{latency_ms:.3f}",
         "results": results
     }
 
@@ -211,8 +240,29 @@ async def health_check():
     return {"status": "healthy", "timestamp": time.time()}
 
 # =========================
+# 🔹 BACKGROUND WARMING
+# =========================
+async def warm_cache():
+    """Pre-scrape popular titles to make first search instant for most users"""
+    popular_titles = ["Naruto", "One Piece", "Bleach", "Dragon Ball", "Jujutsu Kaisen", "Solo Leveling"]
+    logger.info(f"Starting background cache warming for {len(popular_titles)} titles...")
+    for title in popular_titles:
+        try:
+            await search_anime_logic(title)
+            await get_suggestions_logic(title)
+            logger.info(f"Warmed cache for: {title}")
+            await asyncio.sleep(1) # Be nice to the source
+        except Exception as e:
+            logger.error(f"Warming failed for {title}: {e}")
+
+# =========================
 # 🔹 LIFECYCLE
 # =========================
+
+@app.on_event("startup")
+async def startup():
+    # Start cache warming in the background
+    asyncio.create_task(warm_cache())
 
 @app.on_event("shutdown")
 async def shutdown():
