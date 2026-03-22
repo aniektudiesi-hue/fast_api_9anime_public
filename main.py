@@ -1,10 +1,19 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 from httpx import AsyncClient, Timeout
 import asyncio
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev ke liye
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 🔥 Global HTTP Client (connection pooling = FAST)
 client = AsyncClient(
