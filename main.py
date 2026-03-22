@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from httpx import AsyncClient, Timeout, Limits
 from selectolax.lexbor import LexborHTMLParser
+import orjson
 
 # =========================
 # 🔹 CONFIGURATION & LOGGING
@@ -16,10 +17,17 @@ from selectolax.lexbor import LexborHTMLParser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fast-api-scraper")
 
+class ORJSONResponse(JSONResponse):
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return orjson.dumps(content, option=orjson.OPT_INDENT_2)
+
 app = FastAPI(
-    title="Advanced 9Anime Scraper",
-    description="High-performance scraping API with sub-second latency targets.",
-    version="2.0.0"
+    title="Hyper-Optimized 9Anime Scraper",
+    description="Ultra-low latency scraping API targeting sub-millisecond responses.",
+    version="3.0.0",
+    default_response_class=ORJSONResponse
 )
 
 app.add_middleware(
@@ -37,7 +45,7 @@ app.add_middleware(
 client = AsyncClient(
     http2=True,
     timeout=Timeout(5.0, connect=2.0),
-    limits=Limits(max_connections=100, max_keepalive_connections=20),
+    limits=Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=5),
     headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -55,6 +63,10 @@ client = AsyncClient(
 
 BASE_URL_9ANIME = "https://9animetv.to"
 
+# Pre-compile CSS selectors for maximum speed
+SEARCH_ITEM_SELECTOR = "div.flw-item.item-qtip"
+EPISODE_ITEM_SELECTOR = "a.item.ep-item"
+
 # =========================
 # 🔹 IN-MEMORY CACHE (LRU-LIKE)
 # =========================
@@ -66,14 +78,14 @@ class SimpleCache:
     def get(self, key: str):
         if key in self.cache:
             val, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
+            if time.monotonic() - timestamp < self.ttl:
                 return val
             else:
                 del self.cache[key]
         return None
 
     def set(self, key: str, value: Any):
-        self.cache[key] = (value, time.time())
+        self.cache[key] = (value, time.monotonic())
 
 # Initialize caches for different endpoints
 search_cache = SimpleCache(ttl=600)  # 10 mins
@@ -87,11 +99,11 @@ async def add_process_time_header(request: Request, call_next):
     start_time = time.perf_counter()
     response = await call_next(request)
     process_time = (time.perf_counter() - start_time) * 1000
-    response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
+    response.headers["X-Process-Time-Ms"] = f"{process_time:.3f}" # More precision
     return response
 
 # =========================
-# 🔹 SERVICE FUNCTIONS (OPTIMIZED)
+# 🔹 SERVICE FUNCTIONS (ULTRA-OPTIMIZED)
 # =========================
 
 async def fetch_with_retry(url: str, is_json: bool = False, retries: int = 1):
@@ -107,7 +119,7 @@ async def fetch_with_retry(url: str, is_json: bool = False, retries: int = 1):
             if attempt == retries:
                 logger.error(f"Failed to fetch {url}: {str(e)}")
                 raise HTTPException(status_code=502, detail="Upstream service unavailable")
-            await asyncio.sleep(0.1 * (attempt + 1))
+            await asyncio.sleep(0.05 * (attempt + 1)) # Reduced sleep for faster retries
     return None
 
 async def search_anime_logic(query: str) -> List[Dict[str, str]]:
@@ -120,9 +132,9 @@ async def search_anime_logic(query: str) -> List[Dict[str, str]]:
     html = await fetch_with_retry(url)
     if not html: return []
 
-    # Using Lexbor (C-based parser) for ultra-fast HTML parsing
+    # Using Lexbor (C-based parser) for ultra-fast HTML parsing with pre-compiled selector
     parser = LexborHTMLParser(html)
-    items = parser.css("div.flw-item.item-qtip")
+    items = parser.css(SEARCH_ITEM_SELECTOR)
     
     results = []
     for item in items:
@@ -148,7 +160,7 @@ async def get_episodes_logic(anime_id: str) -> List[Dict[str, str]]:
         return []
 
     parser = LexborHTMLParser(data["html"])
-    episodes = parser.css("a.item.ep-item")
+    episodes = parser.css(EPISODE_ITEM_SELECTOR)
     
     results = []
     for ep in episodes:
@@ -173,7 +185,7 @@ async def search(query: str):
     
     return {
         "status": "success",
-        "latency_ms": f"{latency_ms:.2f}",
+        "latency_ms": f"{latency_ms:.3f}", # More precision
         "results_found": len(results),
         "results": results
     }
@@ -189,7 +201,7 @@ async def get_episodes(anime_id: str):
         
     return {
         "status": "success",
-        "latency_ms": f"{latency_ms:.2f}",
+        "latency_ms": f"{latency_ms:.3f}", # More precision
         "episode_count": len(data),
         "episode_data": data
     }

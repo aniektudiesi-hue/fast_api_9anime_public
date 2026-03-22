@@ -5,3 +5,4 @@ selectolax
 brotli
 lxml
 python-multipart
+orjson
