@@ -355,18 +355,36 @@ def parse_episodes(html: str) -> List[Dict]:
 
 def parse_home(html: str) -> Dict:
     parser = LexborHTMLParser(html)
-    trending = []
+    thumbs: List[str] = []
+    heroes: List[str] = []
+    trending: List[Dict] = []
+
+    for img in parser.css("img.film-poster-img"):
+        a = img.attributes
+        if a.get("data-src"):
+            thumbs.append(a["data-src"])
+        if a.get("src"):
+            heroes.append(a["src"])
+
     for item in parser.css("div.flw-item"):
         img = item.css_first("img")
         if not img: continue
+        a = img.attributes
+        title = a.get("alt", "").strip()
         anime_id = item.attributes.get("data-id", "")
-        if anime_id:
+        if title and anime_id:
             trending.append({
                 "anime_id": anime_id,
-                "title": img.attributes.get("alt", "").strip(),
-                "poster": img.attributes.get("data-src") or img.attributes.get("src") or "",
+                "title": title,
+                "poster": a.get("data-src") or a.get("src") or "",
             })
-    return {"trending": trending}
+
+    return {
+        "thumbnails": thumbs,
+        "hero_thumbnails": heroes,
+        "trending": trending,
+        "count": len(thumbs),
+    }
 
 def parse_server_id(html: str, sub: str) -> Optional[str]:
     for s in LexborHTMLParser(html).css("div.item.server-item"):
