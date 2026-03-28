@@ -1,689 +1,568 @@
+"""
+RO-Anime API v9.0 - "Unified Edition"
+=====================================
+Industry-grade, high-performance backend architecture merging v7 & v8.
+
+Key Features:
+1.  Engine: `msgspec` for ultra-fast JSON serialization/deserialization.
+2.  Caching: Multi-layer "Smart Cache" with Stale-While-Revalidate (SWR) & O(1) LRU.
+3.  Resilience: 12 retry attempts, smart backoff, 5 rotating browser profiles.
+4.  Concurrency: Robust request coalescing (asyncio.Event) & Upstream Semaphore.
+5.  CPU-Offloading: HTML parsing in ThreadPoolExecutor.
+6.  Observability: Structured JSON logging & detailed performance metrics.
+7.  Security: Per-IP sliding window rate limiter (O(1) deque).
+"""
+
 import asyncio
-import time
 import logging
 import random
-from typing import List, Dict, Any, Optional
-from urllib.parse import quote
-from collections import OrderedDict, defaultdict
+import time
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, Query
+import msgspec
+import uvloop
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
-from httpx import AsyncClient, Timeout, Limits, HTTPStatusError
+from httpx import AsyncClient, HTTPStatusError, Limits, Timeout
 from selectolax.lexbor import LexborHTMLParser
-import orjson
 
-# =========================
-# 🔹 LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-)
-logger = logging.getLogger("ro-anime-api")
+# ──────────────────────────────────────────────
+# CONFIGURATION & CONSTANTS
+# ──────────────────────────────────────────────
+BASE_URL = "https://9animetv.to"
+UPSTREAM_CONCURRENCY = 15
+CACHE_MAX_SIZE = 5000
+PARSER_WORKERS = 4
 
+# TTLs in seconds
+TTL = {
+    "search": 600,
+    "episode": 300,
+    "suggest": 600,
+    "home": 180,
+    "stream": 120,
+}
 
-# =========================
-# 🔹 ORJSON RESPONSE
-# =========================
-class ORJSONResponse(JSONResponse):
-    media_type = "application/json"
+# ──────────────────────────────────────────────
+# STRUCTURED LOGGING
+# ──────────────────────────────────────────────
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_record["exception"] = self.formatException(record.exc_info)
+        return msgspec.json.encode(log_record).decode()
 
-    def render(self, content: Any) -> bytes:
-        return orjson.dumps(content)
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+logger = logging.getLogger("ro-anime-v9")
 
+# ──────────────────────────────────────────────
+# MODELS (msgspec for speed)
+# ──────────────────────────────────────────────
+class AnimeBase(msgspec.Struct):
+    anime_id: str
+    title: str
+    poster: str
 
-# =========================
-# 🔹 BROWSER FINGERPRINT PROFILES
-# Real Chrome/Edge/Firefox UA + matching sec-ch-ua headers
-# Rotating these prevents fingerprint-based blocks
-# =========================
+class Episode(msgspec.Struct):
+    episode_number: str
+    episode_id: str
+    title: str
+
+class StreamInfo(msgspec.Struct):
+    url: str
+    source: str
+    server_id: Optional[str] = None
+
+# ──────────────────────────────────────────────
+# BROWSER PROFILES (Restored from v7)
+# ──────────────────────────────────────────────
 BROWSER_PROFILES = [
     {
-        # Chrome 124 on Windows
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
     },
     {
-        # Chrome 123 on macOS
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "sec-ch-ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"macOS"',
     },
     {
-        # Edge 124 on Windows
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
         "sec-ch-ua": '"Chromium";v="124", "Microsoft Edge";v="124", "Not-A.Brand";v="99"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
     },
     {
-        # Firefox 125 on Windows
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
-            "Gecko/20100101 Firefox/125.0"
-        ),
-        "sec-ch-ua": "",          # Firefox doesn't send sec-ch-ua
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "sec-ch-ua": "",
         "sec-ch-ua-mobile": "",
         "sec-ch-ua-platform": "",
     },
     {
-        # Chrome 122 on Linux
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "sec-ch-ua": '"Chromium";v="122", "Google Chrome";v="122", "Not(A:Brand";v="24"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Linux"',
     },
 ]
 
-# Static headers that never change (full browser simulation)
-STATIC_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-    "DNT": "1",
-}
+# ──────────────────────────────────────────────
+# SMART CACHE (O(1) LRU + SWR)
+# ──────────────────────────────────────────────
+class SmartCache:
+    def __init__(self, max_size: int = 5000):
+        self._store: OrderedDict[str, Tuple[Any, float, float]] = OrderedDict()
+        self._max = max_size
+        self.hits = self.misses = self.swr_hits = 0
 
-STATIC_HEADERS_JSON = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "X-Requested-With": "XMLHttpRequest",
-    "DNT": "1",
-}
+    def get(self, key: str) -> Tuple[Optional[Any], bool]:
+        """Returns (value, is_stale)"""
+        entry = self._store.get(key)
+        if entry is None:
+            self.misses += 1
+            return None, False
+        
+        value, expires_at, stale_at = entry
+        now = time.monotonic()
+        
+        if now > stale_at:
+            self._store.pop(key, None)
+            self.misses += 1
+            return None, False
+        
+        self._store.move_to_end(key)
+        if now > expires_at:
+            self.swr_hits += 1
+            return value, True
+        
+        self.hits += 1
+        return value, False
 
-
-def _build_headers(for_json: bool = False, profile_idx: Optional[int] = None) -> Dict[str, str]:
-    """Assemble full browser-grade headers with a chosen (or random) UA profile."""
-    idx = profile_idx if profile_idx is not None else random.randint(0, len(BROWSER_PROFILES) - 1)
-    profile = BROWSER_PROFILES[idx]
-    base = STATIC_HEADERS_JSON.copy() if for_json else STATIC_HEADERS.copy()
-    base["User-Agent"] = profile["User-Agent"]
-    # Only add sec-ch-ua headers when non-empty (Firefox omits them)
-    for k in ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"):
-        if profile.get(k):
-            base[k] = profile[k]
-    return base
-
-
-# =========================
-# 🔹 LRU + TTL CACHE
-# =========================
-class LRUCache:
-    def __init__(self, ttl: int = 300, max_size: int = 1000):
-        self.cache: OrderedDict = OrderedDict()
-        self.ttl = ttl
-        self.max_size = max_size
-        self.hits = 0
-        self.misses = 0
-
-    def get(self, key: str) -> Optional[Any]:
-        if key in self.cache:
-            value, ts = self.cache.pop(key)
-            if time.monotonic() - ts < self.ttl:
-                self.cache[key] = (value, ts)
-                self.hits += 1
-                return value
-        self.misses += 1
-        return None
-
-    def set(self, key: str, value: Any) -> None:
-        if key in self.cache:
-            self.cache.pop(key)
-        elif len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)
-        self.cache[key] = (value, time.monotonic())
-
-    def delete(self, key: str) -> None:
-        self.cache.pop(key, None)
-
-    def clear(self) -> None:
-        self.cache.clear()
-
-    @property
-    def size(self) -> int:
-        return len(self.cache)
+    def set(self, key: str, value: Any, ttl: int) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+        elif len(self._store) >= self._max:
+            self._store.popitem(last=False)
+        
+        now = time.monotonic()
+        # SWR: Allow stale data for up to 2x TTL
+        self._store[key] = (value, now + ttl, now + (ttl * 2))
 
     def stats(self) -> Dict:
-        total = self.hits + self.misses
+        total = self.hits + self.misses + self.swr_hits
         return {
-            "size": self.size,
-            "max_size": self.max_size,
-            "ttl_seconds": self.ttl,
+            "size": len(self._store),
             "hits": self.hits,
+            "swr_hits": self.swr_hits,
             "misses": self.misses,
-            "hit_rate": round(self.hits / total, 3) if total else 0.0,
+            "hit_rate": round((self.hits + self.swr_hits) / total, 3) if total else 0.0,
         }
 
+cache = SmartCache(max_size=CACHE_MAX_SIZE)
 
-# =========================
-# 🔹 RATE LIMITER
-# =========================
-class SlidingWindowRateLimiter:
-    def __init__(self, max_requests: int = 200, window_seconds: int = 60):
-        self.max_requests = max_requests
-        self.window = window_seconds
-        self._buckets: Dict[str, List[float]] = defaultdict(list)
+# ──────────────────────────────────────────────
+# RATE LIMITER (Restored from v7)
+# ──────────────────────────────────────────────
+class RateLimiter:
+    def __init__(self, max_req: int = 200, window: int = 60) -> None:
+        self._max = max_req
+        self._window = window
+        self._buckets: Dict[str, deque] = {}
 
     def is_allowed(self, ip: str) -> bool:
         now = time.monotonic()
-        window_start = now - self.window
-        self._buckets[ip] = [t for t in self._buckets[ip] if t > window_start]
-        if len(self._buckets[ip]) >= self.max_requests:
+        cutoff = now - self._window
+        if ip not in self._buckets:
+            self._buckets[ip] = deque()
+        dq = self._buckets[ip]
+        while dq and dq[0] <= cutoff:
+            dq.popleft()
+        if len(dq) >= self._max:
             return False
-        self._buckets[ip].append(now)
+        dq.append(now)
         return True
 
-    def cleanup(self) -> None:
-        now = time.monotonic()
-        cutoff = now - self.window
-        stale = [ip for ip, ts in self._buckets.items() if not any(t > cutoff for t in ts)]
-        for ip in stale:
-            del self._buckets[ip]
+rate_limiter = RateLimiter()
 
+# ──────────────────────────────────────────────
+# RESILIENCE: CIRCUIT BREAKER
+# ──────────────────────────────────────────────
+class CircuitBreaker:
+    def __init__(self, threshold: int = 10, recovery_time: int = 30):
+        self.threshold = threshold
+        self.recovery_time = recovery_time
+        self.failures = 0
+        self.state = "CLOSED"
+        self.last_failure_time = 0
 
-# =========================
-# 🔹 INSTANCES
-# =========================
-search_cache  = LRUCache(ttl=600,  max_size=1000)
-episode_cache = LRUCache(ttl=300,  max_size=500)
-suggest_cache = LRUCache(ttl=600,  max_size=1000)
-home_cache    = LRUCache(ttl=180,  max_size=10)
-stream_cache  = LRUCache(ttl=120,  max_size=500)
+    def allow(self) -> bool:
+        if self.state == "OPEN":
+            if time.monotonic() - self.last_failure_time > self.recovery_time:
+                self.state = "HALF-OPEN"
+                return True
+            return False
+        return True
 
-rate_limiter = SlidingWindowRateLimiter(max_requests=200, window_seconds=60)
+    def record_success(self):
+        self.failures = 0
+        self.state = "CLOSED"
 
-BASE_URL = "https://9animetv.to"
+    def record_failure(self):
+        self.failures += 1
+        self.last_failure_time = time.monotonic()
+        if self.failures >= self.threshold:
+            self.state = "OPEN"
+            logger.error(f"Circuit Breaker OPENED after {self.failures} failures")
 
+breaker = CircuitBreaker()
 
-# =========================
-# 🔹 HTTP CLIENT POOL
-# Multiple clients so we can rotate per retry (different TCP fingerprint)
-# =========================
-_clients: List[AsyncClient] = []
-_client_idx = 0
+# ──────────────────────────────────────────────
+# HTTP CLIENT & CONCURRENCY
+# ──────────────────────────────────────────────
+class HttpClient:
+    def __init__(self):
+        self.client: Optional[AsyncClient] = None
+        self.semaphore = asyncio.Semaphore(UPSTREAM_CONCURRENCY)
+        self.inflight: Dict[str, asyncio.Event] = {}
+        self.inflight_results: Dict[str, Any] = {}
+        self.inflight_errors: Dict[str, Exception] = {}
 
-def _make_client() -> AsyncClient:
-    return AsyncClient(
-        http2=True,
-        timeout=Timeout(12.0, connect=5.0),
-        limits=Limits(max_connections=200, max_keepalive_connections=60),
-        follow_redirects=True,
-        verify=True,          # keep TLS verification — dropping it is suspicious
-    )
-
-def get_client(rotate: bool = False) -> AsyncClient:
-    """Return a client from the pool, optionally rotating to the next one."""
-    global _client_idx
-    if len(_clients) < 3:
-        while len(_clients) < 3:
-            _clients.append(_make_client())
-    if rotate:
-        _client_idx = (_client_idx + 1) % len(_clients)
-    client = _clients[_client_idx]
-    if client.is_closed:
-        _clients[_client_idx] = _make_client()
-        client = _clients[_client_idx]
-    return client
-
-
-# =========================
-# 🔹 LIFESPAN
-# =========================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting up — warming cache...")
-    asyncio.create_task(warm_cache())
-    asyncio.create_task(periodic_cleanup())
-    yield
-    logger.info("Shutting down — closing HTTP clients...")
-    for c in _clients:
-        if not c.is_closed:
-            await c.aclose()
-
-
-# =========================
-# 🔹 APP
-# =========================
-app = FastAPI(
-    title="RO-Anime API",
-    version="6.0.0",
-    description="High-reliability async scraper for 9AnimeTV",
-    default_response_class=ORJSONResponse,
-    lifespan=lifespan,
-)
-
-app.add_middleware(GZipMiddleware, minimum_size=512)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
-
-
-# =========================
-# 🔹 MIDDLEWARE
-# =========================
-@app.middleware("http")
-async def request_middleware(request: Request, call_next):
-    ip = request.client.host if request.client else "unknown"
-    if not rate_limiter.is_allowed(ip):
-        return ORJSONResponse(
-            {"error": "Too many requests", "retry_after": 60},
-            status_code=429,
-            headers={"Retry-After": "60"},
+    async def start(self):
+        self.client = AsyncClient(
+            http2=True,
+            timeout=Timeout(12.0, connect=5.0),
+            limits=Limits(max_connections=200, max_keepalive_connections=50),
+            follow_redirects=True,
         )
-    start = time.perf_counter()
-    response = await call_next(request)
-    ms = (time.perf_counter() - start) * 1000
-    response.headers["X-Process-Time-Ms"] = f"{ms:.2f}"
-    response.headers["X-Powered-By"] = "RO-Anime/6.0"
-    return response
 
+    async def stop(self):
+        if self.client:
+            await self.client.aclose()
 
-# =========================
-# 🔹 CORE FETCH — RETRY UNTIL SUCCESS
-#
-# Strategy:
-#   • First 3 attempts: exponential backoff (0.3s → 0.6s → 1.2s) + jitter
-#   • Attempts 4-6:     rotate UA profile + rotate HTTP client
-#   • Attempt 7+:       longer pause (3-6s) before retrying — avoids ban
-#   • 403/404:          fail immediately (no point retrying)
-#   • No hard cap:      keeps trying until `max_attempts` (default 15)
-#     which practically = ~100% success for transient failures
-# =========================
-async def fetch_html(
-    url: str,
-    max_attempts: int = 15,
-    referer: str = BASE_URL,
-) -> str:
-    last_exc = None
-    for attempt in range(max_attempts):
-        rotate = attempt >= 3          # rotate UA+client after 3 failures
-        client = get_client(rotate=rotate)
-        profile_idx = attempt % len(BROWSER_PROFILES)
-        headers = _build_headers(for_json=False, profile_idx=profile_idx)
-        headers["Referer"] = referer
+    async def fetch(self, url: str, referer: str = BASE_URL, is_json: bool = False) -> Any:
+        if not breaker.allow():
+            raise HTTPException(503, "Upstream circuit open")
+
+        # Request Coalescing (Restored from v7)
+        if url in self.inflight:
+            event = self.inflight[url]
+            await event.wait()
+            if url in self.inflight_errors:
+                raise self.inflight_errors[url]
+            return self.inflight_results[url]
+
+        event = asyncio.Event()
+        self.inflight[url] = event
 
         try:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            if attempt > 0:
-                logger.info(f"✅ fetch_html succeeded on attempt {attempt + 1}: {url}")
-            return resp.text
-
-        except HTTPStatusError as e:
-            status = e.response.status_code
-            logger.warning(f"HTTP {status} on attempt {attempt + 1} for {url}")
-            if status in (403, 404):
-                raise HTTPException(status, "Upstream returned error")
-            last_exc = e
-
+            result = await self._do_fetch(url, referer, is_json)
+            self.inflight_results[url] = result
+            breaker.record_success()
+            return result
         except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed ({url}): {type(e).__name__}: {e}")
-            last_exc = e
+            self.inflight_errors[url] = e
+            breaker.record_failure()
+            raise
+        finally:
+            event.set()
+            async def _cleanup():
+                await asyncio.sleep(0.1)
+                self.inflight.pop(url, None)
+                self.inflight_results.pop(url, None)
+                self.inflight_errors.pop(url, None)
+            asyncio.create_task(_cleanup())
 
-        # ── Backoff ──
-        if attempt < 3:
-            delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
-        elif attempt < 7:
-            delay = 1.5 + random.uniform(0, 0.5)
-        else:
-            delay = 3.0 + random.uniform(0, 3.0)   # long pause for stubborn blocks
+    async def _do_fetch(self, url: str, referer: str, is_json: bool) -> Any:
+        for attempt in range(12): # 12 attempts from v7
+            profile = BROWSER_PROFILES[attempt % len(BROWSER_PROFILES)]
+            headers = {
+                "User-Agent": profile["User-Agent"],
+                "Referer": referer,
+                "Accept-Encoding": "gzip, deflate, br",
+            }
+            if profile.get("sec-ch-ua"):
+                headers["sec-ch-ua"] = profile["sec-ch-ua"]
+                headers["sec-ch-ua-mobile"] = profile["sec-ch-ua-mobile"]
+                headers["sec-ch-ua-platform"] = profile["sec-ch-ua-platform"]
 
-        logger.info(f"Retrying in {delay:.2f}s (attempt {attempt + 2}/{max_attempts})...")
-        await asyncio.sleep(delay)
+            try:
+                async with self.semaphore:
+                    resp = await self.client.get(url, headers=headers)
+                resp.raise_for_status()
+                return resp.json() if is_json else resp.text
+            except Exception as e:
+                if attempt == 11: raise
+                # Backoff curve from v7
+                if attempt < 3:
+                    delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
+                elif attempt < 7:
+                    delay = 1.5 + random.uniform(0, 0.5)
+                else:
+                    delay = 3.0 + random.uniform(0, 3.0)
+                await asyncio.sleep(delay)
 
-    logger.error(f"All {max_attempts} attempts failed for {url}: {last_exc}")
-    raise HTTPException(502, f"Upstream unavailable after {max_attempts} attempts")
+http_client = HttpClient()
 
+# ──────────────────────────────────────────────
+# PARSING (Offloaded to ThreadPool)
+# ──────────────────────────────────────────────
+executor = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
-async def fetch_json(
-    url: str,
-    max_attempts: int = 15,
-    referer: str = BASE_URL,
-) -> Any:
-    last_exc = None
-    for attempt in range(max_attempts):
-        rotate = attempt >= 3
-        client = get_client(rotate=rotate)
-        profile_idx = attempt % len(BROWSER_PROFILES)
-        headers = _build_headers(for_json=True, profile_idx=profile_idx)
-        headers["Referer"] = referer
-
-        try:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            if attempt > 0:
-                logger.info(f"✅ fetch_json succeeded on attempt {attempt + 1}: {url}")
-            return resp.json()
-
-        except HTTPStatusError as e:
-            status = e.response.status_code
-            logger.warning(f"HTTP {status} on attempt {attempt + 1} for {url}")
-            if status in (403, 404):
-                raise HTTPException(status, "Upstream returned error")
-            last_exc = e
-
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed ({url}): {type(e).__name__}: {e}")
-            last_exc = e
-
-        if attempt < 3:
-            delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
-        elif attempt < 7:
-            delay = 1.5 + random.uniform(0, 0.5)
-        else:
-            delay = 3.0 + random.uniform(0, 3.0)
-
-        logger.info(f"Retrying in {delay:.2f}s (attempt {attempt + 2}/{max_attempts})...")
-        await asyncio.sleep(delay)
-
-    logger.error(f"All {max_attempts} attempts failed for {url}: {last_exc}")
-    raise HTTPException(502, f"Upstream unavailable after {max_attempts} attempts")
-
-
-# =========================
-# 🔹 PARSERS
-# =========================
-def _parse_search_results(html: str) -> List[Dict]:
+def parse_search(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
     results = []
     for item in parser.css("div.flw-item.item-qtip"):
         img = item.css_first("img")
-        if not img:
-            continue
-        attrs = img.attributes
-        title = attrs.get("alt", "").strip()
-        poster = attrs.get("data-src") or attrs.get("src") or ""
+        if not img: continue
         anime_id = item.attributes.get("data-id", "")
-        if title and anime_id:
-            results.append({"anime_id": anime_id, "poster": poster, "title": title})
+        if anime_id:
+            results.append({
+                "anime_id": anime_id,
+                "title": img.attributes.get("alt", "").strip(),
+                "poster": img.attributes.get("data-src") or img.attributes.get("src") or "",
+            })
     return results
 
-
-def _parse_episodes(html: str) -> List[Dict]:
+def parse_episodes(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
     episodes = []
     for ep in parser.css("a.item.ep-item"):
-        attrs = ep.attributes
-        ep_num   = attrs.get("data-number", "")
-        ep_id    = attrs.get("data-id", "")
-        ep_title = attrs.get("title", f"Episode {ep_num}").strip()
-        if ep_num and ep_id:
+        num = ep.attributes.get("data-number", "")
+        eid = ep.attributes.get("data-id", "")
+        if num and eid:
             episodes.append({
-                "episode_number": ep_num,
-                "episode_id": ep_id,
-                "title": ep_title,
+                "episode_number": num,
+                "episode_id": eid,
+                "title": ep.attributes.get("title", f"Episode {num}").strip(),
             })
     return episodes
 
-
-def _parse_home(html: str) -> Dict:
+def parse_home(html: str) -> Dict:
     parser = LexborHTMLParser(html)
-    thumbnails, hero_thumbnails = [], []
-
-    for img in parser.css("img.film-poster-img"):
-        attrs = img.attributes
-        if attrs.get("data-src"):
-            thumbnails.append(attrs["data-src"])
-        if attrs.get("src"):
-            hero_thumbnails.append(attrs["src"])
-
     trending = []
     for item in parser.css("div.flw-item"):
         img = item.css_first("img")
-        if img:
-            attrs = img.attributes
-            title = attrs.get("alt", "").strip()
-            poster = attrs.get("data-src") or attrs.get("src") or ""
-            anime_id = item.attributes.get("data-id", "")
-            if title and anime_id:
-                trending.append({"anime_id": anime_id, "poster": poster, "title": title})
+        if not img: continue
+        anime_id = item.attributes.get("data-id", "")
+        if anime_id:
+            trending.append({
+                "anime_id": anime_id,
+                "title": img.attributes.get("alt", "").strip(),
+                "poster": img.attributes.get("data-src") or img.attributes.get("src") or "",
+            })
+    return {"trending": trending}
 
-    return {
-        "thumbnails": thumbnails,
-        "hero_thumbnails": hero_thumbnails,
-        "trending": trending,
-        "count": len(thumbnails),
-    }
-
-
-# =========================
-# 🔹 SERVICE LAYER
-# =========================
-async def search_service(query: str) -> List[Dict]:
-    key = f"search:{query.lower().strip()}"
-    cached = search_cache.get(key)
-    if cached is not None:
-        return cached
-    html = await fetch_html(
-        f"{BASE_URL}/search?keyword={quote(query)}",
-        referer=f"{BASE_URL}/home",
-    )
-    results = _parse_search_results(html)
-    search_cache.set(key, results)
-    return results
-
-
-async def episodes_service(anime_id: str) -> List[Dict]:
-    cached = episode_cache.get(anime_id)
-    if cached is not None:
-        return cached
-    data = await fetch_json(
-        f"{BASE_URL}/ajax/episode/list/{anime_id}",
-        referer=f"{BASE_URL}/watch/{anime_id}",
-    )
-    episodes = _parse_episodes(data.get("html", ""))
-    episode_cache.set(anime_id, episodes)
-    return episodes
-
-
-async def suggest_service(query: str) -> List:
-    key = f"suggest:{query.lower().strip()}"
-    cached = suggest_cache.get(key)
-    if cached is not None:
-        return cached
-    data = await fetch_json(
-        f"{BASE_URL}/ajax/search/suggest?keyword={quote(query)}",
-        referer=f"{BASE_URL}/home",
-    )
-    result = data.get("result", [])
-    suggest_cache.set(key, result)
-    return result
-
-
-async def home_service() -> Dict:
-    cached = home_cache.get("home")
-    if cached is not None:
-        return cached
-    html = await fetch_html(f"{BASE_URL}/home", referer=BASE_URL)
-    result = _parse_home(html)
-    home_cache.set("home", result)
-    return result
-
-
-async def stream_url_service(episode_id: str, sub: str = "sub") -> Dict:
-    key = f"stream:{episode_id}:{sub}"
-    cached = stream_cache.get(key)
-    if cached is not None:
-        return cached
-
-    data = await fetch_json(
-        f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}",
-        referer=f"{BASE_URL}/watch/{episode_id}",
-    )
-    servers = data.get("html", "")
-    parser = LexborHTMLParser(servers)
-
-    server_id = None
-    for s in parser.css("div.item.server-item"):
+def parse_server_id(html: str, sub: str) -> Optional[str]:
+    for s in LexborHTMLParser(html).css("div.item.server-item"):
         if sub in s.attributes.get("data-type", "").lower():
-            server_id = s.attributes.get("data-id")
-            break
+            return s.attributes.get("data-id")
+    return None
 
-    if not server_id:
-        url = f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}"
-        result = {"url": url, "source": "fallback"}
-        stream_cache.set(key, result)
-        return result
+# ──────────────────────────────────────────────
+# SERVICE LAYER
+# ──────────────────────────────────────────────
+async def get_search(query: str) -> List[Dict]:
+    key = f"search:{query.lower().strip()}"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
 
-    src_data = await fetch_json(
-        f"{BASE_URL}/ajax/episode/sources?id={server_id}",
-        referer=f"{BASE_URL}/watch/{episode_id}",
-    )
-    url = src_data.get("link", f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}")
-    result = {"url": url, "source": "9anime", "server_id": server_id}
-    stream_cache.set(key, result)
-    return result
+    async def refresh():
+        try:
+            html = await http_client.fetch(f"{BASE_URL}/search?keyword={quote(query)}")
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(executor, parse_search, html)
+            cache.set(key, results, TTL["search"])
+            return results
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
 
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
 
-# =========================
-# 🔹 ROUTES
-# =========================
-@app.get("/search/{query}", summary="Search anime by keyword")
-async def search(query: str):
-    if len(query.strip()) < 1:
-        raise HTTPException(400, "Query must not be empty")
-    results = await search_service(query)
-    return {"results": results, "count": len(results)}
+async def get_episodes(anime_id: str) -> List[Dict]:
+    key = f"ep:{anime_id}"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
 
+    async def refresh():
+        try:
+            data = await http_client.fetch(f"{BASE_URL}/ajax/episode/list/{anime_id}", is_json=True)
+            loop = asyncio.get_running_loop()
+            eps = await loop.run_in_executor(executor, parse_episodes, data.get("html", ""))
+            cache.set(key, eps, TTL["episode"])
+            return eps
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
 
-@app.get("/suggest/{query}", summary="Autocomplete suggestions")
-async def suggest(query: str):
-    if len(query.strip()) < 2:
-        return {"results": []}
-    results = await suggest_service(query)
-    return {"results": results}
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
 
+async def get_home() -> Dict:
+    key = "home"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
 
-@app.get("/anime/episode/{anime_id}", summary="Get episode list for an anime")
-async def episodes(anime_id: str):
-    eps = await episodes_service(anime_id)
-    return {"episodes": eps, "count": len(eps)}
+    async def refresh():
+        try:
+            html = await http_client.fetch(f"{BASE_URL}/home")
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(executor, parse_home, html)
+            cache.set(key, res, TTL["home"])
+            return res
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
 
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
 
-@app.get("/anime/stream/{episode_id}", summary="Get stream URL for an episode")
-async def stream(
-    episode_id: str,
-    type: str = Query(default="sub", pattern="^(sub|dub)$")
-):
-    result = await stream_url_service(episode_id, type)
-    return result
+async def get_suggest(query: str) -> List:
+    key = f"sug:{query.lower().strip()}"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
 
+    async def refresh():
+        try:
+            data = await http_client.fetch(f"{BASE_URL}/ajax/search/suggest?keyword={quote(query)}", is_json=True)
+            result = data.get("result", [])
+            cache.set(key, result, TTL["suggest"])
+            return result
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
 
-@app.get("/home/thumbnails", summary="Home page thumbnails and trending")
-async def home():
-    return await home_service()
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
 
+async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
+    key = f"stream:{episode_id}:{sub}"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
 
-@app.get("/cache/stats", summary="Cache hit/miss statistics")
-async def cache_stats():
-    return {
-        "search":  search_cache.stats(),
-        "episode": episode_cache.stats(),
-        "suggest": suggest_cache.stats(),
-        "home":    home_cache.stats(),
-        "stream":  stream_cache.stats(),
-    }
+    async def refresh():
+        try:
+            servers_data = await http_client.fetch(f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}", is_json=True)
+            loop = asyncio.get_running_loop()
+            server_id = await loop.run_in_executor(executor, parse_server_id, servers_data.get("html", ""), sub)
+            
+            fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}"
+            if not server_id:
+                result = {"url": fallback, "source": "fallback"}
+            else:
+                src = await http_client.fetch(f"{BASE_URL}/ajax/episode/sources?id={server_id}", is_json=True)
+                result = {"url": src.get("link", fallback), "source": "9anime", "server_id": server_id}
+            
+            cache.set(key, result, TTL["stream"])
+            return result
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
 
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
 
-@app.delete("/cache/flush", summary="Flush all caches")
-async def flush_cache():
-    for c in (search_cache, episode_cache, suggest_cache, home_cache, stream_cache):
-        c.clear()
-    return {"status": "flushed"}
+# ──────────────────────────────────────────────
+# FASTAPI APP
+# ──────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await http_client.start()
+    logger.info("🚀 RO-Anime API v9.0 Online")
+    yield
+    await http_client.stop()
+    executor.shutdown()
 
+app = FastAPI(lifespan=lifespan, title="RO-Anime API v9.0")
 
-@app.get("/health", summary="Health check")
+# Middlewares
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
+app.add_middleware(GZipMiddleware, minimum_size=512)
+
+@app.middleware("http")
+async def middleware(request: Request, call_next):
+    ip = request.client.host if request.client else "unknown"
+    if not rate_limiter.is_allowed(ip):
+        return Response(
+            msgspec.json.encode({"error": "Too many requests", "retry_after": 60}),
+            status_code=429,
+            media_type="application/json",
+            headers={"Retry-After": "60"}
+        )
+    
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = (time.perf_counter() - start_time) * 1000
+    response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
+    response.headers["X-Powered-By"] = "RO-Anime/9.0"
+    return response
+
+# Routes
+@app.get("/search/{query}")
+async def route_search(query: str):
+    results = await get_search(query)
+    return Response(msgspec.json.encode({"results": results}), media_type="application/json")
+
+@app.get("/suggest/{query}")
+async def route_suggest(query: str):
+    results = await get_suggest(query)
+    return Response(msgspec.json.encode({"results": results}), media_type="application/json")
+
+@app.get("/anime/episode/{anime_id}")
+async def route_episodes(anime_id: str):
+    eps = await get_episodes(anime_id)
+    return Response(msgspec.json.encode({"episodes": eps}), media_type="application/json")
+
+@app.get("/anime/stream/{episode_id}")
+async def route_stream(episode_id: str, type: str = Query(default="sub", pattern="^(sub|dub)$")):
+    res = await get_stream(episode_id, type)
+    return Response(msgspec.json.encode(res), media_type="application/json")
+
+@app.get("/home")
+async def route_home():
+    res = await get_home()
+    return Response(msgspec.json.encode(res), media_type="application/json")
+
+@app.get("/batch/search")
+async def route_batch_search(q: List[str] = Query(...)):
+    queries = list(dict.fromkeys(q[:20]))
+    tasks = [get_search(title) for title in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out = {t: (r if not isinstance(r, Exception) else {"error": str(r)}) for t, r in zip(queries, results)}
+    return Response(msgspec.json.encode(out), media_type="application/json")
+
+@app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "version": "6.0.0",
-        "active_clients": len([c for c in _clients if not c.is_closed]),
-        "browser_profiles": len(BROWSER_PROFILES),
-        "cache_sizes": {
-            "search":  search_cache.size,
-            "episode": episode_cache.size,
-            "suggest": suggest_cache.size,
-            "home":    home_cache.size,
-            "stream":  stream_cache.size,
-        },
+        "cache": cache.stats(),
+        "circuit": breaker.state,
+        "inflight": len(http_client.inflight)
     }
 
-
-# =========================
-# 🔹 BACKGROUND TASKS
-# =========================
-async def warm_cache():
-    titles = ["Naruto", "One Piece", "Bleach", "Jujutsu Kaisen", "Demon Slayer"]
-    tasks = [search_service(t) for t in titles] + [suggest_service(t) for t in titles]
-    tasks.append(home_service())
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    errors = sum(1 for r in results if isinstance(r, Exception))
-    logger.info(f"Cache warm complete — {len(tasks) - errors}/{len(tasks)} succeeded")
-
-
-async def periodic_cleanup():
-    while True:
-        await asyncio.sleep(300)
-        rate_limiter.cleanup()
-        logger.debug("Rate limiter cleanup done")
-
-
-# =========================
-# 🔹 ENTRY POINT
-# =========================
 if __name__ == "__main__":
     import uvicorn
-
-    try:
-        import uvloop
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        logger.info("Using uvloop event loop")
-    except ImportError:
-        logger.info("uvloop not found — using default asyncio loop")
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        workers=1,
-        log_level="info",
-        access_log=True,
-    )
+    uvloop.install()
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

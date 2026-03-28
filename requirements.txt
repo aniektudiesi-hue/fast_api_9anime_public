@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
+uvloop
 httpx[http2]
 selectolax
+msgspec
 brotli
-lxml
 python-multipart
 orjson
