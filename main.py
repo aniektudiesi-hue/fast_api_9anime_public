@@ -558,7 +558,7 @@ async def route_stream(episode_id: str, type: str = Query(default="sub", pattern
     res = await get_stream(episode_id, type)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
-@app.get("/home")
+@app.get("/home/thumbnails")
 async def route_home():
     res = await get_home()
     return Response(msgspec.json.encode(res), media_type="application/json")
