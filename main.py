@@ -73,6 +73,11 @@ class AnimeBase(msgspec.Struct):
     title: str
     poster: str
 
+class HeroBanner(msgspec.Struct):
+    image: str
+    title: str
+    link: str
+
 class Episode(msgspec.Struct):
     episode_number: str
     episode_id: str
@@ -435,8 +440,7 @@ def parse_mew_server_ids(html: str) -> List[str]:
 
 # ──────────────────────────────────────────────
 # SERVICE LAYER — v9.0 routes (unchanged)
-# ──────────────────────────────────────────────
-async def get_search(query: str) -> List[Dict]:
+# ──────────────────────────────────────────────async def get_suggest(query: str) -> List:Dict]:
     key = f"search:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
@@ -450,6 +454,45 @@ async def get_search(query: str) -> List[Dict]:
             return results
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
+
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
+
+def parse_9anime_homepage(html_content: str) -> List[HeroBanner]:
+    tree = LexborHTMLParser(html_content)
+    hero_thumbnails = []
+    for slide in tree.css(".swiper-wrapper .swiper-slide"): 
+        img_element = slide.css_first(".film-poster img")
+        title_element = slide.css_first(".film-detail .film-name a")
+        link_element = slide.css_first(".film-detail .film-name a")
+
+        if img_element and title_element and link_element:
+            hero_thumbnails.append(HeroBanner(
+                image=img_element.attributes.get("src"),
+                title=title_element.text(strip=True),
+                link=link_element.attributes.get("href")
+            ))
+    return hero_thumbnails
+
+async def get_home() -> Dict[str, List[HeroBanner]]:
+    key = "home:thumbnails"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
+
+    async def refresh():
+        try:
+            html_content = await http_client.fetch(BASE_URL)
+            hero_thumbnails = await asyncio.get_running_loop().run_in_executor(
+                executor, parse_9anime_homepage, html_content
+            )
+            result = {"hero_thumbnails": hero_thumbnails, "trending": []}
+            cache.set(key, result, TTL["home"])
+            return result
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
+            return {"hero_thumbnails": [], "trending": []}
 
     if is_stale:
         asyncio.create_task(refresh())
@@ -472,32 +515,7 @@ async def get_episodes(anime_id: str) -> List[Dict]:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
     if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_home() -> Dict:
-    key = "home"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            html = await http_client.fetch(f"{BASE_URL}/home")
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(executor, parse_home, html)
-            cache.set(key, res, TTL["home"])
-            return res
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_suggest(query: str) -> List:
-    key = f"sug:{query.lower().strip()}"
+        asyncio.create_taskey = f"sug:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
 
@@ -679,6 +697,11 @@ async def middleware(request: Request, call_next):
 async def route_search(query: str):
     results = await get_search(query)
     return Response(msgspec.json.encode({"results": results}), media_type="application/json")
+
+@app.get("/home")
+async def route_home():
+    home_data = await get_home()
+    return Response(msgspec.json.encode(home_data), media_type="application/json")
 
 @app.get("/suggest/{query}")
 async def route_suggest(query: str):
