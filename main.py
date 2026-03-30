@@ -73,11 +73,6 @@ class AnimeBase(msgspec.Struct):
     title: str
     poster: str
 
-class HeroBanner(msgspec.Struct):
-    image: str
-    title: str
-    link: str
-
 class Episode(msgspec.Struct):
     episode_number: str
     episode_id: str
@@ -253,10 +248,9 @@ class HttpClient:
     async def start(self):
         self.client = AsyncClient(
             http2=True,
-            timeout=Timeout(8.0, connect=3.0),
-            limits=Limits(max_connections=300, max_keepalive_connections=100),
+            timeout=Timeout(12.0, connect=5.0),
+            limits=Limits(max_connections=200, max_keepalive_connections=50),
             follow_redirects=True,
-            trust_env=False, # Faster by not looking up proxy env vars
         )
 
     async def stop(self):
@@ -296,7 +290,7 @@ class HttpClient:
             asyncio.create_task(_cleanup())
 
     async def _do_fetch(self, url: str, referer: str, is_json: bool, extra_headers: Optional[Dict]) -> Any:
-        for attempt in range(3): # Reduced retries for faster response
+        for attempt in range(12):
             profile = BROWSER_PROFILES[attempt % len(BROWSER_PROFILES)]
             headers = {
                 "User-Agent": profile["User-Agent"],
@@ -364,45 +358,15 @@ def parse_episodes(html: str) -> List[Dict]:
 
 def parse_home(html: str) -> Dict:
     parser = LexborHTMLParser(html)
-    thumbs: List[Dict] = []
-    heroes: List[Dict] = []
+    thumbs: List[str] = []
+    heroes: List[str] = []
     trending: List[Dict] = []
 
-    # Parse main thumbnails (usually recent/featured)
-    for item in parser.css("div.flw-item"):
-        img = item.css_first("img.film-poster-img")
-        if not img: continue
+    for img in parser.css("img.film-poster-img"):
         a = img.attributes
-        title = a.get("alt", "").strip()
-        anime_id = item.attributes.get("data-id", "")
-        poster = a.get("data-src") or a.get("src") or ""
-        
-        if poster:
-            thumbs.append({
-                "anime_id": anime_id,
-                "title": title,
-                "poster": poster
-            })
+        if a.get("data-src"): thumbs.append(a["data-src"])
+        if a.get("src"): heroes.append(a["src"])
 
-    # Parse hero/slider thumbnails
-    for item in parser.css("div.swiper-slide"):
-        img = item.css_first("img")
-        if not img: continue
-        a = img.attributes
-        title = item.css_first(".desi-head-title").text().strip() if item.css_first(".desi-head-title") else a.get("alt", "").strip()
-        # Hero items might have different ID structure, but usually they are linked
-        link = item.css_first("a")
-        anime_id = link.attributes.get("href", "").split("-")[-1] if link else ""
-        
-        poster = a.get("src") or a.get("data-src") or ""
-        if poster:
-            heroes.append({
-                "anime_id": anime_id,
-                "title": title,
-                "poster": poster
-            })
-
-    # Parse trending section
     for item in parser.css("div.flw-item"):
         img = item.css_first("img")
         if not img: continue
@@ -416,12 +380,7 @@ def parse_home(html: str) -> Dict:
                 "poster": a.get("data-src") or a.get("src") or "",
             })
 
-    return {
-        "thumbnails": thumbs, 
-        "hero_thumbnails": heroes, 
-        "trending": trending, 
-        "count": len(thumbs)
-    }
+    return {"thumbnails": thumbs, "hero_thumbnails": heroes, "trending": trending, "count": len(thumbs)}
 
 def parse_server_id(html: str, sub: str) -> Optional[str]:
     for s in LexborHTMLParser(html).css("div.item.server-item"):
@@ -440,7 +399,8 @@ def parse_mew_server_ids(html: str) -> List[str]:
 
 # ──────────────────────────────────────────────
 # SERVICE LAYER — v9.0 routes (unchanged)
-# ──────────────────────────────────────────────async def get_suggest(query: str) -> List:Dict]:
+# ──────────────────────────────────────────────
+async def get_search(query: str) -> List[Dict]:
     key = f"search:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
@@ -454,45 +414,6 @@ def parse_mew_server_ids(html: str) -> List[str]:
             return results
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-def parse_9anime_homepage(html_content: str) -> List[HeroBanner]:
-    tree = LexborHTMLParser(html_content)
-    hero_thumbnails = []
-    for slide in tree.css(".swiper-wrapper .swiper-slide"): 
-        img_element = slide.css_first(".film-poster img")
-        title_element = slide.css_first(".film-detail .film-name a")
-        link_element = slide.css_first(".film-detail .film-name a")
-
-        if img_element and title_element and link_element:
-            hero_thumbnails.append(HeroBanner(
-                image=img_element.attributes.get("src"),
-                title=title_element.text(strip=True),
-                link=link_element.attributes.get("href")
-            ))
-    return hero_thumbnails
-
-async def get_home() -> Dict[str, List[HeroBanner]]:
-    key = "home:thumbnails"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            html_content = await http_client.fetch(BASE_URL)
-            hero_thumbnails = await asyncio.get_running_loop().run_in_executor(
-                executor, parse_9anime_homepage, html_content
-            )
-            result = {"hero_thumbnails": hero_thumbnails, "trending": []}
-            cache.set(key, result, TTL["home"])
-            return result
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-            return {"hero_thumbnails": [], "trending": []}
 
     if is_stale:
         asyncio.create_task(refresh())
@@ -515,7 +436,32 @@ async def get_episodes(anime_id: str) -> List[Dict]:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
     if is_stale:
-        asyncio.create_taskey = f"sug:{query.lower().strip()}"
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
+
+async def get_home() -> Dict:
+    key = "home"
+    val, is_stale = cache.get(key)
+    if val and not is_stale: return val
+
+    async def refresh():
+        try:
+            html = await http_client.fetch(f"{BASE_URL}/home")
+            loop = asyncio.get_running_loop()
+            res = await loop.run_in_executor(executor, parse_home, html)
+            cache.set(key, res, TTL["home"])
+            return res
+        except Exception as e:
+            logger.error(f"SWR Refresh failed for {key}: {e}")
+
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
+
+async def get_suggest(query: str) -> List:
+    key = f"sug:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
 
@@ -697,11 +643,6 @@ async def middleware(request: Request, call_next):
 async def route_search(query: str):
     results = await get_search(query)
     return Response(msgspec.json.encode({"results": results}), media_type="application/json")
-
-@app.get("/home")
-async def route_home():
-    home_data = await get_home()
-    return Response(msgspec.json.encode(home_data), media_type="application/json")
 
 @app.get("/suggest/{query}")
 async def route_suggest(query: str):
