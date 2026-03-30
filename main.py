@@ -248,9 +248,10 @@ class HttpClient:
     async def start(self):
         self.client = AsyncClient(
             http2=True,
-            timeout=Timeout(12.0, connect=5.0),
-            limits=Limits(max_connections=200, max_keepalive_connections=50),
+            timeout=Timeout(8.0, connect=3.0),
+            limits=Limits(max_connections=300, max_keepalive_connections=100),
             follow_redirects=True,
+            trust_env=False, # Faster by not looking up proxy env vars
         )
 
     async def stop(self):
@@ -290,7 +291,7 @@ class HttpClient:
             asyncio.create_task(_cleanup())
 
     async def _do_fetch(self, url: str, referer: str, is_json: bool, extra_headers: Optional[Dict]) -> Any:
-        for attempt in range(12):
+        for attempt in range(3): # Reduced retries for faster response
             profile = BROWSER_PROFILES[attempt % len(BROWSER_PROFILES)]
             headers = {
                 "User-Agent": profile["User-Agent"],
@@ -358,15 +359,45 @@ def parse_episodes(html: str) -> List[Dict]:
 
 def parse_home(html: str) -> Dict:
     parser = LexborHTMLParser(html)
-    thumbs: List[str] = []
-    heroes: List[str] = []
+    thumbs: List[Dict] = []
+    heroes: List[Dict] = []
     trending: List[Dict] = []
 
-    for img in parser.css("img.film-poster-img"):
+    # Parse main thumbnails (usually recent/featured)
+    for item in parser.css("div.flw-item"):
+        img = item.css_first("img.film-poster-img")
+        if not img: continue
         a = img.attributes
-        if a.get("data-src"): thumbs.append(a["data-src"])
-        if a.get("src"): heroes.append(a["src"])
+        title = a.get("alt", "").strip()
+        anime_id = item.attributes.get("data-id", "")
+        poster = a.get("data-src") or a.get("src") or ""
+        
+        if poster:
+            thumbs.append({
+                "anime_id": anime_id,
+                "title": title,
+                "poster": poster
+            })
 
+    # Parse hero/slider thumbnails
+    for item in parser.css("div.swiper-slide"):
+        img = item.css_first("img")
+        if not img: continue
+        a = img.attributes
+        title = item.css_first(".desi-head-title").text().strip() if item.css_first(".desi-head-title") else a.get("alt", "").strip()
+        # Hero items might have different ID structure, but usually they are linked
+        link = item.css_first("a")
+        anime_id = link.attributes.get("href", "").split("-")[-1] if link else ""
+        
+        poster = a.get("src") or a.get("data-src") or ""
+        if poster:
+            heroes.append({
+                "anime_id": anime_id,
+                "title": title,
+                "poster": poster
+            })
+
+    # Parse trending section
     for item in parser.css("div.flw-item"):
         img = item.css_first("img")
         if not img: continue
@@ -380,7 +411,12 @@ def parse_home(html: str) -> Dict:
                 "poster": a.get("data-src") or a.get("src") or "",
             })
 
-    return {"thumbnails": thumbs, "hero_thumbnails": heroes, "trending": trending, "count": len(thumbs)}
+    return {
+        "thumbnails": thumbs, 
+        "hero_thumbnails": heroes, 
+        "trending": trending, 
+        "count": len(thumbs)
+    }
 
 def parse_server_id(html: str, sub: str) -> Optional[str]:
     for s in LexborHTMLParser(html).css("div.item.server-item"):
