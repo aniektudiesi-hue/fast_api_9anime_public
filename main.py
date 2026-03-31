@@ -35,6 +35,8 @@ from selectolax.lexbor import LexborHTMLParser
 # CONFIGURATION & CONSTANTS
 # ──────────────────────────────────────────────
 BASE_URL = "https://9animetv.to"
+MEW_BASE = "https://nine.mewcdn.online"
+RAPID_CLOUD_BASE = "https://rapid-cloud.co"
 UPSTREAM_CONCURRENCY = 15
 CACHE_MAX_SIZE = 5000
 PARSER_WORKERS = 4
@@ -46,6 +48,7 @@ TTL = {
     "suggest": 600,
     "home": 180,
     "stream": 120,
+    "stream_v2": 120,
 }
 
 # ──────────────────────────────────────────────
@@ -392,6 +395,28 @@ def parse_server_id(html: str, sub: str) -> Optional[str]:
             return s.attributes.get("data-id")
     return None
 
+def parse_vidcloud_ids(html: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract the first two Vidcloud server data-ids from server-item divs.
+    Returns (sub_id, dub_id). Uses selectolax for speed; avoids index() calls.
+    """
+    sub_id: Optional[str] = None
+    dub_id: Optional[str] = None
+    vidcloud_count = 0
+
+    for node in LexborHTMLParser(html).css("div.item.server-item"):
+        text = node.text(strip=True)
+        if "Vidcloud" in text:
+            data_id = node.attributes.get("data-id")
+            if vidcloud_count == 0:
+                sub_id = data_id
+            elif vidcloud_count == 1:
+                dub_id = data_id
+                break  # Both found — exit early
+            vidcloud_count += 1
+
+    return sub_id, dub_id
+
 # ──────────────────────────────────────────────
 # SERVICE LAYER
 # ──────────────────────────────────────────────
@@ -502,6 +527,104 @@ async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
         return val
     return await refresh()
 
+async def get_source_v2(episode_id: str) -> Dict:
+    """
+    Fetches sub & dub m3u8 sources and subtitle tracks for a given episode_id.
+
+    Pipeline (minimising sequential round-trips):
+      1. Fetch server list  →  parse Vidcloud sub_id & dub_id in thread-pool
+      2. Fetch sub & dub source URLs in parallel  (asyncio.gather)
+      3. Fetch sub & dub RapidCloud getSources in parallel  (asyncio.gather)
+      4. Assemble and return the response dict — no redundant JSON re-parsing.
+    """
+    mew_referer = MEW_BASE
+    rapid_referer = RAPID_CLOUD_BASE
+
+    # ── Step 1: server list ──────────────────────────────────────────────────
+    servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}"
+    try:
+        servers_data = await http_client.fetch(servers_url, referer=mew_referer, is_json=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[stream_v2] servers fetch failed for {episode_id}: {e}")
+        raise HTTPException(502, "Failed to fetch episode server list")
+
+    html = servers_data.get("html", "")
+    if not html:
+        raise HTTPException(502, "Empty server list response")
+
+    loop = asyncio.get_running_loop()
+    sub_id, dub_id = await loop.run_in_executor(executor, parse_vidcloud_ids, html)
+
+    if not sub_id or not dub_id:
+        raise HTTPException(404, f"Vidcloud sub/dub server not found for episode {episode_id}")
+
+    # ── Step 2: fetch sub & dub source links in parallel ────────────────────
+    sub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={sub_id}"
+    dub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={dub_id}"
+
+    try:
+        sub_src_data, dub_src_data = await asyncio.gather(
+            http_client.fetch(sub_src_url, referer=mew_referer, is_json=True),
+            http_client.fetch(dub_src_url, referer=mew_referer, is_json=True),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[stream_v2] source link fetch failed for {episode_id}: {e}")
+        raise HTTPException(502, "Failed to fetch sub/dub source links")
+
+    sub_link: str = sub_src_data.get("link", "")
+    dub_link: str = dub_src_data.get("link", "")
+
+    if not sub_link or not dub_link:
+        raise HTTPException(502, "Missing embed link in source response")
+
+    # Extract embed IDs — last path segment before any query string
+    sub_embed_id = sub_link.rstrip("/").split("/")[-1].split("?")[0]
+    dub_embed_id = dub_link.rstrip("/").split("/")[-1].split("?")[0]
+
+    if not sub_embed_id or not dub_embed_id:
+        raise HTTPException(502, "Could not parse embed IDs from source links")
+
+    # ── Step 3: fetch RapidCloud getSources in parallel ──────────────────────
+    sub_sources_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={sub_embed_id}"
+    dub_sources_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={dub_embed_id}"
+
+    try:
+        sub_sources_data, dub_sources_data = await asyncio.gather(
+            http_client.fetch(sub_sources_url, referer=rapid_referer, is_json=True),
+            http_client.fetch(dub_sources_url, referer=rapid_referer, is_json=True),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[stream_v2] RapidCloud fetch failed for {episode_id}: {e}")
+        raise HTTPException(502, "Failed to fetch stream sources from RapidCloud")
+
+    # ── Step 4: assemble — parse each JSON blob exactly once ─────────────────
+    try:
+        sub_file: str = sub_sources_data["sources"][0]["file"]
+        sub_tracks: List = sub_sources_data.get("tracks", [])
+        dub_file: str = dub_sources_data["sources"][0]["file"]
+        dub_tracks: List = dub_sources_data.get("tracks", [])
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"[stream_v2] Unexpected source structure for {episode_id}: {e}")
+        raise HTTPException(502, "Unexpected response structure from stream source")
+
+    return {
+        "episode_id": str(episode_id),
+        "sub": {
+            "m3u8": sub_file,
+            "subtitles": sub_tracks,
+        },
+        "dub": {
+            "m3u8": dub_file,
+            "subtitles": dub_tracks,
+        },
+    }
+
 # ──────────────────────────────────────────────
 # FASTAPI APP
 # ──────────────────────────────────────────────
@@ -556,6 +679,11 @@ async def route_episodes(anime_id: str):
 @app.get("/anime/stream/{episode_id}")
 async def route_stream(episode_id: str, type: str = Query(default="sub", pattern="^(sub|dub)$")):
     res = await get_stream(episode_id, type)
+    return Response(msgspec.json.encode(res), media_type="application/json")
+
+@app.get("/stream/v2/{episode_id}")
+async def route_stream_v2(episode_id: str):
+    res = await get_source_v2(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
 @app.get("/home/thumbnails")
