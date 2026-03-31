@@ -479,30 +479,76 @@ async def get_suggest(query: str) -> List:
         return val
     return await refresh()
 
+
+
 async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
     key = f"stream:{episode_id}:{sub}"
     val, is_stale = cache.get(key)
-    if val and not is_stale: return val
+
+    # ✅ Return fresh cache
+    if val and not is_stale:
+        return val
 
     async def refresh():
         try:
-            servers_data = await http_client.fetch(f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}", is_json=True)
+            servers_data = await http_client.fetch(
+                f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}",
+                is_json=True
+            )
+
             loop = asyncio.get_running_loop()
-            server_id = await loop.run_in_executor(executor, parse_server_id, servers_data.get("html", ""), sub)
+            server_id = await loop.run_in_executor(
+                executor,
+                parse_server_id,
+                servers_data.get("html", ""),
+                sub
+            )
+
             fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}"
+
             if not server_id:
-                result = {"url": fallback, "source": "fallback"}
+                result = {
+                    "url": fallback,
+                    "source": "fallback"
+                }
             else:
-                src = await http_client.fetch(f"{BASE_URL}/ajax/episode/sources?id={server_id}", is_json=True)
-                result = {"url": src.get("link", fallback), "source": "9anime", "server_id": server_id}
+                src = await http_client.fetch(
+                    f"{BASE_URL}/ajax/episode/sources?id={server_id}",
+                    is_json=True
+                )
+
+                url = src.get("link")
+
+                # 🔥 UPDATED LOGIC
+                if not url:
+                    sources = src.get("sources", [])
+
+                    if sources:
+                        if sub == "sub":
+                            url = sources[0].get("file")   # first stream
+                        else:
+                            url = sources[-1].get("file")  # last stream
+                    else:
+                        url = fallback
+
+                result = {
+                    "url": url,
+                    "source": "9anime",
+                    "server_id": server_id
+                }
+
             cache.set(key, result, TTL["stream"])
             return result
+
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
-    if is_stale:
+    # ✅ Stale → return old + refresh in background
+    if is_stale and val:
         asyncio.create_task(refresh())
-        return val
+        return val  # FIXED
+
+    # ✅ No cache → fetch fresh
     return await refresh()
 
 # ──────────────────────────────────────────────
