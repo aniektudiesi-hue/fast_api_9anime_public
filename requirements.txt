@@ -7,3 +7,4 @@ msgspec
 brotli
 python-multipart
 orjson
+bs4
