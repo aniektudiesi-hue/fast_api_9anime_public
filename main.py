@@ -479,8 +479,11 @@ async def get_suggest(query: str) -> List:
         return val
     return await refresh()
 
+import asyncio
+import copy
+from bs4 import BeautifulSoup
 
-async def get_stream(episode_id: str) -> Dict:
+async def get_stream(episode_id: str) -> dict:
     key = f"stream:{episode_id}"
     val, is_stale = cache.get(key)
 
@@ -489,22 +492,19 @@ async def get_stream(episode_id: str) -> Dict:
 
     async def refresh():
         try:
+            # ✅ SAME AS YOUR SCRIPT
             servers_data = await http_client.fetch(
                 f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}",
                 is_json=True
             )
 
-            loop = asyncio.get_running_loop()
-            server_ids = await loop.run_in_executor(
-                executor,
-                parse_all_server_ids,
-                servers_data.get("html", ""),
-                "sub"
-            )
+            soup = BeautifulSoup(servers_data["html"], "lxml")
+            items = soup.find_all("div", class_="item server-item")
+            server_ids = [item.get("data-id") for item in items if item.get("data-id")]
 
             vod_links = []
 
-            # 🔥 collect vod links + subtitles
+            # ✅ SAME LOOP AS YOUR SCRIPT
             for sid in server_ids:
                 try:
                     src = await http_client.fetch(
@@ -520,10 +520,8 @@ async def get_stream(episode_id: str) -> Dict:
                         sources_data = await http_client.fetch(
                             f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
                             headers={
-                                "Accept": "*/*",
                                 "Referer": link,
-                                "X-Requested-With": "XMLHttpRequest",
-                                "User-Agent": "Mozilla/5.0",
+                                "User-Agent": "Mozilla/5.0"
                             },
                             is_json=True
                         )
@@ -534,36 +532,23 @@ async def get_stream(episode_id: str) -> Dict:
                         if sources:
                             file = sources[0].get("file", "")
 
-                            if "vod" in file:
+                            # ✅ SAME FILTER
+                            if "vod" in file and file not in [v["m3u8"] for v in vod_links]:
                                 vod_links.append({
                                     "m3u8": file,
-                                    "subtitles": tracks,
-                                    "server_id": sid
+                                    "subtitles": copy.deepcopy(tracks)
                                 })
 
                 except:
                     continue
 
-            # 🎯 assign sub & dub
-            if vod_links:
+            # 🎯 SAME FINAL LOGIC
+            if len(vod_links) >= 2:
                 sub_data = vod_links[0]
-
-                if len(vod_links) > 1:
-                    dub_data = vod_links[1]
-                else:
-                    dub_data = vod_links[0]  # fallback
-
-                result = {
-                    "episode_id": episode_id,
-                    "sub": {
-                        "m3u8": sub_data["m3u8"],
-                        "subtitles": sub_data["subtitles"]
-                    },
-                    "dub": {
-                        "m3u8": dub_data["m3u8"],
-                        "subtitles": dub_data["subtitles"]
-                    }
-                }
+                dub_data = vod_links[1]
+            elif len(vod_links) == 1:
+                sub_data = vod_links[0]
+                dub_data = vod_links[0]
             else:
                 fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/sub"
 
@@ -572,6 +557,21 @@ async def get_stream(episode_id: str) -> Dict:
                     "sub": {"m3u8": fallback, "subtitles": []},
                     "dub": {"m3u8": fallback, "subtitles": []}
                 }
+
+                cache.set(key, result, TTL["stream"])
+                return result
+
+            result = {
+                "episode_id": episode_id,
+                "sub": {
+                    "m3u8": sub_data["m3u8"],
+                    "subtitles": sub_data["subtitles"]
+                },
+                "dub": {
+                    "m3u8": dub_data["m3u8"],
+                    "subtitles": dub_data["subtitles"]
+                }
+            }
 
             cache.set(key, result, TTL["stream"])
             return result
@@ -584,6 +584,7 @@ async def get_stream(episode_id: str) -> Dict:
         return val
 
     return await refresh()
+
 
 # ──────────────────────────────────────────────
 # SERVICE LAYER — NEW VOD STREAM (v9.1)
