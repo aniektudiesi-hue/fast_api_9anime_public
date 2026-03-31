@@ -480,12 +480,10 @@ async def get_suggest(query: str) -> List:
     return await refresh()
 
 
-
-async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
-    key = f"stream:{episode_id}:{sub}"
+async def get_stream(episode_id: str) -> Dict:
+    key = f"stream:{episode_id}"
     val, is_stale = cache.get(key)
 
-    # ✅ Return fresh cache
     if val and not is_stale:
         return val
 
@@ -497,44 +495,82 @@ async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
             )
 
             loop = asyncio.get_running_loop()
-            server_id = await loop.run_in_executor(
+            server_ids = await loop.run_in_executor(
                 executor,
-                parse_server_id,
+                parse_all_server_ids,
                 servers_data.get("html", ""),
-                sub
+                "sub"
             )
 
-            fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}"
+            vod_links = []
 
-            if not server_id:
+            # 🔥 collect vod links + subtitles
+            for sid in server_ids:
+                try:
+                    src = await http_client.fetch(
+                        f"{BASE_URL}/ajax/episode/sources?id={sid}",
+                        is_json=True
+                    )
+
+                    link = src.get("link", "")
+
+                    if "rapid-cloud.co" in link or "megacloud" in link:
+                        embed_id = link.split("/")[-1].split("?")[0]
+
+                        sources_data = await http_client.fetch(
+                            f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
+                            headers={
+                                "Accept": "*/*",
+                                "Referer": link,
+                                "X-Requested-With": "XMLHttpRequest",
+                                "User-Agent": "Mozilla/5.0",
+                            },
+                            is_json=True
+                        )
+
+                        sources = sources_data.get("sources", [])
+                        tracks = sources_data.get("tracks", [])
+
+                        if sources:
+                            file = sources[0].get("file", "")
+
+                            if "vod" in file:
+                                vod_links.append({
+                                    "m3u8": file,
+                                    "subtitles": tracks,
+                                    "server_id": sid
+                                })
+
+                except:
+                    continue
+
+            # 🎯 assign sub & dub
+            if vod_links:
+                sub_data = vod_links[0]
+
+                if len(vod_links) > 1:
+                    dub_data = vod_links[1]
+                else:
+                    dub_data = vod_links[0]  # fallback
+
                 result = {
-                    "url": fallback,
-                    "source": "fallback"
+                    "episode_id": episode_id,
+                    "sub": {
+                        "m3u8": sub_data["m3u8"],
+                        "subtitles": sub_data["subtitles"]
+                    },
+                    "dub": {
+                        "m3u8": dub_data["m3u8"],
+                        "subtitles": dub_data["subtitles"]
+                    }
                 }
             else:
-                src = await http_client.fetch(
-                    f"{BASE_URL}/ajax/episode/sources?id={server_id}",
-                    is_json=True
-                )
-
-                url = src.get("link")
-
-                # 🔥 UPDATED LOGIC
-                if not url:
-                    sources = src.get("sources", [])
-
-                    if sources:
-                        if sub == "sub":
-                            url = sources[0].get("file")   # first stream
-                        else:
-                            url = sources[-1].get("file")  # last stream
-                    else:
-                        url = fallback
+                fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/sub"
 
                 result = {
-                    "url": url,
-                    "source": "9anime",
-                    "server_id": server_id
+                    "episode_id": episode_id,
+                    "sub": {"m3u8": fallback, "subtitles": []},
+                    "dub": {"m3u8": fallback, "subtitles": []}
                 }
 
             cache.set(key, result, TTL["stream"])
@@ -543,12 +579,10 @@ async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
-    # ✅ Stale → return old + refresh in background
     if is_stale and val:
         asyncio.create_task(refresh())
-        return val  # FIXED
+        return val
 
-    # ✅ No cache → fetch fresh
     return await refresh()
 
 # ──────────────────────────────────────────────
