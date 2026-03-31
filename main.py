@@ -11,6 +11,7 @@ import asyncio
 import logging
 import random
 import time
+import copy
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -295,98 +296,74 @@ class HttpClient:
             headers = {
                 "User-Agent": profile["User-Agent"],
                 "Referer": referer,
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "application/json, text/javascript, */*; q=0.01" if is_json else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             }
-            if profile.get("sec-ch-ua"):
-                headers["sec-ch-ua"] = profile["sec-ch-ua"]
-                headers["sec-ch-ua-mobile"] = profile["sec-ch-ua-mobile"]
-                headers["sec-ch-ua-platform"] = profile["sec-ch-ua-platform"]
             if extra_headers:
                 headers.update(extra_headers)
 
             try:
                 async with self.semaphore:
                     resp = await self.client.get(url, headers=headers)
-                resp.raise_for_status()
-                return resp.json() if is_json else resp.text
-            except Exception:
-                if attempt == 11:
-                    raise
-                if attempt < 3:
-                    delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
-                elif attempt < 7:
-                    delay = 1.5 + random.uniform(0, 0.5)
-                else:
-                    delay = 3.0 + random.uniform(0, 3.0)
-                await asyncio.sleep(delay)
+                    if resp.status_code == 403:
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        continue
+                    resp.raise_for_status()
+                    return resp.json() if is_json else resp.text
+            except Exception as e:
+                if attempt == 11: raise
+                await asyncio.sleep(random.uniform(0.2, 0.5))
 
 http_client = HttpClient()
-
-# ──────────────────────────────────────────────
-# PARSING (Offloaded to ThreadPool)
-# ──────────────────────────────────────────────
 executor = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
+# ──────────────────────────────────────────────
+# PARSERS
+# ──────────────────────────────────────────────
 def parse_search(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
     results = []
-    for item in parser.css("div.flw-item.item-qtip"):
-        img = item.css_first("img")
-        if not img: continue
-        anime_id = item.attributes.get("data-id", "")
-        if anime_id:
-            results.append({
-                "anime_id": anime_id,
-                "title": img.attributes.get("alt", "").strip(),
-                "poster": img.attributes.get("data-src") or img.attributes.get("src") or "",
-            })
+    for node in parser.css("div.item"):
+        try:
+            link = node.css_first("a.name")
+            img = node.css_first("img")
+            if link and img:
+                results.append({
+                    "anime_id": link.attributes.get("href", "").split("/")[-1],
+                    "title": link.text(strip=True),
+                    "poster": img.attributes.get("src", ""),
+                })
+        except: continue
     return results
 
 def parse_episodes(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
-    episodes = []
-    for ep in parser.css("a.item.ep-item"):
-        num = ep.attributes.get("data-number", "")
-        eid = ep.attributes.get("data-id", "")
-        if num and eid:
-            episodes.append({
-                "episode_number": num,
-                "episode_id": eid,
-                "title": ep.attributes.get("title", f"Episode {num}").strip(),
+    eps = []
+    for node in parser.css("a.ep-item"):
+        try:
+            eps.append({
+                "episode_number": node.attributes.get("data-number", ""),
+                "episode_id": node.attributes.get("data-id", ""),
+                "title": node.attributes.get("title", ""),
             })
-    return episodes
+        except: continue
+    return eps
 
-def parse_home(html: str) -> Dict:
+def parse_home(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
-    thumbs: List[str] = []
-    heroes: List[str] = []
-    trending: List[Dict] = []
-
-    for img in parser.css("img.film-poster-img"):
-        a = img.attributes
-        if a.get("data-src"): thumbs.append(a["data-src"])
-        if a.get("src"): heroes.append(a["src"])
-
-    for item in parser.css("div.flw-item"):
-        img = item.css_first("img")
-        if not img: continue
-        a = img.attributes
-        title = a.get("alt", "").strip()
-        anime_id = item.attributes.get("data-id", "")
-        if title and anime_id:
-            trending.append({
-                "anime_id": anime_id,
-                "title": title,
-                "poster": a.get("data-src") or a.get("src") or "",
-            })
-
-    return {"thumbnails": thumbs, "hero_thumbnails": heroes, "trending": trending, "count": len(thumbs)}
-
-def parse_server_id(html: str, sub: str) -> Optional[str]:
-    for s in LexborHTMLParser(html).css("div.item.server-item"):
-        if sub in s.attributes.get("data-type", "").lower():
-            return s.attributes.get("data-id")
-    return None
+    results = []
+    for node in parser.css("div.item"):
+        try:
+            link = node.css_first("a.name")
+            img = node.css_first("img")
+            if link and img:
+                results.append({
+                    "anime_id": link.attributes.get("href", "").split("/")[-1],
+                    "title": link.text(strip=True),
+                    "poster": img.attributes.get("src", ""),
+                })
+        except: continue
+    return results
 
 # Inline BS4-free parser for mew server list using selectolax
 def parse_mew_server_ids(html: str) -> List[str]:
@@ -409,9 +386,9 @@ async def get_search(query: str) -> List[Dict]:
         try:
             html = await http_client.fetch(f"{BASE_URL}/search?keyword={quote(query)}")
             loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(executor, parse_search, html)
-            cache.set(key, results, TTL["search"])
-            return results
+            res = await loop.run_in_executor(executor, parse_search, html)
+            cache.set(key, res, TTL["search"])
+            return res
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
@@ -421,17 +398,18 @@ async def get_search(query: str) -> List[Dict]:
     return await refresh()
 
 async def get_episodes(anime_id: str) -> List[Dict]:
-    key = f"ep:{anime_id}"
+    key = f"eps:{anime_id}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
 
     async def refresh():
         try:
             data = await http_client.fetch(f"{BASE_URL}/ajax/episode/list/{anime_id}", is_json=True)
+            html = data.get("result", "")
             loop = asyncio.get_running_loop()
-            eps = await loop.run_in_executor(executor, parse_episodes, data.get("html", ""))
-            cache.set(key, eps, TTL["episode"])
-            return eps
+            res = await loop.run_in_executor(executor, parse_episodes, html)
+            cache.set(key, res, TTL["episode"])
+            return res
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
 
@@ -440,14 +418,14 @@ async def get_episodes(anime_id: str) -> List[Dict]:
         return val
     return await refresh()
 
-async def get_home() -> Dict:
-    key = "home"
+async def get_home() -> List[Dict]:
+    key = "home:thumbnails"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
 
     async def refresh():
         try:
-            html = await http_client.fetch(f"{BASE_URL}/home")
+            html = await http_client.fetch(BASE_URL)
             loop = asyncio.get_running_loop()
             res = await loop.run_in_executor(executor, parse_home, html)
             cache.set(key, res, TTL["home"])
@@ -479,9 +457,36 @@ async def get_suggest(query: str) -> List:
         return val
     return await refresh()
 
-import asyncio
-import copy
-from bs4 import BeautifulSoup
+async def _fetch_source_from_sid(sid: str) -> Optional[Dict]:
+    """Fetch VOD link and tracks for a single server ID."""
+    try:
+        src = await http_client.fetch(
+            f"{BASE_URL}/ajax/episode/sources?id={sid}",
+            is_json=True
+        )
+        link = src.get("link", "")
+        if "rapid-cloud.co" in link or "megacloud" in link:
+            embed_id = link.split("/")[-1].split("?")[0]
+            sources_data = await http_client.fetch(
+                f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
+                headers={
+                    "Referer": link,
+                    "User-Agent": "Mozilla/5.0"
+                },
+                is_json=True
+            )
+            sources = sources_data.get("sources", [])
+            tracks = sources_data.get("tracks", [])
+            if sources:
+                file = sources[0].get("file", "")
+                if "vod" in file:
+                    return {
+                        "m3u8": file,
+                        "subtitles": copy.deepcopy(tracks)
+                    }
+    except Exception as e:
+        logger.debug(f"Failed to fetch source for sid {sid}: {e}")
+    return None
 
 async def get_stream(episode_id: str) -> dict:
     key = f"stream:{episode_id}"
@@ -492,85 +497,58 @@ async def get_stream(episode_id: str) -> dict:
 
     async def refresh():
         try:
-            # ✅ SAME AS YOUR SCRIPT
             servers_data = await http_client.fetch(
                 f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}",
                 is_json=True
             )
+            
+            parser = LexborHTMLParser(servers_data["html"])
+            
+            # Group servers by type (sub/dub)
+            # 9anime usually has divs with class 'servers-sub' and 'servers-dub'
+            # Each containing '.item.server-item'
+            sub_sids = []
+            dub_sids = []
+            
+            sub_container = parser.css_first(".servers-sub")
+            if sub_container:
+                sub_sids = [n.attributes.get("data-id") for n in sub_container.css(".item.server-item") if n.attributes.get("data-id")]
+            
+            dub_container = parser.css_first(".servers-dub")
+            if dub_container:
+                dub_sids = [n.attributes.get("data-id") for n in dub_container.css(".item.server-item") if n.attributes.get("data-id")]
+                
+            # Fallback: if no containers, just take all and hope for the best (original logic but faster)
+            if not sub_sids and not dub_sids:
+                all_sids = [n.attributes.get("data-id") for n in parser.css(".item.server-item") if n.attributes.get("data-id")]
+                sub_sids = all_sids
+                dub_sids = all_sids
 
-            soup = BeautifulSoup(servers_data["html"], "lxml")
-            items = soup.find_all("div", class_="item server-item")
-            server_ids = [item.get("data-id") for item in items if item.get("data-id")]
-
-            vod_links = []
-
-            # ✅ SAME LOOP AS YOUR SCRIPT
-            for sid in server_ids:
-                try:
-                    src = await http_client.fetch(
-                        f"{BASE_URL}/ajax/episode/sources?id={sid}",
-                        is_json=True
-                    )
-
-                    link = src.get("link", "")
-
-                    if "rapid-cloud.co" in link or "megacloud" in link:
-                        embed_id = link.split("/")[-1].split("?")[0]
-
-                        sources_data = await http_client.fetch(
-                            f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
-                            headers={
-                                "Referer": link,
-                                "User-Agent": "Mozilla/5.0"
-                            },
-                            is_json=True
-                        )
-
-                        sources = sources_data.get("sources", [])
-                        tracks = sources_data.get("tracks", [])
-
-                        if sources:
-                            file = sources[0].get("file", "")
-
-                            # ✅ SAME FILTER
-                            if "vod" in file and file not in [v["m3u8"] for v in vod_links]:
-                                vod_links.append({
-                                    "m3u8": file,
-                                    "subtitles": copy.deepcopy(tracks)
-                                })
-
-                except:
-                    continue
-
-            # 🎯 SAME FINAL LOGIC
-            if len(vod_links) >= 2:
-                sub_data = vod_links[0]
-                dub_data = vod_links[1]
-            elif len(vod_links) == 1:
-                sub_data = vod_links[0]
-                dub_data = vod_links[0]
-            else:
-                fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/sub"
-
-                result = {
-                    "episode_id": episode_id,
-                    "sub": {"m3u8": fallback, "subtitles": []},
-                    "dub": {"m3u8": fallback, "subtitles": []}
-                }
-
-                cache.set(key, result, TTL["stream"])
-                return result
+            # Fetch sources in parallel
+            sub_tasks = [_fetch_source_from_sid(sid) for sid in sub_sids]
+            dub_tasks = [_fetch_source_from_sid(sid) for sid in dub_sids]
+            
+            # Combine all tasks to fetch concurrently
+            all_results = await asyncio.gather(*(sub_tasks + dub_tasks))
+            
+            sub_results = [r for r in all_results[:len(sub_tasks)] if r]
+            dub_results = [r for r in all_results[len(sub_tasks):] if r]
+            
+            sub_data = sub_results[0] if sub_results else None
+            dub_data = dub_results[0] if dub_results else None
+            
+            # Fallback logic
+            fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/sub"
+            
+            if not sub_data:
+                sub_data = {"m3u8": fallback, "subtitles": []}
+            if not dub_data:
+                dub_data = {"m3u8": sub_data["m3u8"] if sub_data else fallback, "subtitles": sub_data["subtitles"] if sub_data else []}
 
             result = {
                 "episode_id": episode_id,
-                "sub": {
-                    "m3u8": sub_data["m3u8"],
-                    "subtitles": sub_data["subtitles"]
-                },
-                "dub": {
-                    "m3u8": dub_data["m3u8"],
-                    "subtitles": dub_data["subtitles"]
-                }
+                "sub": sub_data,
+                "dub": dub_data
             }
 
             cache.set(key, result, TTL["stream"])
@@ -578,6 +556,7 @@ async def get_stream(episode_id: str) -> dict:
 
         except Exception as e:
             logger.error(f"SWR Refresh failed for {key}: {e}")
+            return {"episode_id": episode_id, "sub": None, "dub": None}
 
     if is_stale and val:
         asyncio.create_task(refresh())
@@ -737,7 +716,7 @@ async def route_episodes(anime_id: str):
 
 @app.get("/anime/stream/{episode_id}")
 async def route_stream(episode_id: str, type: str = Query(default="sub", pattern="^(sub|dub)$")):
-    res = await get_stream(episode_id, type)
+    res = await get_stream(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
 @app.get("/home/thumbnails")
