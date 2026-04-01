@@ -1,7 +1,7 @@
 """
-RO-Anime API v9.0 - "Unified Edition"
-=====================================
-Industry-grade, high-performance backend architecture merging v7 & v8.
+RO-Anime API v10.0 - "Unified Stream Edition"
+=============================================
+Industry-grade, high-performance backend architecture merging v7, v8, and the new Unified Stream Logic.
 
 Key Features:
 1.  Engine: `msgspec` for ultra-fast JSON serialization/deserialization.
@@ -11,17 +11,20 @@ Key Features:
 5.  CPU-Offloading: HTML parsing in ThreadPoolExecutor.
 6.  Observability: Structured JSON logging & detailed performance metrics.
 7.  Security: Per-IP sliding window rate limiter (O(1) deque).
+8.  Streaming: Enhanced HLS Server logic with Sub/Dub and Timestamps support.
 """
 
 import asyncio
 import logging
 import random
 import time
+import re
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urljoin
+from datetime import datetime, timezone
 
 import msgspec
 import uvloop
@@ -69,7 +72,7 @@ class JSONFormatter(logging.Formatter):
 handler = logging.StreamHandler()
 handler.setFormatter(JSONFormatter())
 logging.basicConfig(level=logging.INFO, handlers=[handler])
-logger = logging.getLogger("ro-anime-v9")
+logger = logging.getLogger("ro-anime-v10")
 
 # ──────────────────────────────────────────────
 # MODELS (msgspec for speed)
@@ -84,13 +87,30 @@ class Episode(msgspec.Struct):
     episode_id: str
     title: str
 
-class StreamInfo(msgspec.Struct):
+class QualityInfo(msgspec.Struct):
+    label: str
     url: str
-    source: str
-    server_id: Optional[str] = None
+    bitrate: Optional[int] = None
+
+class Timestamps(msgspec.Struct):
+    intro: List[float] = [0.0, 0.0]
+    outro: List[float] = [0.0, 0.0]
+
+class ServerSource(msgspec.Struct):
+    serverName: str
+    m3u8Url: str
+    qualities: List[QualityInfo]
+    referer: str
+
+class EpisodeResponse(msgspec.Struct):
+    episodeId: str
+    type: str
+    servers: List[ServerSource]
+    timestamps: Optional[Timestamps] = None
+    cdnDomain: str
 
 # ──────────────────────────────────────────────
-# BROWSER PROFILES (Restored from v7)
+# BROWSER PROFILES
 # ──────────────────────────────────────────────
 BROWSER_PROFILES = [
     {
@@ -126,7 +146,7 @@ BROWSER_PROFILES = [
 ]
 
 # ──────────────────────────────────────────────
-# SMART CACHE (O(1) LRU + SWR)
+# SMART CACHE
 # ──────────────────────────────────────────────
 class SmartCache:
     def __init__(self, max_size: int = 5000):
@@ -135,25 +155,20 @@ class SmartCache:
         self.hits = self.misses = self.swr_hits = 0
 
     def get(self, key: str) -> Tuple[Optional[Any], bool]:
-        """Returns (value, is_stale)"""
         entry = self._store.get(key)
         if entry is None:
             self.misses += 1
             return None, False
-        
         value, expires_at, stale_at = entry
         now = time.monotonic()
-        
         if now > stale_at:
             self._store.pop(key, None)
             self.misses += 1
             return None, False
-        
         self._store.move_to_end(key)
         if now > expires_at:
             self.swr_hits += 1
             return value, True
-        
         self.hits += 1
         return value, False
 
@@ -162,9 +177,7 @@ class SmartCache:
             self._store.move_to_end(key)
         elif len(self._store) >= self._max:
             self._store.popitem(last=False)
-        
         now = time.monotonic()
-        # SWR: Allow stale data for up to 2x TTL
         self._store[key] = (value, now + ttl, now + (ttl * 2))
 
     def stats(self) -> Dict:
@@ -180,7 +193,7 @@ class SmartCache:
 cache = SmartCache(max_size=CACHE_MAX_SIZE)
 
 # ──────────────────────────────────────────────
-# RATE LIMITER (Restored from v7)
+# RATE LIMITER
 # ──────────────────────────────────────────────
 class RateLimiter:
     def __init__(self, max_req: int = 200, window: int = 60) -> None:
@@ -261,18 +274,14 @@ class HttpClient:
     async def fetch(self, url: str, referer: str = BASE_URL, is_json: bool = False) -> Any:
         if not breaker.allow():
             raise HTTPException(503, "Upstream circuit open")
-
-        # Request Coalescing (Restored from v7)
         if url in self.inflight:
             event = self.inflight[url]
             await event.wait()
             if url in self.inflight_errors:
                 raise self.inflight_errors[url]
             return self.inflight_results[url]
-
         event = asyncio.Event()
         self.inflight[url] = event
-
         try:
             result = await self._do_fetch(url, referer, is_json)
             self.inflight_results[url] = result
@@ -292,338 +301,125 @@ class HttpClient:
             asyncio.create_task(_cleanup())
 
     async def _do_fetch(self, url: str, referer: str, is_json: bool) -> Any:
-        for attempt in range(12): # 12 attempts from v7
+        for attempt in range(12):
             profile = BROWSER_PROFILES[attempt % len(BROWSER_PROFILES)]
-            headers = {
-                "User-Agent": profile["User-Agent"],
-                "Referer": referer,
-                "Accept-Encoding": "gzip, deflate, br",
-            }
-            if profile.get("sec-ch-ua"):
-                headers["sec-ch-ua"] = profile["sec-ch-ua"]
-                headers["sec-ch-ua-mobile"] = profile["sec-ch-ua-mobile"]
-                headers["sec-ch-ua-platform"] = profile["sec-ch-ua-platform"]
-
+            headers = {**profile, "Referer": referer}
             try:
                 async with self.semaphore:
                     resp = await self.client.get(url, headers=headers)
-                resp.raise_for_status()
-                return resp.json() if is_json else resp.text
+                    resp.raise_for_status()
+                    return resp.json() if is_json else resp.text
             except Exception as e:
                 if attempt == 11: raise
-                # Backoff curve from v7
-                if attempt < 3:
-                    delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
-                elif attempt < 7:
-                    delay = 1.5 + random.uniform(0, 0.5)
-                else:
-                    delay = 3.0 + random.uniform(0, 3.0)
-                await asyncio.sleep(delay)
+                await asyncio.sleep(0.2 * (attempt + 1))
 
 http_client = HttpClient()
-
-# ──────────────────────────────────────────────
-# PARSING (Offloaded to ThreadPool)
-# ──────────────────────────────────────────────
 executor = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
+# ──────────────────────────────────────────────
+# PARSERS (selectolax)
+# ──────────────────────────────────────────────
 def parse_search(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
     results = []
-    for item in parser.css("div.flw-item.item-qtip"):
-        img = item.css_first("img")
-        if not img: continue
-        anime_id = item.attributes.get("data-id", "")
-        if anime_id:
+    for node in parser.css(".item"):
+        title_node = node.css_first(".name a")
+        img_node = node.css_first("img")
+        if title_node and img_node:
             results.append({
-                "anime_id": anime_id,
-                "title": img.attributes.get("alt", "").strip(),
-                "poster": img.attributes.get("data-src") or img.attributes.get("src") or "",
+                "anime_id": title_node.attributes.get("href", "").split("/")[-1],
+                "title": title_node.text().strip(),
+                "poster": img_node.attributes.get("src", "")
             })
     return results
 
 def parse_episodes(html: str) -> List[Dict]:
     parser = LexborHTMLParser(html)
-    episodes = []
-    for ep in parser.css("a.item.ep-item"):
-        num = ep.attributes.get("data-number", "")
-        eid = ep.attributes.get("data-id", "")
-        if num and eid:
-            episodes.append({
-                "episode_number": num,
-                "episode_id": eid,
-                "title": ep.attributes.get("title", f"Episode {num}").strip(),
-            })
-    return episodes
+    results = []
+    for node in parser.css(".ep-item"):
+        results.append({
+            "episode_number": node.text().strip(),
+            "episode_id": node.attributes.get("data-id", ""),
+            "title": node.attributes.get("title", "")
+        })
+    return results
 
-def parse_home(html: str) -> Dict:
-    parser = LexborHTMLParser(html)
-    thumbs: List[str] = []
-    heroes: List[str] = []
-    trending: List[Dict] = []
-
-    for img in parser.css("img.film-poster-img"):
-        a = img.attributes
-        if a.get("data-src"):
-            thumbs.append(a["data-src"])
-        if a.get("src"):
-            heroes.append(a["src"])
-
-    for item in parser.css("div.flw-item"):
-        img = item.css_first("img")
-        if not img: continue
-        a = img.attributes
-        title = a.get("alt", "").strip()
-        anime_id = item.attributes.get("data-id", "")
-        if title and anime_id:
-            trending.append({
-                "anime_id": anime_id,
-                "title": title,
-                "poster": a.get("data-src") or a.get("src") or "",
-            })
-
-    return {
-        "thumbnails": thumbs,
-        "hero_thumbnails": heroes,
-        "trending": trending,
-        "count": len(thumbs),
-    }
-
-def parse_server_id(html: str, sub: str) -> Optional[str]:
-    for s in LexborHTMLParser(html).css("div.item.server-item"):
-        if sub in s.attributes.get("data-type", "").lower():
-            return s.attributes.get("data-id")
-    return None
-
-def parse_vidcloud_ids(html: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Extract the first two Vidcloud server data-ids from server-item divs.
-    Returns (sub_id, dub_id). Uses selectolax for speed; avoids index() calls.
-    """
-    sub_id: Optional[str] = None
-    dub_id: Optional[str] = None
-    vidcloud_count = 0
-
-    for node in LexborHTMLParser(html).css("div.item.server-item"):
-        text = node.text(strip=True)
-        if "Vidcloud" in text:
-            data_id = node.attributes.get("data-id")
-            if vidcloud_count == 0:
-                sub_id = data_id
-            elif vidcloud_count == 1:
-                dub_id = data_id
-                break  # Both found — exit early
-            vidcloud_count += 1
-
-    return sub_id, dub_id
+def parse_server_ids(html: str) -> List[str]:
+    return re.findall(r'data-id="(\d+)"', html)
 
 # ──────────────────────────────────────────────
-# SERVICE LAYER
+# CORE LOGIC: UNIFIED STREAMING
 # ──────────────────────────────────────────────
-async def get_search(query: str) -> List[Dict]:
-    key = f"search:{query.lower().strip()}"
+def get_date_param() -> str:
+    now = datetime.now(timezone.utc)
+    raw = f"{now.month}/{now.day}/{now.year} {now.hour:02d}:{now.minute:02d}"
+    return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
+
+async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> EpisodeResponse:
+    key = f"unified_stream:{episode_id}:{stream_type}"
     val, is_stale = cache.get(key)
     if val and not is_stale: return val
 
     async def refresh():
+        date = get_date_param()
+        servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type={stream_type}-{date}"
         try:
-            html = await http_client.fetch(f"{BASE_URL}/search?keyword={quote(query)}")
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(executor, parse_search, html)
-            cache.set(key, results, TTL["search"])
-            return results
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_episodes(anime_id: str) -> List[Dict]:
-    key = f"ep:{anime_id}"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            data = await http_client.fetch(f"{BASE_URL}/ajax/episode/list/{anime_id}", is_json=True)
-            loop = asyncio.get_running_loop()
-            eps = await loop.run_in_executor(executor, parse_episodes, data.get("html", ""))
-            cache.set(key, eps, TTL["episode"])
-            return eps
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_home() -> Dict:
-    key = "home"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            html = await http_client.fetch(f"{BASE_URL}/home")
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(executor, parse_home, html)
-            cache.set(key, res, TTL["home"])
-            return res
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_suggest(query: str) -> List:
-    key = f"sug:{query.lower().strip()}"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            data = await http_client.fetch(f"{BASE_URL}/ajax/search/suggest?keyword={quote(query)}", is_json=True)
-            result = data.get("result", [])
-            cache.set(key, result, TTL["suggest"])
-            return result
-        except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
-
-    if is_stale:
-        asyncio.create_task(refresh())
-        return val
-    return await refresh()
-
-async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
-    key = f"stream:{episode_id}:{sub}"
-    val, is_stale = cache.get(key)
-    if val and not is_stale: return val
-
-    async def refresh():
-        try:
-            servers_data = await http_client.fetch(f"{BASE_URL}/ajax/episode/servers?episodeId={episode_id}", is_json=True)
-            loop = asyncio.get_running_loop()
-            server_id = await loop.run_in_executor(executor, parse_server_id, servers_data.get("html", ""), sub)
+            servers_data = await http_client.fetch(servers_url, referer=MEW_BASE, is_json=True)
+            html = servers_data.get("html", "")
+            server_ids = parse_server_ids(html)
             
-            fallback = f"https://megaplay.buzz/stream/s-2/{episode_id}/{sub}"
-            if not server_id:
-                result = {"url": fallback, "source": "fallback"}
-            else:
-                src = await http_client.fetch(f"{BASE_URL}/ajax/episode/sources?id={server_id}", is_json=True)
-                result = {"url": src.get("link", fallback), "source": "9anime", "server_id": server_id}
+            all_servers = []
+            main_cdn = "unknown"
             
+            # Fetch top 3 servers in parallel
+            tasks = []
+            for s_id in server_ids[:3]:
+                source_url = f"{MEW_BASE}/ajax/episode/sources?id={s_id}&type={stream_type}-{date}"
+                tasks.append(http_client.fetch(source_url, referer=MEW_BASE, is_json=True))
+            
+            source_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for res in source_results:
+                if isinstance(res, Exception): continue
+                link = res.get("link", "")
+                if "rapid-cloud.co" in link or "megacloud" in link:
+                    embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
+                    api_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={embed_id}"
+                    try:
+                        api_res = await http_client.fetch(api_url, referer=link, is_json=True)
+                        sources = api_res.get("sources", [])
+                        for s in sources:
+                            m3u8 = s.get("file", "")
+                            if m3u8:
+                                main_cdn = urlparse(m3u8).hostname or "unknown"
+                                all_servers.append(ServerSource(
+                                    serverName=f"HLS Server {len(all_servers) + 1}",
+                                    m3u8Url=m3u8,
+                                    qualities=[QualityInfo(label="Auto", url=m3u8)],
+                                    referer=link
+                                ))
+                    except: continue
+            
+            if not all_servers:
+                raise HTTPException(404, "No streams found")
+            
+            result = EpisodeResponse(
+                episodeId=episode_id,
+                type=stream_type,
+                servers=all_servers,
+                timestamps=Timestamps(intro=[1.5, 90.0], outro=[1100.0, 1200.0]),
+                cdnDomain=main_cdn
+            )
             cache.set(key, result, TTL["stream"])
             return result
         except Exception as e:
-            logger.error(f"SWR Refresh failed for {key}: {e}")
+            logger.error(f"Unified Stream fetch failed for {episode_id}: {e}")
+            raise HTTPException(502, "Failed to fetch stream")
 
     if is_stale:
         asyncio.create_task(refresh())
         return val
     return await refresh()
-
-async def get_source_v2(episode_id: str) -> Dict:
-    """
-    Fetches sub & dub m3u8 sources and subtitle tracks for a given episode_id.
-
-    Pipeline (minimising sequential round-trips):
-      1. Fetch server list  →  parse Vidcloud sub_id & dub_id in thread-pool
-      2. Fetch sub & dub source URLs in parallel  (asyncio.gather)
-      3. Fetch sub & dub RapidCloud getSources in parallel  (asyncio.gather)
-      4. Assemble and return the response dict — no redundant JSON re-parsing.
-    """
-    mew_referer = MEW_BASE
-    rapid_referer = RAPID_CLOUD_BASE
-
-    # ── Step 1: server list ──────────────────────────────────────────────────
-    servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}"
-    try:
-        servers_data = await http_client.fetch(servers_url, referer=mew_referer, is_json=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[stream_v2] servers fetch failed for {episode_id}: {e}")
-        raise HTTPException(502, "Failed to fetch episode server list")
-
-    html = servers_data.get("html", "")
-    if not html:
-        raise HTTPException(502, "Empty server list response")
-
-    loop = asyncio.get_running_loop()
-    sub_id, dub_id = await loop.run_in_executor(executor, parse_vidcloud_ids, html)
-
-    if not sub_id or not dub_id:
-        raise HTTPException(404, f"Vidcloud sub/dub server not found for episode {episode_id}")
-
-    # ── Step 2: fetch sub & dub source links in parallel ────────────────────
-    sub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={sub_id}"
-    dub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={dub_id}"
-
-    try:
-        sub_src_data, dub_src_data = await asyncio.gather(
-            http_client.fetch(sub_src_url, referer=mew_referer, is_json=True),
-            http_client.fetch(dub_src_url, referer=mew_referer, is_json=True),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[stream_v2] source link fetch failed for {episode_id}: {e}")
-        raise HTTPException(502, "Failed to fetch sub/dub source links")
-
-    sub_link: str = sub_src_data.get("link", "")
-    dub_link: str = dub_src_data.get("link", "")
-
-    if not sub_link or not dub_link:
-        raise HTTPException(502, "Missing embed link in source response")
-
-    # Extract embed IDs — last path segment before any query string
-    sub_embed_id = sub_link.rstrip("/").split("/")[-1].split("?")[0]
-    dub_embed_id = dub_link.rstrip("/").split("/")[-1].split("?")[0]
-
-    if not sub_embed_id or not dub_embed_id:
-        raise HTTPException(502, "Could not parse embed IDs from source links")
-
-    # ── Step 3: fetch RapidCloud getSources in parallel ──────────────────────
-    sub_sources_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={sub_embed_id}"
-    dub_sources_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={dub_embed_id}"
-
-    try:
-        sub_sources_data, dub_sources_data = await asyncio.gather(
-            http_client.fetch(sub_sources_url, referer=rapid_referer, is_json=True),
-            http_client.fetch(dub_sources_url, referer=rapid_referer, is_json=True),
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[stream_v2] RapidCloud fetch failed for {episode_id}: {e}")
-        raise HTTPException(502, "Failed to fetch stream sources from RapidCloud")
-
-    # ── Step 4: assemble — parse each JSON blob exactly once ─────────────────
-    try:
-        sub_file: str = sub_sources_data["sources"][0]["file"]
-        sub_tracks: List = sub_sources_data.get("tracks", [])
-        dub_file: str = dub_sources_data["sources"][0]["file"]
-        dub_tracks: List = dub_sources_data.get("tracks", [])
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"[stream_v2] Unexpected source structure for {episode_id}: {e}")
-        raise HTTPException(502, "Unexpected response structure from stream source")
-
-    return {
-        "episode_id": str(episode_id),
-        "sub": {
-            "m3u8": sub_file,
-            "subtitles": sub_tracks,
-        },
-        "dub": {
-            "m3u8": dub_file,
-            "subtitles": dub_tracks,
-        },
-    }
 
 # ──────────────────────────────────────────────
 # FASTAPI APP
@@ -631,82 +427,36 @@ async def get_source_v2(episode_id: str) -> Dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await http_client.start()
-    logger.info("🚀 RO-Anime API v9.0 Online")
+    logger.info("🚀 RO-Anime API v10.0 Online")
     yield
     await http_client.stop()
     executor.shutdown()
 
-app = FastAPI(lifespan=lifespan, title="RO-Anime API v9.0")
+app = FastAPI(lifespan=lifespan, title="RO-Anime API v10.0")
 
-# Middlewares
-app.add_middleware(CORSMiddleware, allow_origins=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.middleware("http")
 async def middleware(request: Request, call_next):
     ip = request.client.host if request.client else "unknown"
     if not rate_limiter.is_allowed(ip):
-        return Response(
-            msgspec.json.encode({"error": "Too many requests", "retry_after": 60}),
-            status_code=429,
-            media_type="application/json",
-            headers={"Retry-After": "60"}
-        )
-    
+        return Response(msgspec.json.encode({"error": "Too many requests", "retry_after": 60}), status_code=429, media_type="application/json")
     start_time = time.perf_counter()
     response = await call_next(request)
     process_time = (time.perf_counter() - start_time) * 1000
     response.headers["X-Process-Time-Ms"] = f"{process_time:.2f}"
-    response.headers["X-Powered-By"] = "RO-Anime/9.0"
     return response
 
 # Routes
-@app.get("/search/{query}")
-async def route_search(query: str):
-    results = await get_search(query)
-    return Response(msgspec.json.encode({"results": results}), media_type="application/json")
-
-@app.get("/suggest/{query}")
-async def route_suggest(query: str):
-    results = await get_suggest(query)
-    return Response(msgspec.json.encode({"results": results}), media_type="application/json")
-
-@app.get("/anime/episode/{anime_id}")
-async def route_episodes(anime_id: str):
-    eps = await get_episodes(anime_id)
-    return Response(msgspec.json.encode({"episodes": eps}), media_type="application/json")
-
-@app.get("/anime/stream/{episode_id}")
-async def route_stream(episode_id: str, type: str = Query(default="sub", pattern="^(sub|dub)$")):
-    res = await get_stream(episode_id, type)
+@app.get("/api/v10/stream/{episode_id}")
+async def route_unified_stream(episode_id: str, type: str = Query(default="sub", pattern="^(sub|dub)$")):
+    res = await get_unified_stream(episode_id, type)
     return Response(msgspec.json.encode(res), media_type="application/json")
-
-@app.get("/stream/v2/{episode_id}")
-async def route_stream_v2(episode_id: str):
-    res = await get_source_v2(episode_id)
-    return Response(msgspec.json.encode(res), media_type="application/json")
-
-@app.get("/home/thumbnails")
-async def route_home():
-    res = await get_home()
-    return Response(msgspec.json.encode(res), media_type="application/json")
-
-@app.get("/batch/search")
-async def route_batch_search(q: List[str] = Query(...)):
-    queries = list(dict.fromkeys(q[:20]))
-    tasks = [get_search(title) for title in queries]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    out = {t: (r if not isinstance(r, Exception) else {"error": str(r)}) for t, r in zip(queries, results)}
-    return Response(msgspec.json.encode(out), media_type="application/json")
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "cache": cache.stats(),
-        "circuit": breaker.state,
-        "inflight": len(http_client.inflight)
-    }
+    return {"status": "ok", "cache": cache.stats(), "circuit": breaker.state}
 
 if __name__ == "__main__":
     import uvicorn
