@@ -111,9 +111,9 @@ class EpisodeResponse(msgspec.Struct):
     episodeId: str
     type: str
     servers: List[ServerSource]
+    cdnDomain: str
     subtitles: List[Subtitle] = msgspec.field(default_factory=list)
     timestamps: Optional[Timestamps] = None
-    cdnDomain: str
 
 # ──────────────────────────────────────────────
 # BROWSER PROFILES
@@ -426,9 +426,9 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                 episodeId=episode_id,
                 type=stream_type,
                 servers=all_servers,
+                cdnDomain=main_cdn,
                 subtitles=all_subtitles,
-                timestamps=Timestamps(intro=[1.5, 90.0], outro=[1100.0, 1200.0]),
-                cdnDomain=main_cdn
+                timestamps=Timestamps(intro=[1.5, 90.0], outro=[1100.0, 1200.0])
             )
             cache.set(key, result, TTL["stream"])
             return result
