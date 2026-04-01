@@ -93,8 +93,13 @@ class QualityInfo(msgspec.Struct):
     bitrate: Optional[int] = None
 
 class Timestamps(msgspec.Struct):
-    intro: List[float] = [0.0, 0.0]
-    outro: List[float] = [0.0, 0.0]
+    intro: List[float] = msgspec.field(default_factory=lambda: [0.0, 0.0])
+    outro: List[float] = msgspec.field(default_factory=lambda: [0.0, 0.0])
+
+class Subtitle(msgspec.Struct):
+    file: str
+    label: str
+    default: bool = False
 
 class ServerSource(msgspec.Struct):
     serverName: str
@@ -106,6 +111,7 @@ class EpisodeResponse(msgspec.Struct):
     episodeId: str
     type: str
     servers: List[ServerSource]
+    subtitles: List[Subtitle] = msgspec.field(default_factory=list)
     timestamps: Optional[Timestamps] = None
     cdnDomain: str
 
@@ -369,6 +375,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
             server_ids = parse_server_ids(html)
             
             all_servers = []
+            all_subtitles = []
             main_cdn = "unknown"
             
             # Fetch top 3 servers in parallel
@@ -387,6 +394,18 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                     api_url = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={embed_id}"
                     try:
                         api_res = await http_client.fetch(api_url, referer=link, is_json=True)
+                        
+                        # Extract subtitles from the first server that has them
+                        if not all_subtitles:
+                            subs_data = api_res.get("tracks", [])
+                            for sub in subs_data:
+                                if sub.get("kind") == "captions":
+                                    all_subtitles.append(Subtitle(
+                                        file=sub.get("file"),
+                                        label=sub.get("label"),
+                                        default=sub.get("default", False)
+                                    ))
+
                         sources = api_res.get("sources", [])
                         for s in sources:
                             m3u8 = s.get("file", "")
@@ -407,6 +426,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                 episodeId=episode_id,
                 type=stream_type,
                 servers=all_servers,
+                subtitles=all_subtitles,
                 timestamps=Timestamps(intro=[1.5, 90.0], outro=[1100.0, 1200.0]),
                 cdnDomain=main_cdn
             )
