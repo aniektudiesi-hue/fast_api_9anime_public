@@ -1,49 +1,41 @@
 """
-RO-Anime API v10.0 - "Unified Stream Edition" [DEBUGGED]
-=========================================================
-Bugs fixed (8 total — see inline BUG-FIX comments):
+RO-Anime API v10.0 - "Unified Stream Edition"
+==============================================
+Base: v9.0 infrastructure (superior parsers, backoff curve, parse_home with
+      trending/hero, parse_search with flw-item.item-qtip, parse_episodes
+      with a.item.ep-item).
 
-  BUG-1  get_search() / get_suggest() / get_home() — SWR refresh returns None
-         on exception instead of raising, causing the route to return None → crash.
-
-  BUG-2  get_unified_stream() — server list headers missing Referer/Origin for
-         MEW_BASE requests. The HttpClient only sets a generic Referer from the
-         `referer` arg but never sets Origin, so nine.mewcdn.online rejects it.
-
-  BUG-3  get_unified_stream() — bare `except: continue` silently swallows ALL
-         errors including HTTPException/cancellation. Changed to `except Exception`.
-
-  BUG-4  get_source_v2() — servers_url missing `&type=` param. The endpoint
-         requires type context; without it the server list is empty/wrong.
-
-  BUG-5  get_source_v2() — sub_src_url / dub_src_url also missing the date
-         param that MEW_BASE requires (same date param as get_unified_stream).
-
-  BUG-6  HttpClient._do_fetch() — headers never include Origin, only Referer.
-         MEW_BASE and RapidCloud both check Origin header. Added per-call Origin.
-
-  BUG-7  parse_search() — CSS selector `.item` is too broad; it matches suggest
-         items too. On 9animetv.to the search results live under `.film-list .item`.
-         Wrong selector = empty results = search always returns [].
-
-  BUG-8  SmartCache.get() — is_stale logic inverted. Returns (value, True) when
-         now > expires_at, meaning a fresh entry is flagged stale immediately
-         because expires_at == now + ttl and stale_at == now + ttl*2. The SWR
-         window should be (expires_at, stale_at), not just now > expires_at.
-         Fixed: is_stale only when now is BETWEEN expires_at and stale_at.
+Added from v10.0:
+  - New msgspec models: QualityInfo, Timestamps, Subtitle, ServerSource,
+    EpisodeResponse
+  - HttpClient.fetch gains `origin` param (fixes MEW_BASE / RapidCloud 403s)
+  - Full Origin header in _do_fetch (BUG-6 fix)
+  - get_date_param() helper
+  - get_unified_stream() — the full v10 pipeline that the player calls at
+    GET /api/v10/stream/{episode_id}?type=sub|dub
+  - /api/v10/stream/{episode_id} route
+  - SmartCache.get() SWR window fixed (BUG-8: is_stale only in SWR window,
+    not immediately after a fresh set)
+  - All SWR refresh() functions re-raise on exception (BUG-1 fix)
+  - get_source_v2() gets &type= param and date param (BUG-4, BUG-5 fixes)
+  - get_unified_stream() passes origin= on all MEW/RapidCloud calls (BUG-2)
+  - bare except replaced with except Exception in unified stream (BUG-3)
+  - TTL entry for "unified_stream" added
+  - /home/thumbnails returns the flat trending list the player expects
+  - Version bumped to 10.0 throughout
 """
 
 import asyncio
 import logging
 import random
-import time
 import re
+import time
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar
-from urllib.parse import quote, urlparse, urljoin
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import quote, urlparse
 
 import msgspec
 import uvloop
@@ -64,12 +56,13 @@ CACHE_MAX_SIZE       = 5000
 PARSER_WORKERS       = 4
 
 TTL = {
-    "search":    600,
-    "episode":   300,
-    "suggest":   600,
-    "home":      180,
-    "stream":    120,
-    "stream_v2": 120,
+    "search":         600,
+    "episode":        300,
+    "suggest":        600,
+    "home":           180,
+    "stream":         120,
+    "stream_v2":      120,
+    "unified_stream": 120,   # v10 addition
 }
 
 # ──────────────────────────────────────────────
@@ -93,7 +86,7 @@ logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("ro-anime-v10")
 
 # ──────────────────────────────────────────────
-# MODELS
+# MODELS (msgspec for speed)
 # ──────────────────────────────────────────────
 class AnimeBase(msgspec.Struct):
     anime_id: str
@@ -110,6 +103,7 @@ class StreamInfo(msgspec.Struct):
     source:    str
     server_id: Optional[str] = None
 
+# ── v10 models ────────────────────────────────
 class QualityInfo(msgspec.Struct):
     label:   str
     url:     str
@@ -135,8 +129,8 @@ class EpisodeResponse(msgspec.Struct):
     type:       str
     servers:    List[ServerSource]
     cdnDomain:  str
-    subtitles:  List[Subtitle]          = msgspec.field(default_factory=list)
-    timestamps: Optional[Timestamps]    = None
+    subtitles:  List[Subtitle]       = msgspec.field(default_factory=list)
+    timestamps: Optional[Timestamps] = None
 
 # ──────────────────────────────────────────────
 # BROWSER PROFILES
@@ -200,23 +194,14 @@ class SmartCache:
 
         self._store.move_to_end(key)
 
-        # ── BUG-8 FIX ─────────────────────────────────────────────────────────
-        # Original: `if now > expires_at: return value, True`
-        # Problem:  A brand-new entry has expires_at = now+ttl, stale_at = now+ttl*2.
-        #           The flag is_stale=True only when now is in the SWR window
-        #           (expires_at < now < stale_at), NOT immediately after set().
-        #           Original code was correct in direction but the cached value
-        #           was being returned as stale on the very first hit because
-        #           the SWR check happened before the fresh check. Fixed: fresh
-        #           check first, then SWR window check.
+        # BUG-8 FIX: fresh check first; is_stale only in the SWR window
         if now <= expires_at:
             self.hits += 1
-            return value, False          # fresh — not stale
+            return value, False          # fresh
 
-        # now is in (expires_at, stale_at) → SWR window → serve stale, trigger refresh
+        # now is in (expires_at, stale_at) → SWR window
         self.swr_hits += 1
         return value, True
-        # ── END FIX ───────────────────────────────────────────────────────────
 
     def set(self, key: str, value: Any, ttl: int) -> None:
         if key in self._store:
@@ -267,10 +252,10 @@ rate_limiter = RateLimiter()
 # ──────────────────────────────────────────────
 class CircuitBreaker:
     def __init__(self, threshold: int = 10, recovery_time: int = 30):
-        self.threshold        = threshold
-        self.recovery_time    = recovery_time
-        self.failures         = 0
-        self.state            = "CLOSED"
+        self.threshold         = threshold
+        self.recovery_time     = recovery_time
+        self.failures          = 0
+        self.state             = "CLOSED"
         self.last_failure_time = 0
 
     def allow(self) -> bool:
@@ -299,11 +284,11 @@ breaker = CircuitBreaker()
 # ──────────────────────────────────────────────
 class HttpClient:
     def __init__(self):
-        self.client:           Optional[AsyncClient]       = None
-        self.semaphore                                      = asyncio.Semaphore(UPSTREAM_CONCURRENCY)
-        self.inflight:         Dict[str, asyncio.Event]    = {}
-        self.inflight_results: Dict[str, Any]              = {}
-        self.inflight_errors:  Dict[str, Exception]        = {}
+        self.client:           Optional[AsyncClient]    = None
+        self.semaphore                                   = asyncio.Semaphore(UPSTREAM_CONCURRENCY)
+        self.inflight:         Dict[str, asyncio.Event] = {}
+        self.inflight_results: Dict[str, Any]           = {}
+        self.inflight_errors:  Dict[str, Exception]     = {}
 
     async def start(self):
         self.client = AsyncClient(
@@ -319,14 +304,15 @@ class HttpClient:
 
     async def fetch(
         self,
-        url:      str,
-        referer:  str  = BASE_URL,
-        origin:   str  = "",          # ← BUG-6 FIX: added explicit origin param
-        is_json:  bool = False,
+        url:     str,
+        referer: str  = BASE_URL,
+        origin:  str  = "",        # v10 addition — needed by MEW_BASE & RapidCloud
+        is_json: bool = False,
     ) -> Any:
         if not breaker.allow():
             raise HTTPException(503, "Upstream circuit open")
 
+        # Request coalescing
         if url in self.inflight:
             event = self.inflight[url]
             await event.wait()
@@ -364,22 +350,20 @@ class HttpClient:
     ) -> Any:
         for attempt in range(12):
             profile = BROWSER_PROFILES[attempt % len(BROWSER_PROFILES)]
-            # ── BUG-6 FIX ─────────────────────────────────────────────────────
-            # Original: headers only had Referer. Both MEW_BASE and RapidCloud
-            # validate Origin. Without it, MEW_BASE returns 403 on every request.
+            # v10 BUG-6 FIX: include Origin header — required by MEW_BASE & RapidCloud
             headers = {
                 **profile,
-                "Referer": referer,
-                "Accept":  "*/*",
-                "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-                "Connection": "keep-alive",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "cross-site",
+                "Referer":          referer,
+                "Accept":           "*/*",
+                "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
+                "Connection":       "keep-alive",
+                "Sec-Fetch-Dest":   "empty",
+                "Sec-Fetch-Mode":   "cors",
+                "Sec-Fetch-Site":   "cross-site",
             }
             if origin:
                 headers["Origin"] = origin
-            # ── END FIX ───────────────────────────────────────────────────────
+
             try:
                 async with self.semaphore:
                     resp = await self.client.get(url, headers=headers)
@@ -388,40 +372,40 @@ class HttpClient:
             except Exception as e:
                 if attempt == 11:
                     raise
-                await asyncio.sleep(0.2 * (attempt + 1))
+                # v9 backoff curve (better than v10's flat 0.2*attempt)
+                if attempt < 3:
+                    delay = (0.3 * (2 ** attempt)) + random.uniform(0, 0.2)
+                elif attempt < 7:
+                    delay = 1.5 + random.uniform(0, 0.5)
+                else:
+                    delay = 3.0 + random.uniform(0, 3.0)
+                await asyncio.sleep(delay)
 
 http_client = HttpClient()
 executor    = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
 # ──────────────────────────────────────────────
-# PARSERS
+# PARSERS  (v9 versions — more precise selectors)
 # ──────────────────────────────────────────────
 def parse_search(html: str) -> List[Dict]:
+    """v9 parser: uses div.flw-item.item-qtip — precise, no false matches."""
     parser  = LexborHTMLParser(html)
     results = []
-    # ── BUG-7 FIX ─────────────────────────────────────────────────────────────
-    # Original selector `.item` matched every `.item` on the page including
-    # suggest/home items, returning wrong data or empty results.
-    # 9animetv.to search results are inside `.film-list .item` (or `.flw-item`
-    # depending on page version). Try both, fall back to original as last resort.
-    nodes = parser.css(".film-list .item") or parser.css(".flw-item") or parser.css(".item")
-    # ── END FIX ───────────────────────────────────────────────────────────────
-    for node in nodes:
-        title_node = node.css_first(".film-name a") or node.css_first(".name a")
-        img_node   = node.css_first("img")
-        if title_node and img_node:
-            href = title_node.attributes.get("href", "")
+    for item in parser.css("div.flw-item.item-qtip"):
+        img = item.css_first("img")
+        if not img:
+            continue
+        anime_id = item.attributes.get("data-id", "")
+        if anime_id:
             results.append({
-                "anime_id": href.split("/")[-1].split("?")[0],
-                "title":    title_node.text().strip(),
-                "poster":   (
-                    img_node.attributes.get("data-src")
-                    or img_node.attributes.get("src", "")
-                ),
+                "anime_id": anime_id,
+                "title":    img.attributes.get("alt", "").strip(),
+                "poster":   img.attributes.get("data-src") or img.attributes.get("src") or "",
             })
     return results
 
 def parse_suggest(html: str) -> List[Dict]:
+    """Parse suggestion results from the AJAX suggest endpoint."""
     parser  = LexborHTMLParser(html)
     results = []
     for node in parser.css(".item"):
@@ -431,76 +415,95 @@ def parse_suggest(html: str) -> List[Dict]:
             results.append({
                 "anime_id": node.attributes.get("href", "").split("/")[-1],
                 "title":    title_node.text().strip(),
-                "poster":   (
-                    img_node.attributes.get("data-src")
-                    or img_node.attributes.get("src", "")
-                ),
+                "poster":   img_node.attributes.get("data-src") or img_node.attributes.get("src", ""),
             })
     return results
 
 def parse_episodes(html: str) -> List[Dict]:
-    parser  = LexborHTMLParser(html)
-    results = []
-    for node in parser.css(".ep-item"):
-        results.append({
-            "episode_number": node.text().strip(),
-            "episode_id":     node.attributes.get("data-id", ""),
-            "title":          node.attributes.get("title", ""),
-        })
-    return results
-
-def parse_server_id(html: str, sub: str) -> Optional[str]:
-    parser = LexborHTMLParser(html)
-    for node in parser.css(".server-item"):
-        if node.attributes.get("data-type") == sub:
-            return node.attributes.get("data-id")
-    return None
-
-def parse_vidcloud_ids(html: str) -> Tuple[Optional[str], Optional[str]]:
-    parser     = LexborHTMLParser(html)
-    sub_id     = dub_id = None
-    for node in parser.css(".server-item"):
-        s_name = node.text().lower()
-        if "vidcloud" in s_name or "megacloud" in s_name:
-            if node.attributes.get("data-type") == "sub":
-                sub_id = node.attributes.get("data-id")
-            elif node.attributes.get("data-type") == "dub":
-                dub_id = node.attributes.get("data-id")
-    return sub_id, dub_id
+    """v9 parser: uses a.item.ep-item — matches 9animetv episode anchor elements."""
+    parser   = LexborHTMLParser(html)
+    episodes = []
+    for ep in parser.css("a.item.ep-item"):
+        num = ep.attributes.get("data-number", "")
+        eid = ep.attributes.get("data-id", "")
+        if num and eid:
+            episodes.append({
+                "episode_number": num,
+                "episode_id":     eid,
+                "title":          ep.attributes.get("title", f"Episode {num}").strip(),
+            })
+    return episodes
 
 def parse_home(html: str) -> List[Dict]:
+    """
+    v9 parser extended: returns a flat list of {anime_id, title, poster}
+    from the trending/featured items on the home page.
+    The frontend (player.html) expects a plain JSON array from /home/thumbnails.
+    """
     parser  = LexborHTMLParser(html)
     results = []
-    for node in parser.css(".item"):
-        title_node = node.css_first(".name a")
-        img_node   = node.css_first("img")
-        if title_node and img_node:
+    for item in parser.css("div.flw-item"):
+        img = item.css_first("img")
+        if not img:
+            continue
+        title    = img.attributes.get("alt", "").strip()
+        anime_id = item.attributes.get("data-id", "")
+        if title and anime_id:
             results.append({
-                "anime_id": title_node.attributes.get("href", "").split("/")[-1],
-                "title":    title_node.text().strip(),
-                "poster":   (
-                    img_node.attributes.get("data-src")
-                    or img_node.attributes.get("src", "")
-                ),
+                "anime_id": anime_id,
+                "title":    title,
+                "poster":   img.attributes.get("data-src") or img.attributes.get("src") or "",
             })
     return results
 
+def parse_server_id(html: str, sub: str) -> Optional[str]:
+    for s in LexborHTMLParser(html).css("div.item.server-item"):
+        if sub in s.attributes.get("data-type", "").lower():
+            return s.attributes.get("data-id")
+    return None
+
+def parse_vidcloud_ids(html: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    v9 approach: find first two Vidcloud server-items.
+    Returns (sub_id, dub_id).
+    """
+    sub_id: Optional[str] = None
+    dub_id: Optional[str] = None
+    count = 0
+    for node in LexborHTMLParser(html).css("div.item.server-item"):
+        text = node.text(strip=True)
+        if "Vidcloud" in text:
+            data_id = node.attributes.get("data-id")
+            if count == 0:
+                sub_id = data_id
+            elif count == 1:
+                dub_id = data_id
+                break
+            count += 1
+    return sub_id, dub_id
+
 def parse_server_ids(html: str) -> List[str]:
+    """v10 helper: extract all data-id values for unified stream pipeline."""
     return re.findall(r'data-id="(\d+)"', html)
 
 # ──────────────────────────────────────────────
-# CORE LOGIC
+# V10 HELPER: DATE PARAM
+# ──────────────────────────────────────────────
+def get_date_param() -> str:
+    """
+    MEW_BASE /ajax/episode/servers and /ajax/episode/sources both require a
+    URL-encoded datetime param in the format M/D/YYYY HH:MM (UTC).
+    """
+    now = datetime.now(timezone.utc)
+    raw = f"{now.month}/{now.day}/{now.year} {now.hour:02d}:{now.minute:02d}"
+    return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
+
+# ──────────────────────────────────────────────
+# SERVICE LAYER
 # ──────────────────────────────────────────────
 
-# ── BUG-1 PATTERN FIX (applied to all SWR functions) ─────────────────────────
-# Original: refresh() caught all exceptions and returned None implicitly.
-# This meant the route handler received None and either crashed serialising it
-# or returned an empty/null response with HTTP 200.
-# Fix: re-raise inside refresh() so the caller gets a proper HTTPException.
-# ── END NOTE ──────────────────────────────────────────────────────────────────
-
 async def get_search(query: str) -> List[Dict]:
-    key          = f"search:{query}"
+    key           = f"search:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale:
         return val
@@ -514,7 +517,7 @@ async def get_search(query: str) -> List[Dict]:
             return results
         except Exception as e:
             logger.error(f"search refresh failed for '{query}': {e}")
-            raise  # BUG-1 FIX: was silently returning None
+            raise  # BUG-1 FIX: re-raise so route returns proper HTTP error
 
     if is_stale:
         asyncio.create_task(refresh())
@@ -522,19 +525,23 @@ async def get_search(query: str) -> List[Dict]:
     return await refresh()
 
 
-async def get_suggest(query: str) -> List[Dict]:
-    key           = f"suggest:{query}"
+async def get_suggest(query: str) -> List:
+    key           = f"sug:{query.lower().strip()}"
     val, is_stale = cache.get(key)
     if val and not is_stale:
         return val
 
     async def refresh():
         try:
-            html    = await http_client.fetch(f"{BASE_URL}/ajax/search/suggest?keyword={quote(query)}")
-            loop    = asyncio.get_running_loop()
-            results = await loop.run_in_executor(executor, parse_suggest, html)
-            cache.set(key, results, TTL["suggest"])
-            return results
+            data   = await http_client.fetch(
+                f"{BASE_URL}/ajax/search/suggest?keyword={quote(query)}", is_json=True
+            )
+            # 9animetv returns HTML inside a JSON envelope; parse it
+            html   = data.get("html", "")
+            loop   = asyncio.get_running_loop()
+            result = await loop.run_in_executor(executor, parse_suggest, html) if html else data.get("result", [])
+            cache.set(key, result, TTL["suggest"])
+            return result
         except Exception as e:
             logger.error(f"suggest refresh failed for '{query}': {e}")
             raise  # BUG-1 FIX
@@ -546,20 +553,20 @@ async def get_suggest(query: str) -> List[Dict]:
 
 
 async def get_episodes(anime_id: str) -> List[Dict]:
-    key           = f"episode:{anime_id}"
+    key           = f"ep:{anime_id}"
     val, is_stale = cache.get(key)
     if val and not is_stale:
         return val
 
     async def refresh():
         try:
-            data    = await http_client.fetch(
+            data = await http_client.fetch(
                 f"{BASE_URL}/ajax/episode/list/{anime_id}", is_json=True
             )
-            loop    = asyncio.get_running_loop()
-            results = await loop.run_in_executor(executor, parse_episodes, data.get("html", ""))
-            cache.set(key, results, TTL["episode"])
-            return results
+            loop = asyncio.get_running_loop()
+            eps  = await loop.run_in_executor(executor, parse_episodes, data.get("html", ""))
+            cache.set(key, eps, TTL["episode"])
+            return eps
         except Exception as e:
             logger.error(f"episodes refresh failed for '{anime_id}': {e}")
             raise  # BUG-1 FIX
@@ -571,14 +578,20 @@ async def get_episodes(anime_id: str) -> List[Dict]:
 
 
 async def get_home() -> List[Dict]:
-    key           = "home:thumbnails"
+    """
+    Returns a flat list of {anime_id, title, poster} objects.
+    The frontend reads this as a plain JSON array and uses:
+      - poster URLs   → hero slider images
+      - full objects  → dynamic anime grid cards
+    """
+    key           = "home"
     val, is_stale = cache.get(key)
     if val and not is_stale:
         return val
 
     async def refresh():
         try:
-            html    = await http_client.fetch(BASE_URL)
+            html    = await http_client.fetch(f"{BASE_URL}/home")
             loop    = asyncio.get_running_loop()
             results = await loop.run_in_executor(executor, parse_home, html)
             cache.set(key, results, TTL["home"])
@@ -629,22 +642,20 @@ async def get_stream(episode_id: str, sub: str = "sub") -> Dict:
 
 
 async def get_source_v2(episode_id: str) -> Dict:
+    """
+    Fetches sub & dub m3u8 sources and subtitle tracks.
+    Pipeline: server list → vidcloud IDs → source links → RapidCloud getSources.
+    All parallel where possible.
+    """
     mew_referer   = MEW_BASE
     rapid_referer = RAPID_CLOUD_BASE
 
-    # ── BUG-4 FIX ─────────────────────────────────────────────────────────────
-    # Original: servers_url had NO &type= param → server list returned wrong/empty data.
-    # MEW_BASE endpoint requires the type param to filter sub/dub server items.
-    # Using "sub" as default here since v2 returns both sub+dub embed IDs itself.
-    # ── END FIX ───────────────────────────────────────────────────────────────
+    # BUG-4 FIX: &type= param required; BUG-2 FIX: origin= required
+    date        = get_date_param()
     servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type=sub"
-
     try:
         servers_data = await http_client.fetch(
-            servers_url,
-            referer=mew_referer,
-            origin=MEW_BASE,   # BUG-6 FIX: pass origin
-            is_json=True,
+            servers_url, referer=mew_referer, origin=MEW_BASE, is_json=True
         )
     except HTTPException:
         raise
@@ -656,19 +667,15 @@ async def get_source_v2(episode_id: str) -> Dict:
     if not html:
         raise HTTPException(502, "Empty server list response")
 
-    loop          = asyncio.get_running_loop()
+    loop           = asyncio.get_running_loop()
     sub_id, dub_id = await loop.run_in_executor(executor, parse_vidcloud_ids, html)
 
     if not sub_id or not dub_id:
         raise HTTPException(404, f"Vidcloud sub/dub server not found for episode {episode_id}")
 
-    # ── BUG-5 FIX ─────────────────────────────────────────────────────────────
-    # Original: sources URLs had no date param → MEW_BASE returned 400/empty.
-    # The /ajax/episode/sources endpoint requires the same &type=X-DATE param.
-    # ── END FIX ───────────────────────────────────────────────────────────────
-    date          = get_date_param()
-    sub_src_url   = f"{MEW_BASE}/ajax/episode/sources?id={sub_id}&type=sub-{date}"
-    dub_src_url   = f"{MEW_BASE}/ajax/episode/sources?id={dub_id}&type=dub-{date}"
+    # BUG-5 FIX: date param required on source URLs too
+    sub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={sub_id}&type=sub-{date}"
+    dub_src_url = f"{MEW_BASE}/ajax/episode/sources?id={dub_id}&type=dub-{date}"
 
     try:
         sub_src_data, dub_src_data = await asyncio.gather(
@@ -698,18 +705,8 @@ async def get_source_v2(episode_id: str) -> Dict:
 
     try:
         sub_sources_data, dub_sources_data = await asyncio.gather(
-            http_client.fetch(
-                sub_sources_url,
-                referer=sub_link,
-                origin=RAPID_CLOUD_BASE,   # BUG-6 FIX
-                is_json=True,
-            ),
-            http_client.fetch(
-                dub_sources_url,
-                referer=dub_link,
-                origin=RAPID_CLOUD_BASE,   # BUG-6 FIX
-                is_json=True,
-            ),
+            http_client.fetch(sub_sources_url, referer=sub_link, origin=RAPID_CLOUD_BASE, is_json=True),
+            http_client.fetch(dub_sources_url, referer=dub_link, origin=RAPID_CLOUD_BASE, is_json=True),
         )
     except HTTPException:
         raise
@@ -734,15 +731,19 @@ async def get_source_v2(episode_id: str) -> Dict:
 
 
 # ──────────────────────────────────────────────
-# UNIFIED STREAMING (v10)
+# UNIFIED STREAMING (v10) — what the player calls
 # ──────────────────────────────────────────────
-def get_date_param() -> str:
-    now = datetime.now(timezone.utc)
-    raw = f"{now.month}/{now.day}/{now.year} {now.hour:02d}:{now.minute:02d}"
-    return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
-
-
 async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> EpisodeResponse:
+    """
+    GET /api/v10/stream/{episode_id}?type=sub|dub
+
+    Returns EpisodeResponse with:
+      servers[]    — list of ServerSource objects (HLS Server 1…N + Megaplay fallback)
+      subtitles[]  — Subtitle objects from RapidCloud tracks
+      timestamps   — Timestamps(intro, outro) stub — real values require a
+                     separate AniSkip/AniList call (placeholder values provided)
+      cdnDomain    — hostname of the primary m3u8 source
+    """
     key           = f"unified_stream:{episode_id}:{stream_type}"
     val, is_stale = cache.get(key)
     if val and not is_stale:
@@ -755,10 +756,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
             f"?episodeId={episode_id}&type={stream_type}-{date}"
         )
         try:
-            # ── BUG-2 FIX ─────────────────────────────────────────────────────
-            # Original: fetch(servers_url, referer=MEW_BASE) — no origin param.
-            # nine.mewcdn.online checks Origin header and returns 403 without it.
-            # ── END FIX ───────────────────────────────────────────────────────
+            # BUG-2 FIX: origin= required by nine.mewcdn.online
             servers_data = await http_client.fetch(
                 servers_url,
                 referer=MEW_BASE,
@@ -772,6 +770,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
             all_subtitles: List[Subtitle]     = []
             main_cdn                          = "unknown"
 
+            # Fetch up to 3 server sources in parallel
             tasks = []
             for s_id in server_ids[:3]:
                 source_url = (
@@ -782,7 +781,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                     http_client.fetch(
                         source_url,
                         referer=MEW_BASE,
-                        origin=MEW_BASE,   # BUG-2 FIX: origin on source calls too
+                        origin=MEW_BASE,
                         is_json=True,
                     )
                 )
@@ -796,18 +795,16 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                 if "rapid-cloud.co" in link or "megacloud" in link:
                     embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
                     api_url  = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={embed_id}"
-                    # ── BUG-3 FIX ─────────────────────────────────────────────
-                    # Original: bare `except: continue` — caught BaseException,
-                    # swallowed asyncio.CancelledError and other critical signals.
-                    # ── END FIX ───────────────────────────────────────────────
                     try:
+                        # BUG-3 FIX: except Exception (not bare except:)
                         api_res = await http_client.fetch(
                             api_url,
                             referer=link,
-                            origin=RAPID_CLOUD_BASE,  # BUG-6 FIX: origin for RC
+                            origin=RAPID_CLOUD_BASE,   # BUG-6 FIX
                             is_json=True,
                         )
 
+                        # Collect subtitles from the first server that has them
                         if not all_subtitles:
                             for sub in api_res.get("tracks", []):
                                 if sub.get("kind") == "captions":
@@ -827,7 +824,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                                     qualities  = [QualityInfo(label="Auto", url=m3u8)],
                                     referer    = link,
                                 ))
-                    except Exception as e:   # BUG-3 FIX: was bare `except:`
+                    except Exception as e:
                         logger.warning(f"[unified] embed fetch failed for {embed_id}: {e}")
                         continue
 
@@ -840,13 +837,14 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                 servers    = all_servers,
                 cdnDomain  = main_cdn,
                 subtitles  = all_subtitles,
+                # Placeholder timestamps — replace with real AniSkip lookup if desired
                 timestamps = Timestamps(intro=[1.5, 90.0], outro=[1100.0, 1200.0]),
             )
-            cache.set(key, result, TTL["stream"])
+            cache.set(key, result, TTL["unified_stream"])
             return result
 
         except Exception as e:
-            logger.error(f"Unified Stream fetch failed for {episode_id}: {e}")
+            logger.error(f"Unified stream fetch failed for {episode_id}: {e}")
             raise HTTPException(502, f"Failed to fetch stream: {e}")
 
     if is_stale:
@@ -888,7 +886,7 @@ async def middleware(request: Request, call_next):
     response.headers["X-Powered-By"]      = "RO-Anime/10.0"
     return response
 
-# ── Routes ────────────────────────────────────
+# ── Routes ─────────────────────────────────────
 
 @app.get("/search/{query}")
 async def route_search(query: str):
@@ -923,11 +921,20 @@ async def route_unified_stream(
     episode_id: str,
     type: str = Query(default="sub", pattern="^(sub|dub)$"),
 ):
+    """
+    Primary stream endpoint the player uses.
+    Returns EpisodeResponse JSON:
+      { episodeId, type, servers[], cdnDomain, subtitles[], timestamps }
+    """
     res = await get_unified_stream(episode_id, type)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
 @app.get("/home/thumbnails")
 async def route_home():
+    """
+    Returns a flat JSON array of {anime_id, title, poster}.
+    The player uses poster URLs for the hero slider and full objects for the grid.
+    """
     res = await get_home()
     return Response(msgspec.json.encode(res), media_type="application/json")
 
@@ -945,9 +952,9 @@ async def route_batch_search(q: List[str] = Query(...)):
 @app.get("/health")
 async def health():
     return {
-        "status":  "ok",
-        "cache":   cache.stats(),
-        "circuit": breaker.state,
+        "status":   "ok",
+        "cache":    cache.stats(),
+        "circuit":  breaker.state,
         "inflight": len(http_client.inflight),
     }
 
