@@ -464,27 +464,56 @@ def parse_server_id(html: str, sub: str) -> Optional[str]:
 
 def parse_vidcloud_ids(html: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    v9 approach: find first two Vidcloud server-items.
-    Returns (sub_id, dub_id).
+    Block-aware parser: finds the SUB block and DUB block by their
+    div.ps__-title text, then returns the first Vidcloud (or any) server
+    data-id from each block.
+
+    This is correct regardless of how many servers are listed because it
+    uses the block title ("SUB" / "DUB") to distinguish — NOT position.
+    The type= URL param alone does NOT filter the returned HTML; both blocks
+    are always present and must be parsed by title.
     """
+    parser = LexborHTMLParser(html)
     sub_id: Optional[str] = None
     dub_id: Optional[str] = None
-    count = 0
-    for node in LexborHTMLParser(html).css("div.item.server-item"):
-        text = node.text(strip=True)
-        if "Vidcloud" in text:
-            data_id = node.attributes.get("data-id")
-            if count == 0:
-                sub_id = data_id
-            elif count == 1:
-                dub_id = data_id
-                break
-            count += 1
+
+    for block in parser.css("div.ps_-block"):
+        title_div = block.css_first("div.ps__-title")
+        if not title_div:
+            continue
+        block_title = title_div.text().strip().lower()
+        is_sub = "sub" in block_title and "dub" not in block_title
+        is_dub = "dub" in block_title
+
+        for item in block.css("div.item.server-item"):
+            sid = item.attributes.get("data-id")
+            if not sid:
+                continue
+            if is_sub and sub_id is None:
+                sub_id = sid
+            elif is_dub and dub_id is None:
+                dub_id = sid
+
     return sub_id, dub_id
 
-def parse_server_ids(html: str) -> List[str]:
-    """v10 helper: extract all data-id values for unified stream pipeline."""
-    return re.findall(r'data-id="(\d+)"', html)
+def parse_sub_server_ids(html: str) -> List[str]:
+    """
+    Extract only SUB server IDs from the HTML by finding the SUB block
+    (div.ps_-block whose div.ps__-title contains 'sub'), then collecting
+    all data-id values within it.  More precise than the old regex — avoids
+    picking up DUB or raw-torrent server IDs.
+    """
+    parser     = LexborHTMLParser(html)
+    server_ids = []
+    for block in parser.css("div.ps_-block"):
+        title_div = block.css_first("div.ps__-title")
+        if title_div and "sub" in title_div.text().lower():
+            for item in block.css("div.item.server-item"):
+                sid = item.attributes.get("data-id")
+                if sid:
+                    server_ids.append(sid)
+            break
+    return server_ids
 
 # ──────────────────────────────────────────────
 # V10 HELPER: DATE PARAM
@@ -652,7 +681,7 @@ async def get_source_v2(episode_id: str) -> Dict:
 
     # BUG-4 FIX: &type= param required; BUG-2 FIX: origin= required
     date        = get_date_param()
-    servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type=sub"
+    servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type=sub-{date}"
     try:
         servers_data = await http_client.fetch(
             servers_url, referer=mew_referer, origin=MEW_BASE, is_json=True
@@ -737,14 +766,24 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
     """
     GET /api/v10/stream/{episode_id}?type=sub|dub
 
+    v10.1 changes vs original v10:
+      - Uses parse_sub_server_ids() which targets the SUB block specifically
+        (div.ps_-block → div.ps__-title contains "sub") instead of a greedy
+        regex that could grab DUB/other server IDs.
+      - Fetches ALL SUB servers (no [:3] cap) so no valid source is skipped.
+      - Server prioritization after gathering: netmagcdn > crimsonstorm > others.
+        This ensures the Cloudflare-free vod.netmagcdn.com URL is always first.
+      - cdnDomain is set from the first (highest-priority) server after sorting.
+      - Cache key is unified_stream_sub_only:{episode_id} (type param retained
+        in signature for API compatibility but SUB path is always used).
+
     Returns EpisodeResponse with:
-      servers[]    — list of ServerSource objects (HLS Server 1…N + Megaplay fallback)
+      servers[]    — sorted ServerSource list (best CDN first)
       subtitles[]  — Subtitle objects from RapidCloud tracks
-      timestamps   — Timestamps(intro, outro) stub — real values require a
-                     separate AniSkip/AniList call (placeholder values provided)
-      cdnDomain    — hostname of the primary m3u8 source
+      timestamps   — Timestamps stub (intro/outro placeholder)
+      cdnDomain    — hostname of the primary m3u8 after prioritization
     """
-    key           = f"unified_stream:{episode_id}:{stream_type}"
+    key           = f"unified_stream_sub_only:{episode_id}"
     val, is_stale = cache.get(key)
     if val and not is_stale:
         return val
@@ -753,7 +792,7 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
         date        = get_date_param()
         servers_url = (
             f"{MEW_BASE}/ajax/episode/servers"
-            f"?episodeId={episode_id}&type={stream_type}-{date}"
+            f"?episodeId={episode_id}&type=sub-{date}"
         )
         try:
             # BUG-2 FIX: origin= required by nine.mewcdn.online
@@ -764,18 +803,17 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                 is_json=True,
             )
             html       = servers_data.get("html", "")
-            server_ids = parse_server_ids(html)
+            server_ids = parse_sub_server_ids(html)   # precise SUB-only extraction
 
             all_servers:   List[ServerSource] = []
             all_subtitles: List[Subtitle]     = []
-            main_cdn                          = "unknown"
 
-            # Fetch up to 3 server sources in parallel
+            # Fetch all SUB server sources in parallel (no [:3] cap)
             tasks = []
-            for s_id in server_ids[:3]:
+            for s_id in server_ids:
                 source_url = (
                     f"{MEW_BASE}/ajax/episode/sources"
-                    f"?id={s_id}&type={stream_type}-{date}"
+                    f"?id={s_id}&type=sub-{date}"
                 )
                 tasks.append(
                     http_client.fetch(
@@ -817,7 +855,6 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                         for s in api_res.get("sources", []):
                             m3u8 = s.get("file", "")
                             if m3u8:
-                                main_cdn = urlparse(m3u8).hostname or "unknown"
                                 all_servers.append(ServerSource(
                                     serverName = f"HLS Server {len(all_servers) + 1}",
                                     m3u8Url    = m3u8,
@@ -829,11 +866,29 @@ async def get_unified_stream(episode_id: str, stream_type: str = "sub") -> Episo
                         continue
 
             if not all_servers:
-                raise HTTPException(404, "No streams found")
+                raise HTTPException(404, "No SUB streams found")
+
+            # ── CDN PRIORITIZATION ─────────────────────────────────────────
+            # 1. vod.netmagcdn.com  — no Cloudflare, most reliable
+            # 2. crimsonstorm CDN   — second preference
+            # 3. everything else
+            def sort_key(s: ServerSource) -> int:
+                url = s.m3u8Url.lower()
+                if "vod.netmagcdn.com" in url:  return 0
+                if "crimsonstorm"      in url:  return 1
+                return 2
+
+            all_servers.sort(key=sort_key)
+
+            # Rename after sorting so numbers stay sequential
+            for i, s in enumerate(all_servers):
+                s.serverName = f"HLS Server {i + 1}"
+
+            main_cdn = urlparse(all_servers[0].m3u8Url).hostname or "unknown"
 
             result = EpisodeResponse(
                 episodeId  = episode_id,
-                type       = stream_type,
+                type       = "sub",
                 servers    = all_servers,
                 cdnDomain  = main_cdn,
                 subtitles  = all_subtitles,
@@ -916,6 +971,66 @@ async def route_stream_v2(episode_id: str):
     res = await get_source_v2(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
+@app.get("/proxy")
+async def proxy_m3u8(url: str, referer: str = ""):
+    """
+    Universal m3u8 proxy for all streaming CDNs.
+    Auto-detects referer/origin from URL domain when not supplied.
+    Rewrites relative segment paths in m3u8 responses to absolute URLs.
+
+    CDN map:
+      vod.netmagcdn.com  -> rapid-cloud.co  (CF-free)
+      crimsonstorm.*     -> rapid-cloud.co
+      rainveil.*         -> rapid-cloud.co
+      rapid-cloud.co     -> rapid-cloud.co
+      megacloud.*        -> megacloud.tv
+      fallback           -> 9animetv.to
+    """
+    if not url:
+        raise HTTPException(400, "Missing URL")
+    try:
+        if not referer:
+            if "vod.netmagcdn.com" in url: referer = "https://rapid-cloud.co/"
+            elif "crimsonstorm"    in url: referer = "https://rapid-cloud.co/"
+            elif "rainveil"        in url: referer = "https://rapid-cloud.co/"
+            elif "rapid-cloud.co"  in url: referer = "https://rapid-cloud.co/"
+            elif "megacloud"       in url: referer = "https://megacloud.tv/"
+            else:                          referer = BASE_URL
+
+        parsed = urlparse(referer)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        profile = random.choice(BROWSER_PROFILES)
+        headers = {
+            **profile,
+            "Referer":         referer,
+            "Origin":          origin,
+            "Accept":          "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection":      "keep-alive",
+        }
+        async with http_client.semaphore:
+            resp = await http_client.client.get(url, headers=headers, timeout=12.0)
+            resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "application/vnd.apple.mpegurl")
+        body         = resp.text
+
+        # Rewrite relative segment URLs in m3u8 so HLS.js resolves them directly
+        if ".m3u8" in url or "mpegurl" in content_type:
+            base_url = url.rsplit("/", 1)[0] + "/"
+            lines = []
+            for line in body.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and not stripped.startswith("http"):
+                    stripped = base_url + stripped
+                lines.append(stripped)
+            body = "\n".join(lines)
+
+        return Response(body, media_type=content_type)
+    except Exception as e:
+        raise HTTPException(502, f"Proxy failed: {e}")
+
+
 @app.get("/api/v10/stream/{episode_id}")
 async def route_unified_stream(
     episode_id: str,
@@ -923,8 +1038,10 @@ async def route_unified_stream(
 ):
     """
     Primary stream endpoint the player uses.
+    type param is accepted for API compatibility but always routes to SUB pipeline.
     Returns EpisodeResponse JSON:
       { episodeId, type, servers[], cdnDomain, subtitles[], timestamps }
+    Servers are sorted: netmagcdn (CF-free) → crimsonstorm → others.
     """
     res = await get_unified_stream(episode_id, type)
     return Response(msgspec.json.encode(res), media_type="application/json")
