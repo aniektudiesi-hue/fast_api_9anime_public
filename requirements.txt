@@ -8,3 +8,4 @@ brotli
 python-multipart
 orjson
 bs4
+curl_cffi
