@@ -1,37 +1,3 @@
-""": v10 unified stream pipeline with VidStream/VidCloud server naming,
-           SmartCache (LRU+SWR), HttpClient with origin/referer, /proxy route,
-           parse_sub_server_ids, get_unified_stream, get_date_param.
-           HLS proxy (/stream.m3u8, /chunk) kept intact via curl_cffi.
-
-Frontend : Full RO-Anime premium UI (black/pink Netflix-style theme).
-           Streaming JS fully integrated calling local /api/v10/stream/{id}.
-           Subtitle system v4 (FIXED):
-             - Per-episode token prevents stale roSubAutoSelectDone across episodes
-             - Auto-select delay reduced 800ms → 200ms for faster subtitle appearance
-             - Hardened VTT validation: rejects HTML error pages from public proxies
-             - Fast-path: if direct URL works, skip remaining CDN candidates immediately
-             - roSwitchSubtitle allows retry on tracks that previously failed
-             - roAutoFallbackToNextTrack also considers 'loading' state tracks
-             - Multi-language detection from API tracks[]
-             - Enhanced VTT validation — rejects empty/broken files
-             - 5-tier CDN fallback for .vtt files
-               (direct → alt CDN hostname → /proxy → corsproxy.io → allorigins.win)
-             - Automatic fallback to next valid subtitle track if current fails
-             - Subtitle state reset on episode/server change
-             - Duplicate-track deduplication
-             - Working clickable dropdown with smooth switching
-             - Auto-selects default/English track on load
-             - Real-time subtitle rendering with no gaps
-             - Subtitle validation: checks WEBVTT header + cue count
-             - Backend subtitle validation endpoint added (/api/v10/subtitle/validate)
-             - Graceful degradation — never blocks playback
-           Playback reliability:
-             - Banned CDN filter (storm/strom/crimsonstorm)
-             - 4-second manifest timeout → auto next server
-             - 5-second stall watchdog → auto next server
-             - Infinite retry loop with re-fetch on full exhaustion
-             - "Video not available yet" shown when truly exhausted
-"""
 
 import asyncio
 import logging
