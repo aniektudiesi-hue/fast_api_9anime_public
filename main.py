@@ -657,6 +657,8 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
             referer = "https://rapid-cloud.co/"
         elif "megacloud" in url:
             referer = "https://megacloud.tv/"
+        elif "mgstatics.xyz" in url or ".vtt" in url:
+            referer = "https://megacloud.tv/"
         else:
             referer = BASE_URL
 
@@ -2153,23 +2155,46 @@ HTML = r"""<!DOCTYPE html>
         roSubActive      = false;
         document.getElementById('roSubtitleOverlay').innerHTML = '';
 
-        // Route through backend proxy to avoid CORS blocks from subtitle CDNs
         const proxyUrl = `${API_BASE}/proxy?url=${encodeURIComponent(fileUrl)}`;
+
+        let txt = null;
+
+        // Try direct first (works if CDN allows CORS)
         try {
-            const r = await fetch(proxyUrl);
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const txt  = await r.text();
-            const cues = parseVTT(txt);
-            if (cues.length > 0) {
-                roSubtitleCues = cues;
-                roSubActive    = true;
-                console.log(`[SUB] English loaded — ${cues.length} cues`);
-            } else {
-                console.warn('[SUB] English VTT parsed but 0 cues');
-                roActiveSubLabel = null;
+            const r = await fetch(fileUrl);
+            if (r.ok) {
+                txt = await r.text();
+                console.log('[SUB] Direct fetch OK');
             }
         } catch(e) {
-            console.warn('[SUB] Failed to load English subtitle:', e.message);
+            console.log('[SUB] Direct fetch blocked, trying proxy...');
+        }
+
+        // Fallback to backend proxy if direct failed
+        if (!txt) {
+            try {
+                const r = await fetch(proxyUrl);
+                if (r.ok) {
+                    txt = await r.text();
+                    console.log('[SUB] Proxy fetch OK');
+                } else {
+                    throw new Error(`Proxy HTTP ${r.status}`);
+                }
+            } catch(e) {
+                console.warn('[SUB] Both direct and proxy failed:', e.message);
+                roActiveSubLabel = null;
+                roRenderSubMenu();
+                return;
+            }
+        }
+
+        const cues = parseVTT(txt);
+        console.log(`[SUB] Parsed ${cues.length} cues from VTT`);
+        if (cues.length > 0) {
+            roSubtitleCues = cues;
+            roSubActive    = true;
+        } else {
+            console.warn('[SUB] VTT loaded but 0 cues parsed — first 200 chars:', txt.slice(0, 200));
             roActiveSubLabel = null;
         }
         roRenderSubMenu();
@@ -2532,7 +2557,9 @@ HTML = r"""<!DOCTYPE html>
                 roEnglishSubFile = eng.file;
                 console.log('[SUB] English subtitle found:', eng.file.slice(0, 70));
                 roRenderSubMenu();
-                roAutoSelectDefaultSubtitle();
+                // Load after a short delay so HLS attach + timeupdate listener
+                // are wired up before cues land — prevents silent drop on fast CDNs
+                setTimeout(() => roAutoSelectDefaultSubtitle(), 300);
             } else {
                 console.log('[SUB] No English subtitle in API response');
                 roRenderSubMenu();
