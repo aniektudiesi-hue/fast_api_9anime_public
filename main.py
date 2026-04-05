@@ -1512,6 +1512,7 @@ HTML = r"""<!DOCTYPE html>
     let roSubtitleCues       = [];     // parsed VTT cues [{start, end, text}]
     let roSubActive          = false;  // subtitle cues loaded and rendering
     let roActiveSubLabel     = null;   // label of currently active track (null = Off)
+    let roEnglishSubFile     = null;   // VTT URL of English subtitle, or null
 
     // ── Fullscreen State ────────────────────────────────────────────────────
     let roIsFullscreen       = false;
@@ -2010,9 +2011,6 @@ HTML = r"""<!DOCTYPE html>
     //  No validation layers, no CDN fallback chains, no multi-track switching.
     // =========================================================================
 
-    // Single English subtitle track file URL (null = none available)
-    let roEnglishSubFile = null;
-
     function roResetSubtitleState() {
         roSubtitleCues   = [];
         roSubActive      = false;
@@ -2155,8 +2153,10 @@ HTML = r"""<!DOCTYPE html>
         roSubActive      = false;
         document.getElementById('roSubtitleOverlay').innerHTML = '';
 
+        // Route through backend proxy to avoid CORS blocks from subtitle CDNs
+        const proxyUrl = `${API_BASE}/proxy?url=${encodeURIComponent(fileUrl)}`;
         try {
-            const r = await fetch(fileUrl);
+            const r = await fetch(proxyUrl);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const txt  = await r.text();
             const cues = parseVTT(txt);
