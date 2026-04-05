@@ -2434,10 +2434,10 @@ HTML = r"""<!DOCTYPE html>
 
         // 4-second manifest load timeout → auto fallback
         let v10LoadTimeout = setTimeout(() => {
-            console.warn('[v10] 4s timeout on', server.serverName, '— trying next');
+            console.warn('[v10] 10s timeout on', server.serverName, '— trying next');
             roUpdateServerPill(v10SrvIdx, 'failed');
             v10NextServer();
-        }, 4000);
+        }, 10000);
 
         const onReady = () => {
             clearTimeout(v10LoadTimeout);
