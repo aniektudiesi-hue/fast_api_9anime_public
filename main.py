@@ -2024,13 +2024,18 @@ HTML = r"""<!DOCTYPE html>
 
     // ── VTT Parser ─────────────────────────────────────────────────────────
     function parseVTT(text) {
+        if (!text) return [];
+        // Strip BOM and normalize line endings
+        text = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
         const cues  = [];
-        const lines = text.split(/\r?\n/);
+        const lines = text.split('\n');
         let i = 0;
         while (i < lines.length) {
-            if (lines[i] && lines[i].includes('-->')) {
-                const match = lines[i].match(
-                    /(\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2}[.,]\d{3})/
+            const line = lines[i].trim();
+            // Find timecode lines — skip everything else
+            if (line.includes('-->')) {
+                const match = line.match(
+                    /(\d{1,2}:\d{2}:\d{2}[.,]\d{3}|\d{1,2}:\d{2}[.,]\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2}[.,]\d{3}|\d{1,2}:\d{2}[.,]\d{3})/
                 );
                 if (match) {
                     const start = vttTimeToSec(match[1]);
@@ -2038,10 +2043,19 @@ HTML = r"""<!DOCTYPE html>
                     i++;
                     const textLines = [];
                     while (i < lines.length && lines[i].trim() !== '') {
-                        textLines.push(lines[i]); i++;
+                        textLines.push(lines[i]);
+                        i++;
                     }
-                    // Strip VTT tags
-                    const cueText = textLines.join('\n').replace(/<[^>]+>/g, '').trim();
+                    // Strip VTT inline tags like <c>, <i>, <b>, <ruby>, <00:01:02.000>
+                    const cueText = textLines
+                        .join('\n')
+                        .replace(/<\d{2}:\d{2}:\d{2}\.\d{3}>/g, '')
+                        .replace(/<[^>]+>/g, '')
+                        .replace(/&amp;/g, '&')
+                        .replace(/&lt;/g, '<')
+                        .replace(/&gt;/g, '>')
+                        .replace(/&nbsp;/g, ' ')
+                        .trim();
                     if (cueText) cues.push({ start, end, text: cueText });
                 }
             }
@@ -2051,7 +2065,9 @@ HTML = r"""<!DOCTYPE html>
     }
 
     function vttTimeToSec(t) {
-        const parts = t.replace(',', '.').split(':');
+        // Handle both HH:MM:SS.mmm and MM:SS.mmm
+        t = t.replace(',', '.');
+        const parts = t.split(':');
         if (parts.length === 3) return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
         if (parts.length === 2) return parseFloat(parts[0]) * 60 + parseFloat(parts[1]);
         return 0;
@@ -2189,7 +2205,7 @@ HTML = r"""<!DOCTYPE html>
         }
 
         const cues = parseVTT(txt);
-        console.log(`[SUB] Parsed ${cues.length} cues from VTT`);
+        console.log(`[SUB] Parsed ${cues.length} cues. VTT preview:`, txt.slice(0, 300));
         if (cues.length > 0) {
             roSubtitleCues = cues;
             roSubActive    = true;
@@ -2308,14 +2324,17 @@ HTML = r"""<!DOCTYPE html>
                 v10SrvIdx  = i;
                 v10QualIdx = 0;
                 roRenderServerPills();
-                // Re-load English subtitle for new server
+                // Re-load subtitle for new server
                 roResetSubtitleState();
                 if (v10Cache && v10Cache.subtitles && v10Cache.subtitles.length > 0) {
-                    const eng = v10Cache.subtitles.find(s => s.label === 'English' && s.file);
-                    if (eng) {
-                        roEnglishSubFile = eng.file;
+                    const sub =
+                        v10Cache.subtitles.find(s => s.file && s.label === 'English') ||
+                        v10Cache.subtitles.find(s => s.file && s.default === true)    ||
+                        v10Cache.subtitles.find(s => s.file);
+                    if (sub) {
+                        roEnglishSubFile = sub.file;
                         roRenderSubMenu();
-                        roAutoSelectDefaultSubtitle();
+                        setTimeout(() => roAutoSelectDefaultSubtitle(), 300);
                     }
                 }
                 v10AttachHLS(saved);
@@ -2552,16 +2571,18 @@ HTML = r"""<!DOCTYPE html>
         // ─── Load English subtitle from API response ──────────────────────────
         roEnglishSubFile = null;
         if (v10Cache.subtitles && v10Cache.subtitles.length > 0) {
-            const eng = v10Cache.subtitles.find(s => s.label === 'English' && s.file);
-            if (eng) {
-                roEnglishSubFile = eng.file;
-                console.log('[SUB] English subtitle found:', eng.file.slice(0, 70));
+            // Priority: exact "English" label → default:true → first track
+            const sub =
+                v10Cache.subtitles.find(s => s.file && s.label === 'English') ||
+                v10Cache.subtitles.find(s => s.file && s.default === true)    ||
+                v10Cache.subtitles.find(s => s.file);
+            if (sub) {
+                roEnglishSubFile = sub.file;
+                console.log('[SUB] Using subtitle:', sub.label, sub.file.slice(0, 70));
                 roRenderSubMenu();
-                // Load after a short delay so HLS attach + timeupdate listener
-                // are wired up before cues land — prevents silent drop on fast CDNs
                 setTimeout(() => roAutoSelectDefaultSubtitle(), 300);
             } else {
-                console.log('[SUB] No English subtitle in API response');
+                console.log('[SUB] No usable subtitle in API response');
                 roRenderSubMenu();
             }
         } else {
