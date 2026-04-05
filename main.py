@@ -1,5 +1,5 @@
 """
-AniStream v10.1 — Unified Streaming Edition
+AniStream v10.2 — Unified Streaming Edition
 =============================================
 Backend  : v10 unified stream pipeline with VidStream/VidCloud server naming,
            SmartCache (LRU+SWR), HttpClient with origin/referer, /proxy route,
@@ -8,14 +8,20 @@ Backend  : v10 unified stream pipeline with VidStream/VidCloud server naming,
 
 Frontend : Full RO-Anime premium UI (black/pink Netflix-style theme).
            Streaming JS fully integrated calling local /api/v10/stream/{id}.
-           Subtitle system v2:
+           Subtitle system v3 (IMPROVED):
              - Multi-language detection from API tracks[]
-             - Working clickable dropdown with smooth switching
-             - Auto-selects default/English track on load
-             - 4-tier CDN fallback for .vtt files
-               (direct → alt CDN hostname → /proxy → corsproxy.io)
+             - Enhanced VTT validation — rejects empty/broken files
+             - 5-tier CDN fallback for .vtt files
+               (direct → alt CDN hostname → /proxy → corsproxy.io → allorigins.win)
+             - Automatic fallback to next valid subtitle track if current fails
              - Subtitle state reset on episode/server change
              - Duplicate-track deduplication
+             - Working clickable dropdown with smooth switching
+             - Auto-selects default/English track on load
+             - Real-time subtitle rendering with no gaps
+             - Subtitle validation: checks WEBVTT header + cue count
+             - Backend subtitle validation endpoint added (/api/v10/subtitle/validate)
+             - Graceful degradation — never blocks playback
            Playback reliability:
              - Banned CDN filter (storm/strom/crimsonstorm)
              - 4-second manifest timeout → auto next server
@@ -259,6 +265,33 @@ class HttpClient:
                 )
                 await asyncio.sleep(delay)
 
+    async def fetch_text_raw(
+        self,
+        url:     str,
+        referer: str = "",
+        origin:  str = "",
+        timeout: float = 10.0,
+    ) -> Optional[str]:
+        """Fetch raw text with a single attempt — used for subtitle validation."""
+        profile = random.choice(BROWSER_PROFILES)
+        headers = {
+            **profile,
+            "Referer":         referer or BASE_URL,
+            "Accept":          "*/*",
+            "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+            "Connection":      "keep-alive",
+        }
+        if origin:
+            headers["Origin"] = origin
+        try:
+            async with self.sem:
+                resp = await self.client.get(url, headers=headers, timeout=timeout)
+                resp.raise_for_status()
+                return resp.text
+        except Exception as e:
+            logger.debug(f"[subtitle-backend] fetch_text_raw failed for {url[:60]}: {e}")
+            return None
+
 http_client = HttpClient()
 executor    = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
@@ -281,6 +314,89 @@ PROXY_HEADERS = {
     "User-Agent":         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
 }
 cf_session = cf_requests.Session()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBTITLE VALIDATION HELPERS (BACKEND)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_valid_vtt_text(text: str) -> bool:
+    """
+    Validate that a string is a genuine, non-empty WebVTT subtitle file.
+    Checks:
+      1. Starts with WEBVTT header (required by spec)
+      2. Contains at least one valid timecode line (HH:MM:SS.mmm --> HH:MM:SS.mmm)
+      3. Has at least one non-empty cue body line
+    Returns False for empty files, HTML error pages, or malformed VTT.
+    """
+    if not text or len(text.strip()) < 20:
+        return False
+    stripped = text.strip()
+    # Must start with WEBVTT (case-insensitive, allows BOM)
+    if not re.search(r'^(?:\ufeff)?WEBVTT', stripped, re.IGNORECASE):
+        return False
+    # Must have at least one timecode line
+    timecode_pattern = re.compile(
+        r'\d{1,2}:\d{2}:\d{2}[.,]\d{3}\s+-->\s+\d{1,2}:\d{2}:\d{2}[.,]\d{3}'
+    )
+    if not timecode_pattern.search(stripped):
+        return False
+    # Must have non-empty cue text (at least one non-blank line after a timecode)
+    lines = stripped.split('\n')
+    found_timecode = False
+    for line in lines:
+        if timecode_pattern.match(line.strip()):
+            found_timecode = True
+            continue
+        if found_timecode and line.strip():
+            return True  # found at least one cue body line
+    return False
+
+
+def count_vtt_cues(text: str) -> int:
+    """Count the number of subtitle cues in a VTT string."""
+    if not text:
+        return 0
+    timecode_pattern = re.compile(
+        r'\d{1,2}:\d{2}:\d{2}[.,]\d{3}\s+-->\s+\d{1,2}:\d{2}:\d{2}[.,]\d{3}'
+    )
+    return len(timecode_pattern.findall(text))
+
+
+async def fetch_and_validate_vtt_backend(url: str, referer: str = "") -> Tuple[bool, int]:
+    """
+    Fetch a VTT URL from the backend and validate it.
+    Returns (is_valid: bool, cue_count: int).
+    Used by /api/v10/subtitle/validate endpoint.
+    """
+    if not referer:
+        if "vod.netmagcdn.com" in url or "rapid-cloud.co" in url:
+            referer = "https://rapid-cloud.co/"
+        elif "megacloud" in url:
+            referer = "https://megacloud.tv/"
+        else:
+            referer = BASE_URL
+
+    parsed = urlparse(referer)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Try direct URL first
+    text = await http_client.fetch_text_raw(url, referer=referer, origin=origin)
+    if text and is_valid_vtt_text(text):
+        return True, count_vtt_cues(text)
+
+    # Try alt CDN hostname (vod.netmagcdn.com)
+    try:
+        parsed_url = urlparse(url)
+        alt_host   = "vod.netmagcdn.com"
+        if parsed_url.hostname != alt_host:
+            alt_url = parsed_url._replace(netloc=alt_host).geturl()
+            alt_text = await http_client.fetch_text_raw(alt_url, referer=referer, origin=origin)
+            if alt_text and is_valid_vtt_text(alt_text):
+                return True, count_vtt_cues(alt_text)
+    except Exception:
+        pass
+
+    return False, 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSERS
@@ -1170,12 +1286,12 @@ HTML = r"""<!DOCTYPE html>
         .srv-pill.failed  { border-color: #ff5252; color: #ff5252; opacity: 0.5; }
         .srv-pill.loading { border-color: var(--accent-pink); color: var(--accent-pink); animation: pilPulse 1s infinite; }
         @keyframes pilPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        /* ===== SUBTITLE DROPDOWN (ENHANCED) ===== */
+        /* ===== SUBTITLE DROPDOWN (ENHANCED v3) ===== */
         #roSubMenuWrap { position: relative; display: inline-block; }
         .ro-sub-dropdown {
             display: none; position: absolute; bottom: 44px; right: 0;
             background: #1a1a1a; border: 1.5px solid var(--accent-pink); border-radius: 10px;
-            min-width: 180px; max-height: 260px; overflow-y: auto; z-index: 9999;
+            min-width: 200px; max-height: 280px; overflow-y: auto; z-index: 9999;
             box-shadow: 0 8px 32px rgba(255,0,110,0.3), 0 2px 8px rgba(0,0,0,0.5);
             animation: dropIn 0.15s ease-out;
         }
@@ -1185,12 +1301,21 @@ HTML = r"""<!DOCTYPE html>
             padding: 10px 16px; cursor: pointer; font-size: 12px; font-weight: 700;
             color: rgba(255,255,255,0.8); transition: background 0.15s, color 0.15s;
             border-left: 3px solid transparent; user-select: none; white-space: nowrap;
+            display: flex; align-items: center; gap: 8px;
         }
         .ro-sub-dropdown-item:hover { background: rgba(255,0,110,0.15); color: #fff; }
         .ro-sub-dropdown-item.active-sub {
             color: var(--accent-pink); border-left-color: var(--accent-pink);
             background: rgba(255,0,110,0.08);
         }
+        .ro-sub-dropdown-item.loading-sub {
+            color: rgba(255,255,255,0.4); cursor: wait;
+            animation: subItemPulse 1s ease-in-out infinite;
+        }
+        .ro-sub-dropdown-item.failed-sub {
+            color: #ff5252; opacity: 0.6;
+        }
+        @keyframes subItemPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .ro-sub-dropdown-item:first-child { border-radius: 8px 8px 0 0; }
         .ro-sub-dropdown-item:last-child  { border-radius: 0 0 8px 8px; }
         .ro-sub-lang-count {
@@ -1198,6 +1323,13 @@ HTML = r"""<!DOCTYPE html>
             font-size: 8px; font-weight: 900; padding: 1px 5px; border-radius: 10px;
             margin-left: 6px; vertical-align: middle; letter-spacing: 0.5px;
         }
+        .ro-sub-status-dot {
+            width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+            background: rgba(255,255,255,0.2);
+        }
+        .ro-sub-status-dot.active  { background: #00e676; box-shadow: 0 0 6px rgba(0,230,118,0.6); }
+        .ro-sub-status-dot.loading { background: var(--accent-pink); animation: subItemPulse 1s infinite; }
+        .ro-sub-status-dot.failed  { background: #ff5252; }
         /* ===== INFO PANEL ===== */
         .player-info {
             background: linear-gradient(135deg, var(--secondary-black), var(--tertiary-black));
@@ -1364,7 +1496,7 @@ HTML = r"""<!DOCTYPE html>
                             </div>
                         </div>
                         <div class="ro-right">
-                            <!-- Subtitle CC selector — enhanced multi-language -->
+                            <!-- Subtitle CC selector — enhanced multi-language v3 -->
                             <div id="roSubMenuWrap">
                                 <button class="ro-btn" id="roSubBtn" title="Subtitles / CC" style="display:none;" onclick="roToggleSubMenu(event)">
                                     <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>
@@ -1502,12 +1634,15 @@ HTML = r"""<!DOCTYPE html>
     let v10LastTime          = -1;     // last video.currentTime seen by watchdog
     let v10FilteredServers   = [];     // v10Cache.servers after banned CDN filter
 
-    // ── Subtitle State ──────────────────────────────────────────────────────
+    // ── Subtitle State v3 ───────────────────────────────────────────────────
     let roSubtitleCues       = [];     // parsed VTT cues [{start, end, text}]
     let roSubActive          = false;  // subtitle cues loaded and rendering
-    let roAllSubtitleTracks  = [];     // all available tracks [{file,label,kind,default}]
+    let roAllSubtitleTracks  = [];     // all available tracks [{file,label,kind,default,status}]
+                                       // status: 'unknown' | 'loading' | 'valid' | 'invalid'
     let roActiveSubLabel     = null;   // label of currently shown track (null = Off)
     let roSubLoadingLabel    = null;   // track being loaded (prevents race condition)
+    let roSubFallbackQueue   = [];     // tracks queued for fallback attempt (ordered by priority)
+    let roSubAutoSelectDone  = false;  // prevent re-running auto-select on server switch
 
     // ── Fullscreen State ────────────────────────────────────────────────────
     let roIsFullscreen       = false;
@@ -1992,7 +2127,7 @@ HTML = r"""<!DOCTYPE html>
         document.getElementById('roCurTime').textContent = '0:00';
         document.getElementById('roDur').textContent     = '0:00';
         document.getElementById('roProgBuf').style.width = '0%';
-        // Reset subtitle state
+        // Reset subtitle state completely
         roResetSubtitleState();
         // Reset server pills
         const pillRow = document.getElementById('serverPillRow');
@@ -2001,7 +2136,17 @@ HTML = r"""<!DOCTYPE html>
     }
 
     // =========================================================================
-    //  SUBTITLE SYSTEM v2 — Multi-language, working dropdown, CDN fallback
+    //  SUBTITLE SYSTEM v3
+    //  ─────────────────────────────────────────────────────────────────────
+    //  Key improvements over v2:
+    //  1. VTT validation: checks WEBVTT header + timecode presence + cue body
+    //  2. Auto-fallback: if selected track fails, tries next valid track
+    //  3. Status tracking per track: unknown → loading → valid/invalid
+    //  4. 5-tier CDN fallback per track:
+    //       direct → alt CDN host → /proxy → corsproxy.io → allorigins.win
+    //  5. Duplicate prevention via roSubLoadingLabel race condition guard
+    //  6. Re-renders dropdown with live status dots (green=valid, red=failed)
+    //  7. Never blocks playback — subtitle load is always async/detached
     // =========================================================================
 
     function roResetSubtitleState() {
@@ -2010,8 +2155,35 @@ HTML = r"""<!DOCTYPE html>
         roAllSubtitleTracks = [];
         roActiveSubLabel    = null;
         roSubLoadingLabel   = null;
+        roSubFallbackQueue  = [];
+        roSubAutoSelectDone = false;
         document.getElementById('roSubtitleOverlay').innerHTML = '';
         roRenderSubMenu();
+    }
+
+    // ── VTT Validation ──────────────────────────────────────────────────────
+    /**
+     * Validate raw VTT text strictly:
+     * - Must have WEBVTT header
+     * - Must have at least one timecode line
+     * - Must have at least one non-empty cue body line
+     */
+    function isValidVTT(text) {
+        if (!text || text.trim().length < 20) return false;
+        const stripped = text.trim();
+        // WEBVTT header check (allows BOM and NOTE fields)
+        if (!/^(?:\ufeff)?WEBVTT/i.test(stripped)) return false;
+        // Timecode pattern: HH:MM:SS.mmm --> HH:MM:SS.mmm (dot or comma as decimal sep)
+        const timecodeRe = /\d{1,2}:\d{2}:\d{2}[.,]\d{3}\s+-->\s+\d{1,2}:\d{2}:\d{2}[.,]\d{3}/;
+        if (!timecodeRe.test(stripped)) return false;
+        // Must have actual cue text after a timecode line
+        const lines = stripped.split(/\r?\n/);
+        let foundTimecode = false;
+        for (const line of lines) {
+            if (timecodeRe.test(line.trim())) { foundTimecode = true; continue; }
+            if (foundTimecode && line.trim().length > 0) return true;
+        }
+        return false;
     }
 
     // ── VTT Parser ─────────────────────────────────────────────────────────
@@ -2032,7 +2204,7 @@ HTML = r"""<!DOCTYPE html>
                     while (i < lines.length && lines[i].trim() !== '') {
                         textLines.push(lines[i]); i++;
                     }
-                    // Strip VTT tags, HTML entities as-is for rendering
+                    // Strip VTT tags
                     const cueText = textLines.join('\n').replace(/<[^>]+>/g, '').trim();
                     if (cueText) cues.push({ start, end, text: cueText });
                 }
@@ -2049,57 +2221,99 @@ HTML = r"""<!DOCTYPE html>
         return 0;
     }
 
-    // ── VTT Loader — 4-tier CDN fallback ───────────────────────────────────
-    // Tier 1: Direct URL (works if CDN has permissive CORS)
-    // Tier 2: Swap hostname to vod.netmagcdn.com (CF-free alternative)
-    // Tier 3: /proxy on our backend (adds correct Referer + Origin headers)
-    // Tier 4: corsproxy.io (public fallback — last resort)
-    async function roLoadVTT(file, labelBeingLoaded) {
-        if (!file) return false;
+    // ── Build CDN Candidate URLs for a VTT file (5-tier fallback) ──────────
+    /**
+     * Given a VTT file URL, returns an ordered list of candidate URLs to try:
+     * Tier 1: Direct URL (original from API)
+     * Tier 2: Swap hostname to vod.netmagcdn.com (CF-free alt CDN)
+     * Tier 3: /proxy endpoint on our backend (adds proper headers)
+     * Tier 4: corsproxy.io (public CORS proxy — fallback)
+     * Tier 5: allorigins.win (another public fallback — last resort)
+     */
+    function buildVTTCandidates(fileUrl) {
+        if (!fileUrl) return [];
+        const candidates = [];
 
-        // Build alt CDN hostname version
-        let altFile = null;
+        // Tier 1: direct
+        candidates.push(fileUrl);
+
+        // Tier 2: alt CDN hostname
         try {
-            const parsed  = new URL(file);
+            const parsed  = new URL(fileUrl);
             const altHost = 'vod.netmagcdn.com';
             if (parsed.hostname !== altHost) {
-                parsed.hostname = altHost;
-                altFile = parsed.toString();
+                const altUrl = new URL(fileUrl);
+                altUrl.hostname = altHost;
+                candidates.push(altUrl.toString());
             }
         } catch(e) {}
 
-        const candidates = [
-            file,
-            altFile,
-            `${API_BASE}/proxy?url=${encodeURIComponent(file)}`,
-            `https://corsproxy.io/?${encodeURIComponent(file)}`,
-        ].filter(Boolean);
+        // Tier 3: backend proxy (handles Referer/Origin correctly)
+        candidates.push(`${API_BASE}/proxy?url=${encodeURIComponent(fileUrl)}`);
 
+        // Tier 4: corsproxy.io
+        candidates.push(`https://corsproxy.io/?${encodeURIComponent(fileUrl)}`);
+
+        // Tier 5: allorigins.win raw endpoint
+        candidates.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(fileUrl)}`);
+
+        return candidates;
+    }
+
+    // ── Fetch and Validate VTT Through All Candidates ──────────────────────
+    /**
+     * Tries each CDN candidate in order until one returns valid VTT data.
+     * Returns { success: bool, cues: [], candidateUsed: string|null }
+     * Respects roSubLoadingLabel to abort if user switches tracks mid-load.
+     */
+    async function fetchAndValidateVTT(fileUrl, expectedLabel) {
+        const candidates = buildVTTCandidates(fileUrl);
         for (const candidateUrl of candidates) {
-            // Abort if user switched to a different track while we were loading
-            if (roSubLoadingLabel !== labelBeingLoaded) {
-                console.log('[SUB] Load cancelled — user switched track');
-                return false;
+            // Race condition guard: abort if user switched tracks
+            if (roSubLoadingLabel !== expectedLabel) {
+                console.log(`[SUB-v3] Aborted load for "${expectedLabel}" — user switched`);
+                return { success: false, cues: [], candidateUsed: null, aborted: true };
             }
             try {
-                const r = await fetch(candidateUrl, { signal: AbortSignal.timeout(8000) });
+                const controller = new AbortController();
+                const timeoutId  = setTimeout(() => controller.abort(), 9000);
+                const r = await fetch(candidateUrl, { signal: controller.signal });
+                clearTimeout(timeoutId);
                 if (!r.ok) throw new Error(`HTTP ${r.status}`);
                 const txt = await r.text();
-                if (!txt.includes('WEBVTT')) throw new Error('Not a valid VTT');
-                const parsed = parseVTT(txt);
-                if (parsed.length === 0) throw new Error('VTT has 0 cues');
-                // Final guard: ensure still the correct track
-                if (roSubLoadingLabel !== labelBeingLoaded) return false;
-                roSubtitleCues = parsed;
-                roSubActive    = true;
-                console.log(`[SUB] Loaded "${labelBeingLoaded}" — ${parsed.length} cues via ${candidateUrl.slice(0, 60)}`);
-                return true;
+                // Validate the fetched content
+                if (!isValidVTT(txt)) {
+                    console.warn(`[SUB-v3] Invalid VTT from ${candidateUrl.slice(0, 70)}: missing WEBVTT header or no cues`);
+                    throw new Error('Invalid VTT content');
+                }
+                const cues = parseVTT(txt);
+                if (cues.length === 0) {
+                    console.warn(`[SUB-v3] VTT parsed but 0 cues from ${candidateUrl.slice(0, 70)}`);
+                    throw new Error('VTT has 0 cues after parsing');
+                }
+                console.log(`[SUB-v3] ✓ "${expectedLabel}" loaded — ${cues.length} cues via ${candidateUrl.slice(0, 70)}`);
+                return { success: true, cues, candidateUsed: candidateUrl, aborted: false };
             } catch(e) {
-                console.warn(`[SUB] Candidate failed (${candidateUrl.slice(0, 60)}): ${e.message}`);
+                if (e.name === 'AbortError') {
+                    console.warn(`[SUB-v3] Timeout on ${candidateUrl.slice(0, 70)}`);
+                } else {
+                    console.warn(`[SUB-v3] Failed on ${candidateUrl.slice(0, 70)}: ${e.message}`);
+                }
             }
         }
-        console.warn(`[SUB] All sources failed for "${labelBeingLoaded}"`);
-        return false;
+        console.warn(`[SUB-v3] All 5 candidates exhausted for "${expectedLabel}" (${fileUrl.slice(0, 60)})`);
+        return { success: false, cues: [], candidateUsed: null, aborted: false };
+    }
+
+    // ── Update Track Status ─────────────────────────────────────────────────
+    /**
+     * Updates the status field of a track in roAllSubtitleTracks by label.
+     * Status: 'unknown' | 'loading' | 'valid' | 'invalid'
+     */
+    function roSetTrackStatus(label, status) {
+        const track = roAllSubtitleTracks.find(t => t.label === label);
+        if (track) track.status = status;
+        roRenderSubMenu();  // re-render to show updated status dots
     }
 
     // ── Subtitle Rendering on timeupdate ────────────────────────────────────
@@ -2120,9 +2334,17 @@ HTML = r"""<!DOCTYPE html>
         }
     }
 
-    // ── Subtitle Dropdown Menu ───────────────────────────────────────────────
-    // Renders all available language tracks + "Off" option.
-    // Each item is a fully styled clickable div — no onclick attribute strings.
+    // ── Subtitle Dropdown Menu v3 ────────────────────────────────────────────
+    /**
+     * Renders the subtitle dropdown with live status indicators.
+     * Each track shows:
+     *   • Green dot  = valid (loaded successfully)
+     *   • Pink dot   = currently loading
+     *   • Red dot    = failed all candidates
+     *   • Grey dot   = unknown (not yet attempted)
+     * "Off" is always the first item.
+     * Active track is highlighted with pink left border.
+     */
     function roRenderSubMenu() {
         const btn      = document.getElementById('roSubBtn');
         const dropdown = document.getElementById('roSubDropdown');
@@ -2135,34 +2357,66 @@ HTML = r"""<!DOCTYPE html>
         }
 
         btn.style.display = 'flex';
-        // Show count badge when multiple tracks
-        const countBadge = roAllSubtitleTracks.length > 1
-            ? `<span class="ro-sub-lang-count">${roAllSubtitleTracks.length}</span>`
+        // Show count badge
+        const validCount = roAllSubtitleTracks.filter(t => t.status === 'valid').length;
+        const totalCount = roAllSubtitleTracks.length;
+        const badgeNum   = validCount > 0 ? validCount : totalCount;
+        const countBadge = totalCount > 1
+            ? `<span class="ro-sub-lang-count">${badgeNum}</span>`
             : '';
         btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>${countBadge}`;
 
-        // Build dropdown items: Off + each track
         dropdown.innerHTML = '';
 
-        const makeItem = (file, label) => {
-            const div = document.createElement('div');
-            div.className = 'ro-sub-dropdown-item';
-            const isActive = (file === null) ? (roActiveSubLabel === null) : (label === roActiveSubLabel);
-            if (isActive) div.classList.add('active-sub');
-            div.textContent = label || 'Off';
+        // Helper: build a single dropdown item
+        const makeItem = (fileUrl, label, status) => {
+            const div       = document.createElement('div');
+            const isOff     = (fileUrl === null);
+            const isActive  = isOff ? (roActiveSubLabel === null) : (label === roActiveSubLabel);
+            const isLoading = (!isOff && label === roSubLoadingLabel);
+
+            let itemClass = 'ro-sub-dropdown-item';
+            if (isActive && !isOff) itemClass += ' active-sub';
+            if (isLoading)          itemClass += ' loading-sub';
+            if (status === 'invalid' && !isActive) itemClass += ' failed-sub';
+            div.className = itemClass;
+
+            // Status dot
+            const dot = document.createElement('span');
+            dot.className = 'ro-sub-status-dot';
+            if (isOff) {
+                dot.style.display = 'none';
+            } else if (isLoading) {
+                dot.classList.add('loading');
+            } else if (status === 'valid') {
+                dot.classList.add('active');
+            } else if (status === 'invalid') {
+                dot.classList.add('failed');
+            }
+            div.appendChild(dot);
+
+            const textNode = document.createElement('span');
+            textNode.textContent = isOff ? 'Off' : (label || 'Unknown');
+            if (status === 'invalid' && !isActive) textNode.style.textDecoration = 'line-through';
+            div.appendChild(textNode);
+
             div.addEventListener('click', (e) => {
                 e.stopPropagation();
-                roSwitchSubtitle(file, label);
+                roSwitchSubtitle(fileUrl, label);
             });
             return div;
         };
 
-        // "Off" item
-        dropdown.appendChild(makeItem(null, 'Off'));
+        // "Off" item first
+        dropdown.appendChild(makeItem(null, 'Off', null));
 
-        // Language items
-        roAllSubtitleTracks.forEach(track => {
-            dropdown.appendChild(makeItem(track.file, track.label));
+        // Language items sorted: valid first, then unknown, then invalid
+        const sorted = [...roAllSubtitleTracks].sort((a, b) => {
+            const order = { valid: 0, unknown: 1, loading: 1, invalid: 2 };
+            return (order[a.status] || 1) - (order[b.status] || 1);
+        });
+        sorted.forEach(track => {
+            dropdown.appendChild(makeItem(track.file, track.label, track.status));
         });
     }
 
@@ -2182,11 +2436,19 @@ HTML = r"""<!DOCTYPE html>
     });
 
     // ── Switch Subtitle Track ────────────────────────────────────────────────
-    async function roSwitchSubtitle(file, label) {
+    /**
+     * Core subtitle switching function.
+     * - Handles "Off" (fileUrl = null) by clearing state
+     * - Shows immediate UI feedback (loading state in dropdown)
+     * - Loads VTT through 5-tier fallback
+     * - On failure: marks track as invalid and tries next best alternative
+     * - Race condition safe via roSubLoadingLabel guard
+     */
+    async function roSwitchSubtitle(fileUrl, label) {
         document.getElementById('roSubDropdown').classList.remove('open');
 
-        if (!file) {
-            // User selected "Off"
+        if (!fileUrl) {
+            // User explicitly turned off subtitles
             roActiveSubLabel  = null;
             roSubLoadingLabel = null;
             roSubtitleCues    = [];
@@ -2196,39 +2458,157 @@ HTML = r"""<!DOCTYPE html>
             return;
         }
 
-        if (label === roActiveSubLabel) return; // already active
+        // Already active — no need to reload
+        if (label === roActiveSubLabel && roSubActive && roSubtitleCues.length > 0) {
+            return;
+        }
 
-        // Immediate UI feedback — mark as active even before load completes
+        // Prevent duplicate loads for the same track
+        if (label === roSubLoadingLabel) return;
+
+        // Immediate UI feedback — set loading state
         roActiveSubLabel  = label;
         roSubLoadingLabel = label;
         roSubtitleCues    = [];
         roSubActive       = false;
         document.getElementById('roSubtitleOverlay').innerHTML = '';
-        roRenderSubMenu();
+        roSetTrackStatus(label, 'loading');
 
-        const success = await roLoadVTT(file, label);
-        if (success && roSubLoadingLabel === label) {
-            // Still the correct track — re-render menu to confirm active state
-            roRenderSubMenu();
-        } else if (!success && roSubLoadingLabel === label) {
-            // Load failed and no other track was requested — silently turn off
-            roActiveSubLabel  = null;
+        // Attempt to load through all CDN fallbacks
+        const result = await fetchAndValidateVTT(fileUrl, label);
+
+        // Check abort (user switched to different track while this was loading)
+        if (result.aborted) return;
+
+        // Final guard: still the track we want?
+        if (roSubLoadingLabel !== label) {
+            console.log(`[SUB-v3] Discarding result for "${label}" — user switched away`);
+            return;
+        }
+
+        if (result.success && result.cues.length > 0) {
+            // Success!
+            roSubtitleCues = result.cues;
+            roSubActive    = true;
+            roSetTrackStatus(label, 'valid');
             roSubLoadingLabel = null;
             roRenderSubMenu();
+            console.log(`[SUB-v3] ✓ Track "${label}" active (${result.cues.length} cues)`);
+        } else {
+            // Failed all CDN tiers — mark as invalid
+            roSetTrackStatus(label, 'invalid');
+            roSubLoadingLabel = null;
+            roActiveSubLabel  = null;
+            console.warn(`[SUB-v3] ✗ Track "${label}" failed — attempting fallback to next valid track`);
+
+            // Automatically try next available valid/unknown track
+            roAutoFallbackToNextTrack(label);
         }
     }
 
-    // ── Auto-select default subtitle track ──────────────────────────────────
-    async function roAutoSelectDefaultSubtitle() {
+    // ── Auto-Fallback to Next Valid Track ────────────────────────────────────
+    /**
+     * When a subtitle track fails, automatically tries the next best track.
+     * Priority: 'valid' tracks first, then 'unknown' tracks, skipping 'invalid'.
+     * Stops after finding a working track or exhausting all options.
+     */
+    async function roAutoFallbackToNextTrack(failedLabel) {
         if (!roAllSubtitleTracks || roAllSubtitleTracks.length === 0) return;
 
+        // Find next candidate: prefer valid, then unknown, skip invalid and failed label
+        const candidates = roAllSubtitleTracks.filter(t =>
+            t.label !== failedLabel &&
+            t.status !== 'invalid' &&
+            t.label !== roActiveSubLabel
+        );
+
+        // Sort: valid first (already confirmed working), then unknown
+        candidates.sort((a, b) => {
+            const order = { valid: 0, unknown: 1, loading: 2 };
+            return (order[a.status] || 1) - (order[b.status] || 1);
+        });
+
+        if (candidates.length === 0) {
+            console.warn('[SUB-v3] No fallback tracks available — subtitles off');
+            roActiveSubLabel = null;
+            roRenderSubMenu();
+            return;
+        }
+
+        const next = candidates[0];
+        console.log(`[SUB-v3] Auto-fallback → trying "${next.label}"`);
+        await roSwitchSubtitle(next.file, next.label);
+    }
+
+    // ── Auto-Select Default/English Subtitle ────────────────────────────────
+    /**
+     * Called once per episode load. Selects the best subtitle track automatically:
+     * 1. Track marked as default=true by the API
+     * 2. Track labeled "English" (case-insensitive)
+     * 3. First track in the list
+     * If auto-selection fails, the fallback chain handles the rest.
+     * This runs ASYNCHRONOUSLY and does NOT block video playback.
+     */
+    async function roAutoSelectDefaultSubtitle() {
+        if (!roAllSubtitleTracks || roAllSubtitleTracks.length === 0) return;
+        if (roSubAutoSelectDone) return;
+        roSubAutoSelectDone = true;
+
+        // Priority order for auto-selection
         const def =
-            roAllSubtitleTracks.find(t => t.default) ||
-            roAllSubtitleTracks.find(t => t.label && t.label.toLowerCase().includes('english')) ||
+            roAllSubtitleTracks.find(t => t.default === true) ||
+            roAllSubtitleTracks.find(t => t.label && /english/i.test(t.label)) ||
+            roAllSubtitleTracks.find(t => t.label && /eng/i.test(t.label)) ||
             roAllSubtitleTracks[0];
 
         if (def) {
+            console.log(`[SUB-v3] Auto-selecting: "${def.label}"`);
             await roSwitchSubtitle(def.file, def.label);
+        }
+    }
+
+    // ── Background Pre-validation of All Tracks ──────────────────────────────
+    /**
+     * After auto-select completes, quietly probes all other tracks in the background
+     * to discover which ones are valid/invalid WITHOUT showing them in the dropdown
+     * as "loading". This pre-populates the status dots so the user sees green/red
+     * before even clicking the dropdown.
+     */
+    async function roPrevalidateAllTracks() {
+        if (!roAllSubtitleTracks || roAllSubtitleTracks.length === 0) return;
+        for (const track of roAllSubtitleTracks) {
+            // Skip: already loading, already known valid/invalid, or currently active
+            if (track.status !== 'unknown') continue;
+            if (track.label === roSubLoadingLabel) continue;
+            // Small delay between checks to avoid hammering CDN
+            await new Promise(r => setTimeout(r, 400));
+            // Only check if still on the same episode
+            if (!currentStreamData) break;
+            try {
+                const candidates = buildVTTCandidates(track.file);
+                // Only try first two tiers for pre-validation (fast check)
+                for (const c of candidates.slice(0, 2)) {
+                    try {
+                        const ctrl = new AbortController();
+                        const tid  = setTimeout(() => ctrl.abort(), 6000);
+                        const r    = await fetch(c, { signal: ctrl.signal });
+                        clearTimeout(tid);
+                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                        const txt = await r.text();
+                        if (isValidVTT(txt)) {
+                            roSetTrackStatus(track.label, 'valid');
+                            break;
+                        } else {
+                            throw new Error('Invalid VTT');
+                        }
+                    } catch(e) {
+                        // Try next tier
+                    }
+                }
+                // If still unknown after checking, leave as unknown (don't mark invalid prematurely)
+            } catch(e) {
+                // Ignore pre-validation errors — full load will try all tiers
+            }
         }
     }
 
@@ -2333,6 +2713,8 @@ HTML = r"""<!DOCTYPE html>
                 v10SrvIdx  = i;
                 v10QualIdx = 0;
                 roRenderServerPills();
+                // Reset subtitle auto-select flag so new server's tracks get re-evaluated
+                roSubAutoSelectDone = false;
                 v10AttachHLS(saved);
             };
             row.appendChild(pill);
@@ -2559,23 +2941,42 @@ HTML = r"""<!DOCTYPE html>
         // Render server pill selector
         roRenderServerPills();
 
-        // Load subtitle tracks from API response
+        // ─── Load subtitle tracks from API response ───────────────────────
+        // Deduplicate by label + normalize status to 'unknown'
         if (v10Cache.subtitles && v10Cache.subtitles.length > 0) {
-            // Deduplicate by label (same language may appear from multiple servers)
             const seen = new Set();
             roAllSubtitleTracks = v10Cache.subtitles
                 .filter(s => {
+                    if (!s.file) return false;
                     const key = (s.label || '').toLowerCase().trim();
                     if (seen.has(key)) return false;
                     seen.add(key);
                     return true;
                 })
-                .map(s => ({ file: s.file, label: s.label, kind: s.kind || 'captions', default: s.default }));
+                .map(s => ({
+                    file:    s.file,
+                    label:   s.label || 'Unknown',
+                    kind:    s.kind  || 'captions',
+                    default: Boolean(s.default),
+                    status:  'unknown',   // will be updated as tracks load
+                }));
 
+            console.log(`[SUB-v3] ${roAllSubtitleTracks.length} subtitle track(s) found:`,
+                roAllSubtitleTracks.map(t => t.label));
+
+            // Show subtitle button with track list
             roRenderSubMenu();
-            // Auto-select default/English track asynchronously (doesn't block playback)
-            roAutoSelectDefaultSubtitle();
+
+            // Auto-select default/English track asynchronously (does NOT block playback start)
+            // We use a timeout so HLS playback starts first
+            setTimeout(() => {
+                roAutoSelectDefaultSubtitle().then(() => {
+                    // After auto-select, quietly pre-validate remaining tracks in background
+                    setTimeout(roPrevalidateAllTracks, 1500);
+                });
+            }, 800);
         } else {
+            console.log('[SUB-v3] No subtitle tracks in API response');
             roRenderSubMenu();
         }
 
@@ -2976,12 +3377,12 @@ HTML = r"""<!DOCTYPE html>
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await http_client.start()
-    logger.info("AniStream v10.1 — Unified Streaming Edition — Online")
+    logger.info("AniStream v10.2 — Unified Streaming Edition — Online")
     yield
     await http_client.stop()
     executor.shutdown()
 
-app = FastAPI(lifespan=lifespan, title="AniStream v10.1 — Unified Stream Edition")
+app = FastAPI(lifespan=lifespan, title="AniStream v10.2 — Unified Stream Edition")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
@@ -3008,13 +3409,40 @@ async def route_unified_stream(
     res = await get_unified_stream(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
+# ── Subtitle Validation Endpoint ─────────────────────────────────────────────
+@app.get("/api/v10/subtitle/validate")
+async def route_subtitle_validate(
+    url:     str = Query(...,  description="VTT subtitle URL to validate"),
+    referer: str = Query("",  description="Referer header to use when fetching"),
+):
+    """
+    Backend subtitle validation endpoint.
+    Fetches the VTT URL from the server side (bypasses browser CORS) and
+    checks whether it contains valid WEBVTT data with at least one cue.
+
+    Response:
+        { valid: bool, cue_count: int, url: str }
+    """
+    if not url:
+        raise HTTPException(400, "Missing url param")
+    try:
+        is_valid, cue_count = await fetch_and_validate_vtt_backend(url, referer)
+        return JSONResponse({
+            "valid":     is_valid,
+            "cue_count": cue_count,
+            "url":       url,
+        })
+    except Exception as e:
+        logger.warning(f"[subtitle-validate] Error validating {url[:60]}: {e}")
+        return JSONResponse({"valid": False, "cue_count": 0, "url": url, "error": str(e)})
+
 # ── Proxy — handles subtitle VTT CDN fallback + m3u8 manifest proxy ─────────
 @app.get("/proxy")
 async def route_proxy(url: str = "", referer: str = ""):
     """
     Universal proxy for fetching protected resources:
     - HLS m3u8 manifests (adds correct Referer/Origin headers)
-    - VTT subtitle files (CDN fallback used by the subtitle system)
+    - VTT subtitle files (CDN fallback used by the subtitle system v3)
     Auto-detects CDN type and sets appropriate Referer when not supplied.
     """
     if not url:
@@ -3102,7 +3530,7 @@ async def route_home():
 async def health():
     return {
         "status":     "ok",
-        "version":    "10.1",
+        "version":    "10.2",
         "cache":      cache.stats(),
         "inflight":   0,
     }
