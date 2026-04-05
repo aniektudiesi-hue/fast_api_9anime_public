@@ -1,7 +1,4 @@
-"""
-AniStream v10.3 — Subtitle Fix Edition
-=======================================
-Backend  : v10 unified stream pipeline with VidStream/VidCloud server naming,
+: v10 unified stream pipeline with VidStream/VidCloud server naming,
            SmartCache (LRU+SWR), HttpClient with origin/referer, /proxy route,
            parse_sub_server_ids, get_unified_stream, get_date_param.
            HLS proxy (/stream.m3u8, /chunk) kept intact via curl_cffi.
@@ -614,6 +611,17 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
             link = res.get("link", "")
             if not link:
                 continue
+                        # 1. Handle direct VTT files (e.g., megastatics)
+            if ".vtt" in link:
+                all_subtitles_raw.append({
+                    "file":    link,
+                    "label":   res.get("label", "Sub"),
+                    "kind":    "captions",
+                    "default": False,
+                })
+                continue
+
+            # 2. Handle embed sources (RapidCloud, MegaCloud)
             if "rapid-cloud.co" not in link and "megacloud" not in link:
                 continue
 
@@ -624,7 +632,7 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
                     api_url, referer=link, origin=RAPID_CLOUD_BASE, is_json=True
                 )
 
-                # Collect all subtitle tracks (not just from first server)
+                # Collect all subtitle tracks from the embed API
                 for sub in api_res.get("tracks", []):
                     kind = sub.get("kind", "")
                     file = sub.get("file", "")
@@ -3511,12 +3519,12 @@ HTML = r"""<!DOCTYPE html>
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await http_client.start()
-    logger.info("AniStream v10.3 — Subtitle Fix Edition — Online")
+    logger.info("AniStream v10.4 — Subtitle Fix Edition (Megastatics Support) — Online")
     yield
     await http_client.stop()
     executor.shutdown()
 
-app = FastAPI(lifespan=lifespan, title="AniStream v10.3 — Subtitle Fix Edition")
+app = FastAPI(lifespan=lifespan, title="AniStream v10.4 — Subtitle Fix Edition (Megastatics Support)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
