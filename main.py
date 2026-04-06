@@ -439,9 +439,13 @@ def fix_url(url: str) -> str:
         query = parsed.query.replace('+', '%2B') if parsed.query else parsed.query
     ).geturl()
 
-def cf_fetch(url: str) -> cf_requests.Response:
+def cf_fetch(url: str, referer: str = "") -> cf_requests.Response:
     h = PROXY_HEADERS.copy()
     h["Host"] = urlparse(url).netloc
+    if referer:
+        parsed_ref = urlparse(referer)
+        h["Referer"] = referer
+        h["Origin"]  = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
     return cf_session.get(fix_url(url), headers=h, impersonate="chrome110", allow_redirects=True)
 
 def rewrite_m3u8(content: str, original_url: str, base_local: str) -> str:
@@ -767,21 +771,12 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
         body = resp.text
     else:
         # Non-VidCloud (VidStream etc.) — MUST use curl_cffi with mobile Chrome impersonation
-        # httpx cannot bypass their bot detection; cf_fetch handles it correctly
         loop = asyncio.get_event_loop()
-        cf_resp = await loop.run_in_executor(None, lambda: cf_fetch(url))
+        cf_resp = await loop.run_in_executor(None, lambda: cf_fetch(url, referer))
         if cf_resp.status_code != 200:
             raise HTTPException(cf_resp.status_code, f"Upstream returned {cf_resp.status_code}")
         content_type = cf_resp.headers.get("Content-Type", "application/octet-stream")
         body = cf_resp.text
-
-    # Full m3u8 rewrite — handles relative URLs, URI= keys, all edge cases
-    if is_m3u8(url, body):
-        from urllib.parse import urlparse as _up
-        req_base = url  # we don't have request obj here so build a minimal base
-        # We pass a placeholder base_local; chunks will be routed through /chunk
-        # The actual base_local is set at call time in the route handler
-        body = body  # will be rewritten by caller if needed
 
     return Response(
         content    = body,
