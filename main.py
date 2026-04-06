@@ -38,6 +38,7 @@ TTL = {
     "search":         600,
     "suggest":        600,
     "episode":        300,
+    "banners":        300,
 }
 
 # Server display names — mapped by index order returned from API
@@ -347,6 +348,70 @@ def parse_episodes(html: str) -> List[Dict]:
             })
     return episodes
 
+def parse_banners(html: str) -> List[Dict]:
+    """Parse hero banner slides from 9animetv home page."""
+    parser  = LexborHTMLParser(html)
+    banners = []
+    # Primary selector — deslide items used by 9animetv
+    selectors = [
+        "div.deslide-item",
+        "div.swiper-slide",
+        "div.slider-item",
+        "div.banner-item",
+        "li.slide-item",
+    ]
+    items = []
+    for sel in selectors:
+        items = parser.css(sel)
+        if items:
+            break
+    for item in items:
+        # Get link — prefer anchor with href
+        a = item.css_first("a[href]")
+        if not a:
+            continue
+        href     = a.attributes.get("href", "")
+        # Extract anime_id — last numeric segment of slug
+        parts    = [p for p in href.rstrip("/").split("-") if p.isdigit()]
+        anime_id = parts[-1] if parts else None
+        if not anime_id:
+            continue
+        # Title — try multiple sources
+        title = (
+            a.attributes.get("title") or
+            a.attributes.get("aria-label") or
+            item.attributes.get("data-title") or
+            ""
+        ).strip()
+        # If still no title, try inner heading
+        if not title:
+            h = item.css_first("h2, h3, .desi-head-title, .title")
+            if h:
+                title = h.text().strip()
+        if not title:
+            continue
+        # Image
+        img     = item.css_first("img")
+        img_url = None
+        if img:
+            img_url = (
+                img.attributes.get("src") or
+                img.attributes.get("data-src") or
+                img.attributes.get("data-lazy-src")
+            )
+        # Background image fallback from style attribute
+        if not img_url:
+            style = item.attributes.get("style", "")
+            m     = re.search(r'url\(["\']?(https?://[^"\')\s]+)["\']?\)', style)
+            if m:
+                img_url = m.group(1)
+        banners.append({
+            "title":    title,
+            "anime_id": anime_id,
+            "img_url":  img_url or "",
+        })
+    return banners
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,9 +422,9 @@ def get_date_param() -> str:
     return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
 
 def is_banned_cdn(url: str) -> bool:
-    """Ban storm/strom/crimsonstorm CDNs — blocked or unreliable."""
+    """Ban strom and douvid CDNs — blocked or unreliable."""
     low = url.lower()
-    return "storm" in low or "strom" in low or "crimsonstorm" in low
+    return "strom" in low or "douvid" in low
 
 def get_server_label(index: int) -> str:
     """Return a human-friendly server label by position."""
@@ -646,6 +711,24 @@ async def get_home() -> List[Dict]:
         return val
     return await refresh()
 
+async def get_banners() -> List[Dict]:
+    key           = "banners"
+    val, is_stale = cache.get(key)
+    if val and not is_stale:
+        return val
+
+    async def refresh():
+        html    = await http_client.fetch(f"{BASE_URL}/home")
+        loop    = asyncio.get_running_loop()
+        results = await loop.run_in_executor(executor, parse_banners, html)
+        cache.set(key, results, TTL["banners"])
+        return results
+
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROXY ENDPOINT  (subtitle VTT CDN fallback + m3u8 manifest proxy)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,14 +748,36 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
     parsed = urlparse(referer)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     profile = random.choice(BROWSER_PROFILES)
-    headers = {
-        **profile,
-        "Referer":         referer,
-        "Origin":          origin,
-        "Accept":          "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection":      "keep-alive",
-    }
+
+    # VidCloud (vod.netmagcdn / rapid-cloud) uses standard browser headers.
+    # All other CDNs (VidStream, douvid-alts, etc.) need mobile Chrome headers
+    # that match what their player JS sends — otherwise they return 403/empty.
+    is_vidcloud = "vod.netmagcdn.com" in url or "rapid-cloud.co" in url
+    if is_vidcloud:
+        headers = {
+            **profile,
+            "Referer":         referer,
+            "Origin":          origin,
+            "Accept":          "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection":      "keep-alive",
+        }
+    else:
+        headers = {
+            "User-Agent":         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+            "Accept":             "*/*",
+            "Accept-Language":    "en-US,en;q=0.9",
+            "Accept-Encoding":    "gzip, deflate, br",
+            "Origin":             origin,
+            "Referer":            referer,
+            "sec-ch-ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile":   "?1",
+            "sec-ch-ua-platform": '"Android"',
+            "Sec-Fetch-Dest":     "empty",
+            "Sec-Fetch-Mode":     "cors",
+            "Sec-Fetch-Site":     "cross-site",
+            "Connection":         "keep-alive",
+        }
     async with http_client.sem:
         resp = await http_client.client.get(url, headers=headers, timeout=12.0)
         resp.raise_for_status()
@@ -1588,7 +1693,14 @@ HTML = r"""<!DOCTYPE html>
     //  SPLASH SCREEN
     // =========================================================================
     window.addEventListener('load', () => {
-        setTimeout(() => document.getElementById('splashScreen').classList.add('hidden'), 30);
+        // Fetch banners while splash is showing — hide splash when done (or after 3s max)
+        const splashTimeout = setTimeout(() => {
+            document.getElementById('splashScreen').classList.add('hidden');
+        }, 3000);
+        fetchBannersForSplash().then(() => {
+            clearTimeout(splashTimeout);
+            document.getElementById('splashScreen').classList.add('hidden');
+        });
     });
 
     // =========================================================================
@@ -1598,21 +1710,28 @@ HTML = r"""<!DOCTYPE html>
         const fragment = document.createDocumentFragment();
         fullAnimeList.forEach(anime => fragment.appendChild(createCard(anime, true)));
         document.getElementById('famousGrid').appendChild(fragment);
-        initHeroSlider(null);
+        initHeroSlider([]);   // start with empty slider; banners fill it
         startAsyncImageLoading();
         fetchDynamicHomeData();
+    }
+
+    async function fetchBannersForSplash() {
+        try {
+            const resp = await fetch(`${API_BASE}/api/v1/banners`);
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const list = Array.isArray(data) ? data : [];
+            if (list.length > 0) initHeroSlider(list);
+        } catch(e) { console.warn('Banner fetch failed:', e); }
     }
 
     async function fetchDynamicHomeData() {
         try {
             const resp = await fetch(`${API_BASE}/home/thumbnails`);
-            if (!resp.ok) { console.warn('Backend response not ok:', resp.status); return; }
+            if (!resp.ok) return;
             const data = await resp.json();
             const list = Array.isArray(data) ? data : (data.results || []);
-            if (!list.length) return;
-            const posterUrls = list.slice(0, 8).map(item => item.poster).filter(Boolean);
-            if (posterUrls.length > 0) initHeroSlider(posterUrls);
-            renderDynamicThumbnails(list);
+            if (list.length) renderDynamicThumbnails(list);
         } catch(e) { console.error('Error fetching dynamic home data:', e); }
     }
 
@@ -1625,59 +1744,46 @@ HTML = r"""<!DOCTYPE html>
         section.style.display = 'block';
     }
 
-    async function identifyHeroAnime(imgUrl) {
-        try {
-            const response = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: 'claude-sonnet-4-20250514', max_tokens: 100,
-                    messages: [{ role: 'user', content: [
-                        { type: 'image', source: { type: 'url', url: imgUrl } },
-                        { type: 'text', text: 'This is an anime banner/thumbnail. Reply with ONLY the anime title, nothing else. If you cannot identify it, reply with exactly: unknown' }
-                    ]}]
-                })
-            });
-            const data  = await response.json();
-            const title = data.content?.[0]?.text?.trim();
-            if (!title || title.toLowerCase() === 'unknown') return null;
-            return title;
-        } catch(e) { return null; }
-    }
-
-    function initHeroSlider(dynamicImages) {
+    // initHeroSlider — accepts array of banner objects {title, anime_id, img_url}
+    // or falls back to static fullAnimeList images
+    function initHeroSlider(banners) {
         const container = document.getElementById('heroSliderContainer');
         container.innerHTML = '';
         heroSlides = [];
         if (heroAutoInterval) { clearInterval(heroAutoInterval); heroAutoInterval = null; }
-        let slides;
-        if (dynamicImages && dynamicImages.length > 0) {
-            slides = dynamicImages.slice(0, Math.min(dynamicImages.length, 8)).map(imgUrl => ({ image: imgUrl, title: null }));
-        } else {
-            slides = fullAnimeList.slice(0, 5).map(a => ({ image: a.image, title: a.title }));
-        }
+
+        const slides = (banners && banners.length > 0)
+            ? banners.slice(0, 8)
+            : fullAnimeList.slice(0, 5).map(a => ({ title: a.title, anime_id: null, img_url: a.image }));
+
         heroSlideIndex = 0;
-        slides.forEach((slideData, index) => {
-            const slide = document.createElement('div');
-            slide.className = `hero-slide ${index === 0 ? 'active' : ''}`;
-            slide.style.backgroundImage = `url('${slideData.image}')`;
+        slides.forEach((slide, index) => {
+            const el = document.createElement('div');
+            el.className = `hero-slide ${index === 0 ? 'active' : ''}`;
+            el.style.backgroundImage = `url('${slide.img_url || slide.image || ''}')`;
             const overlay = document.createElement('div');
             overlay.className = 'hero-slide-overlay';
-            slide.appendChild(overlay);
-            if (slideData.title) {
-                overlay.innerHTML = `<h2 class="hero-slide-title">${slideData.title}</h2><span class="hero-slide-ep">FEATURED &bull; HD</span><button class="hero-watch-btn" onclick="quickOpenEpisodes('${slideData.title.replace(/'/g, "\\'")}')">&#9654; WATCH NOW</button>`;
-            } else {
-                identifyHeroAnime(slideData.image).then(title => {
-                    if (title) overlay.innerHTML = `<h2 class="hero-slide-title">${title}</h2><span class="hero-slide-ep">FEATURED &bull; HD</span><button class="hero-watch-btn" onclick="quickOpenEpisodes('${title.replace(/'/g, "\\'")}')">&#9654; WATCH NOW</button>`;
-                });
+            if (slide.title) {
+                const safeTitle = slide.title.replace(/'/g, "\\'");
+                const watchAction = slide.anime_id
+                    ? `startStreamingFromBanner('${slide.anime_id}', '${safeTitle}')`
+                    : `quickOpenEpisodes('${safeTitle}')`;
+                overlay.innerHTML = `
+                    <h2 class="hero-slide-title">${slide.title}</h2>
+                    <span class="hero-slide-ep">FEATURED &bull; HD</span>
+                    <button class="hero-watch-btn" onclick="${watchAction}">&#9654; WATCH NOW</button>`;
             }
-            container.appendChild(slide);
-            heroSlides.push(slide);
+            el.appendChild(overlay);
+            container.appendChild(el);
+            heroSlides.push(el);
         });
-        heroAutoInterval = setInterval(() => {
-            heroSlideIndex = (heroSlideIndex + 1) % slides.length;
-            updateHeroSlide();
-        }, 6000);
+
+        if (heroSlides.length > 1) {
+            heroAutoInterval = setInterval(() => {
+                heroSlideIndex = (heroSlideIndex + 1) % heroSlides.length;
+                updateHeroSlide();
+            }, 6000);
+        }
     }
 
     function updateHeroSlide() { heroSlides.forEach((s, i) => s.classList.toggle('active', i === heroSlideIndex)); }
@@ -1781,6 +1887,29 @@ HTML = r"""<!DOCTYPE html>
                 }
             } catch(e) {}
             await new Promise(r => setTimeout(r, 150));
+        }
+    }
+
+    // =========================================================================
+    //  START STREAMING FROM BANNER — uses anime_id directly, no search needed
+    // =========================================================================
+    async function startStreamingFromBanner(animeId, title) {
+        // Show episode overlay and fetch episodes directly by anime_id
+        const overlay   = document.getElementById('episodeOverlay');
+        const container = document.getElementById('episodesContainer');
+        container.innerHTML = `<div class="episode-loading"><div class="episode-spinner"></div><div class="episode-loading-text">LOADING EPISODES...</div></div>`;
+        document.getElementById('overlayTitle').textContent = title;
+        overlay.classList.add('active');
+        try {
+            const resp = await fetch(`${API_BASE}/anime/episode/${animeId}`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            const episodes = data.episodes || [];
+            if (!episodes.length) throw new Error('No episodes');
+            const anime = { anime_id: animeId, title };
+            renderEpisodes(anime, episodes);
+        } catch(e) {
+            container.innerHTML = `<div style="text-align:center;padding:30px;"><p style="color:var(--accent-pink);margin-bottom:16px;">&#9888; Could not load episodes.</p><button onclick="startStreamingFromBanner('${animeId}','${title.replace(/'/g,"\\'")}');" style="padding:8px 20px;background:var(--accent-pink);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:700;">RETRY</button></div>`;
         }
     }
 
@@ -2240,10 +2369,7 @@ HTML = r"""<!DOCTYPE html>
         const video = document.getElementById('roVideoEl');
         v10LastTime = video.currentTime;
         v10StallTimer = setInterval(() => {
-            if (!video.paused && !video.ended && video.currentTime === v10LastTime) {
-                console.warn('[v10] Stall detected — trying next server');
-                v10NextServer();
-            }
+            // Stall detection disabled — user must manually switch servers
             v10LastTime = video.currentTime;
         }, 5000);
     }
@@ -2302,7 +2428,7 @@ HTML = r"""<!DOCTYPE html>
     // =========================================================================
     function isBannedCDN(url) {
         const l = url.toLowerCase();
-        return l.includes('storm') || l.includes('strom') || l.includes('crimsonstorm');
+        return l.includes('strom') || l.includes('douvid');
     }
 
     // =========================================================================
@@ -2432,11 +2558,14 @@ HTML = r"""<!DOCTYPE html>
         video.removeEventListener('timeupdate', v10OnTimeUpdate);
         video.addEventListener('timeupdate', v10OnTimeUpdate);
 
-        // 4-second manifest load timeout → auto fallback
+        // 10-second manifest load timeout — show error, no auto-switch
         let v10LoadTimeout = setTimeout(() => {
-            console.warn('[v10] 10s timeout on', server.serverName, '— trying next');
+            console.warn('[v10] 10s timeout on', server.serverName, '— try another server manually');
             roUpdateServerPill(v10SrvIdx, 'failed');
-            v10NextServer();
+            const badge = document.getElementById('streamStatusBadge');
+            badge.textContent = '\u26a0 Server timed out — please select another server';
+            badge.className   = 'stream-status error';
+            roShowSpinner(false);
         }, 10000);
 
         const onReady = () => {
@@ -2475,7 +2604,10 @@ HTML = r"""<!DOCTYPE html>
                 if (d.fatal || [403, 404].includes(d.response?.code)) {
                     clearTimeout(v10LoadTimeout);
                     roUpdateServerPill(v10SrvIdx, 'failed');
-                    v10NextServer();
+                    const badge = document.getElementById('streamStatusBadge');
+                    badge.textContent = '\u26a0 Server failed — please select another server';
+                    badge.className   = 'stream-status error';
+                    roShowSpinner(false);
                     return;
                 }
                 if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
@@ -2491,7 +2623,10 @@ HTML = r"""<!DOCTYPE html>
             video.addEventListener('error', () => {
                 clearTimeout(v10LoadTimeout);
                 roUpdateServerPill(v10SrvIdx, 'failed');
-                v10NextServer();
+                const badge = document.getElementById('streamStatusBadge');
+                badge.textContent = '\u26a0 Server failed — please select another server';
+                badge.className   = 'stream-status error';
+                roShowSpinner(false);
             }, { once: true });
         } else {
             clearTimeout(v10LoadTimeout);
@@ -3014,7 +3149,7 @@ async def route_unified_stream(
     Primary stream endpoint called by the player.
     Returns EpisodeResponse with servers[], subtitles[], cdnDomain.
     Servers are labeled VidCloud/VidStream/etc and sorted (VOD CDN first).
-    Banned CDNs (storm/strom/crimsonstorm) are removed at collection time.
+    Banned CDNs (strom/douvid) are removed at collection time.
     """
     res = await get_unified_stream(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
@@ -3109,6 +3244,11 @@ async def route_episodes(anime_id: str):
 @app.get("/home/thumbnails")
 async def route_home():
     res = await get_home()
+    return Response(msgspec.json.encode(res), media_type="application/json")
+
+@app.get("/api/v1/banners")
+async def route_banners():
+    res = await get_banners()
     return Response(msgspec.json.encode(res), media_type="application/json")
 
 @app.get("/health")
