@@ -448,10 +448,11 @@ def cf_fetch(url: str, referer: str = "") -> cf_requests.Response:
         h["Origin"]  = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
     return cf_session.get(fix_url(url), headers=h, impersonate="chrome110", allow_redirects=True)
 
-def rewrite_m3u8(content: str, original_url: str, base_local: str) -> str:
+def rewrite_m3u8(content: str, original_url: str, base_local: str, referer: str = "") -> str:
     content     = content.replace('\r\n', '\n').replace('\r', '\n')
     base_remote = original_url.rsplit("/", 1)[0] + "/"
     out         = []
+    ref_param   = f"&referer={quote(referer, safe='')}" if referer else ""
     for line in content.split('\n'):
         if not line.strip():
             out.append("")
@@ -463,7 +464,7 @@ def rewrite_m3u8(content: str, original_url: str, base_local: str) -> str:
                 if not uri.startswith("http"):
                     uri = urljoin(base_remote, uri)
                 uri     = uri.replace('+', '%2B')
-                proxied = f'{base_local}/chunk?url={quote(uri, safe=":/?=&%")}'
+                proxied = f'{base_local}/chunk?url={quote(uri, safe=":/?=&%")}{ref_param}'
                 return f'URI="{proxied}"'
             line = re.sub(r'URI="([^"]+)"', repl, line)
             out.append(line)
@@ -473,7 +474,7 @@ def rewrite_m3u8(content: str, original_url: str, base_local: str) -> str:
             continue
         full    = s if s.startswith("http") else urljoin(base_remote, s)
         full    = full.replace('+', '%2B')
-        proxied = f"{base_local}/chunk?url={quote(full, safe=':/?=&%')}"
+        proxied = f"{base_local}/chunk?url={quote(full, safe=':/?=&%')}{ref_param}"
         out.append(proxied)
     return "\n".join(out)
 
@@ -3141,10 +3142,9 @@ async def route_proxy(request: Request, url: str = "", referer: str = ""):
 
     # If it's an m3u8, rewrite all chunk URLs to go through /chunk
     body         = resp.body.decode("utf-8", errors="replace")
-    content_type = resp.headers.get("content-type", "")
     if is_m3u8(decoded_url, body):
         base_local = str(request.base_url).rstrip("/")
-        body       = rewrite_m3u8(body, decoded_url, base_local)
+        body       = rewrite_m3u8(body, decoded_url, base_local, referer=unquote(referer))
         return Response(
             content    = body,
             media_type = "application/vnd.apple.mpegurl",
@@ -3157,16 +3157,17 @@ async def route_proxy(request: Request, url: str = "", referer: str = ""):
 
 # ── HLS chunk proxy (curl_cffi path — unchanged from original) ───────────────
 @app.get("/stream.m3u8")
-async def stream_m3u8(request: Request, src: str = ""):
-    master_url = unquote(src) if src else ""
+async def stream_m3u8(request: Request, src: str = "", referer: str = ""):
+    master_url     = unquote(src) if src else ""
+    decoded_referer = unquote(referer) if referer else ""
     if not master_url:
         return Response("No src provided", status_code=400)
     loop = asyncio.get_event_loop()
-    resp = await loop.run_in_executor(None, lambda: cf_fetch(master_url))
+    resp = await loop.run_in_executor(None, lambda: cf_fetch(master_url, decoded_referer))
     if resp.status_code != 200:
         return Response(content=f"Upstream {resp.status_code}", status_code=502)
     base_local = str(request.base_url).rstrip("/")
-    rewritten  = rewrite_m3u8(resp.text, master_url, base_local)
+    rewritten  = rewrite_m3u8(resp.text, master_url, base_local, referer=decoded_referer)
     return Response(
         content    = rewritten,
         media_type = "application/vnd.apple.mpegurl",
@@ -3179,21 +3180,24 @@ async def stream_m3u8(request: Request, src: str = ""):
 @app.get("/chunk")
 async def proxy_chunk(request: Request):
     raw = str(request.url).split("?", 1)[-1]
-    url = ""
+    url     = ""
+    referer = ""
     for p in raw.split("&"):
         if p.startswith("url="):
             url = p[4:]
-            break
-    url  = fix_url(unquote(url))
+        elif p.startswith("referer="):
+            referer = p[8:]
+    url     = fix_url(unquote(url))
+    referer = unquote(referer)
     loop = asyncio.get_event_loop()
-    resp = await loop.run_in_executor(None, lambda: cf_fetch(url))
+    resp = await loop.run_in_executor(None, lambda: cf_fetch(url, referer))
     if resp.status_code != 200:
         return Response(content=f"Upstream {resp.status_code}", status_code=502)
     text = resp.text
     if is_m3u8(url, text):
         base_local = str(request.base_url).rstrip("/")
         return Response(
-            content    = rewrite_m3u8(text, url, base_local),
+            content    = rewrite_m3u8(text, url, base_local, referer=referer),
             media_type = "application/vnd.apple.mpegurl",
             headers    = {
                 "Access-Control-Allow-Origin": "*",
