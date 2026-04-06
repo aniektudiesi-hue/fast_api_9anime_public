@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import random
@@ -41,9 +40,6 @@ TTL = {
     "banners":        300,
 }
 
-# Server display names — mapped by index order returned from API
-# First server is usually VidCloud (RapidCloud), subsequent ones vary.
-# We label them descriptively so users know what they're switching to.
 SERVER_LABELS = [
     "VidCloud",
     "VidStream",
@@ -236,12 +232,11 @@ class HttpClient:
                 await asyncio.sleep(delay)
 
 
-
 http_client = HttpClient()
 executor    = ThreadPoolExecutor(max_workers=PARSER_WORKERS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# curl_cffi session for HLS proxy  (unchanged from original)
+# curl_cffi session  — used for ALL non-VidCloud HLS proxying
 # ─────────────────────────────────────────────────────────────────────────────
 PROXY_HEADERS = {
     "Accept":             "*/*",
@@ -260,16 +255,12 @@ PROXY_HEADERS = {
 }
 cf_session = cf_requests.Session()
 
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSERS
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_sub_server_ids(html: str) -> List[str]:
-    """Extract all server IDs from the SUB block with fallback."""
     parser     = LexborHTMLParser(html)
     server_ids = []
-    # Primary: find SUB block by title
     for block in parser.css("div.ps_-block"):
         title_div = block.css_first("div.ps__-title")
         if title_div and "sub" in title_div.text().lower():
@@ -278,7 +269,6 @@ def parse_sub_server_ids(html: str) -> List[str]:
                 if sid:
                     server_ids.append(sid)
             break
-    # Fallback: flat items with data-type=sub
     if not server_ids:
         for item in parser.css("div.item.server-item"):
             if item.attributes.get("data-type", "").lower() == "sub":
@@ -349,10 +339,8 @@ def parse_episodes(html: str) -> List[Dict]:
     return episodes
 
 def parse_banners(html: str) -> List[Dict]:
-    """Parse hero banner slides from 9animetv home page."""
     parser  = LexborHTMLParser(html)
     banners = []
-    # Primary selector — deslide items used by 9animetv
     selectors = [
         "div.deslide-item",
         "div.swiper-slide",
@@ -366,31 +354,26 @@ def parse_banners(html: str) -> List[Dict]:
         if items:
             break
     for item in items:
-        # Get link — prefer anchor with href
         a = item.css_first("a[href]")
         if not a:
             continue
         href     = a.attributes.get("href", "")
-        # Extract anime_id — last numeric segment of slug
         parts    = [p for p in href.rstrip("/").split("-") if p.isdigit()]
         anime_id = parts[-1] if parts else None
         if not anime_id:
             continue
-        # Title — try multiple sources
         title = (
             a.attributes.get("title") or
             a.attributes.get("aria-label") or
             item.attributes.get("data-title") or
             ""
         ).strip()
-        # If still no title, try inner heading
         if not title:
             h = item.css_first("h2, h3, .desi-head-title, .title")
             if h:
                 title = h.text().strip()
         if not title:
             continue
-        # Image
         img     = item.css_first("img")
         img_url = None
         if img:
@@ -399,7 +382,6 @@ def parse_banners(html: str) -> List[Dict]:
                 img.attributes.get("data-src") or
                 img.attributes.get("data-lazy-src")
             )
-        # Background image fallback from style attribute
         if not img_url:
             style = item.attributes.get("style", "")
             m     = re.search(r'url\(["\']?(https?://[^"\')\s]+)["\']?\)', style)
@@ -416,18 +398,15 @@ def parse_banners(html: str) -> List[Dict]:
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def get_date_param() -> str:
-    """URL-encoded datetime param required by MEW_BASE endpoints."""
     now = datetime.now(timezone.utc)
     raw = f"{now.month}/{now.day}/{now.year} {now.hour:02d}:{now.minute:02d}"
     return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
 
 def is_banned_cdn(url: str) -> bool:
-    """Ban strom and douvid CDNs — blocked or unreliable."""
     low = url.lower()
     return "strom" in low or "douvid" in low
 
 def get_server_label(index: int) -> str:
-    """Return a human-friendly server label by position."""
     if index < len(SERVER_LABELS):
         return SERVER_LABELS[index]
     return f"Server {index + 1}"
@@ -482,7 +461,6 @@ def is_m3u8(url: str, text: str) -> bool:
     return ".m3u8" in url or text.strip().startswith("#EXTM3U")
 
 def deduplicate_subtitles(tracks: List[Dict]) -> List[Dict]:
-    """Remove duplicate subtitle tracks by label (keep first occurrence)."""
     seen   = set()
     result = []
     for t in tracks:
@@ -522,7 +500,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
         if not server_ids:
             raise HTTPException(404, f"No SUB servers found for episode {episode_id}")
 
-        # Fetch all source links in parallel
         tasks = [
             http_client.fetch(
                 f"{MEW_BASE}/ajax/episode/sources?id={sid}&type=sub-{date}",
@@ -541,7 +518,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
             link = res.get("link", "")
             if not link:
                 continue
-                        # 1. Handle direct VTT files (e.g., megastatics)
             if ".vtt" in link:
                 all_subtitles_raw.append({
                     "file":    link,
@@ -551,7 +527,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
                 })
                 continue
 
-            # 2. Handle embed sources (RapidCloud, MegaCloud)
             if "rapid-cloud.co" not in link and "megacloud" not in link:
                 continue
 
@@ -562,7 +537,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
                     api_url, referer=link, origin=RAPID_CLOUD_BASE, is_json=True
                 )
 
-                # Collect all subtitle tracks from the embed API
                 for sub in api_res.get("tracks", []):
                     kind = sub.get("kind", "")
                     file = sub.get("file", "")
@@ -597,7 +571,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
         if not all_servers:
             raise HTTPException(404, "No playable SUB streams found")
 
-        # Sort: vod.netmagcdn (CF-free) first, everything else second
         def sort_key(s: ServerSource) -> int:
             return 0 if "vod.netmagcdn.com" in s.m3u8Url.lower() else 1
 
@@ -609,7 +582,6 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
 
         main_cdn = urlparse(all_servers[0].m3u8Url).hostname or "unknown"
 
-        # Deduplicate subtitles
         deduped = deduplicate_subtitles(all_subtitles_raw)
         subtitles = [
             Subtitle(
@@ -735,7 +707,7 @@ async def get_banners() -> List[Dict]:
     return await refresh()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROXY ENDPOINT  (subtitle VTT CDN fallback + m3u8 manifest proxy)
+# PROXY ENDPOINT  (VidCloud only — httpx path)
 # ─────────────────────────────────────────────────────────────────────────────
 async def _proxy_url(url: str, referer: str = "") -> Response:
     if not url:
@@ -750,34 +722,22 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
         else:
             referer = BASE_URL
 
-    is_vidcloud = "vod.netmagcdn.com" in url or "rapid-cloud.co" in url
-
-    if is_vidcloud:
-        # VidCloud — use httpx with desktop browser headers (works fine)
-        parsed = urlparse(referer)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        profile = random.choice(BROWSER_PROFILES)
-        headers = {
-            **profile,
-            "Referer":         referer,
-            "Origin":          origin,
-            "Accept":          "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Connection":      "keep-alive",
-        }
-        async with http_client.sem:
-            resp = await http_client.client.get(url, headers=headers, timeout=12.0)
-            resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "application/octet-stream")
-        body = resp.text
-    else:
-        # Non-VidCloud (VidStream etc.) — MUST use curl_cffi with mobile Chrome impersonation
-        loop = asyncio.get_event_loop()
-        cf_resp = await loop.run_in_executor(None, lambda: cf_fetch(url, referer))
-        if cf_resp.status_code != 200:
-            raise HTTPException(cf_resp.status_code, f"Upstream returned {cf_resp.status_code}")
-        content_type = cf_resp.headers.get("Content-Type", "application/octet-stream")
-        body = cf_resp.text
+    parsed = urlparse(referer)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    profile = random.choice(BROWSER_PROFILES)
+    headers = {
+        **profile,
+        "Referer":         referer,
+        "Origin":          origin,
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection":      "keep-alive",
+    }
+    async with http_client.sem:
+        resp = await http_client.client.get(url, headers=headers, timeout=12.0)
+        resp.raise_for_status()
+    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+    body = resp.text
 
     return Response(
         content    = body,
@@ -787,7 +747,7 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRONTEND  —  Full RO-Anime premium UI with integrated v10 streaming JS
+# FRONTEND
 # ─────────────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1251,7 +1211,7 @@ HTML = r"""<!DOCTYPE html>
         .srv-pill.failed  { border-color: #ff5252; color: #ff5252; opacity: 0.5; }
         .srv-pill.loading { border-color: var(--accent-pink); color: var(--accent-pink); animation: pilPulse 1s infinite; }
         @keyframes pilPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        /* ===== SUBTITLE DROPDOWN (ENHANCED v4) ===== */
+        /* ===== SUBTITLE DROPDOWN ===== */
         #roSubMenuWrap { position: relative; display: inline-block; }
         .ro-sub-dropdown {
             display: none; position: absolute; bottom: 44px; right: 0;
@@ -1273,28 +1233,11 @@ HTML = r"""<!DOCTYPE html>
             color: var(--accent-pink); border-left-color: var(--accent-pink);
             background: rgba(255,0,110,0.08);
         }
-        .ro-sub-dropdown-item.loading-sub {
-            color: rgba(255,255,255,0.4); cursor: wait;
-            animation: subItemPulse 1s ease-in-out infinite;
-        }
-        .ro-sub-dropdown-item.failed-sub {
-            color: #ff5252; opacity: 0.6;
-        }
-        @keyframes subItemPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .ro-sub-dropdown-item:first-child { border-radius: 8px 8px 0 0; }
-        .ro-sub-dropdown-item:last-child  { border-radius: 0 0 8px 8px; }
-        .ro-sub-lang-count {
-            display: inline-block; background: var(--accent-pink); color: white;
-            font-size: 8px; font-weight: 900; padding: 1px 5px; border-radius: 10px;
-            margin-left: 6px; vertical-align: middle; letter-spacing: 0.5px;
-        }
         .ro-sub-status-dot {
             width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
             background: rgba(255,255,255,0.2);
         }
         .ro-sub-status-dot.active  { background: #00e676; box-shadow: 0 0 6px rgba(0,230,118,0.6); }
-        .ro-sub-status-dot.loading { background: var(--accent-pink); animation: subItemPulse 1s infinite; }
-        .ro-sub-status-dot.failed  { background: #ff5252; }
         /* ===== INFO PANEL ===== */
         .player-info {
             background: linear-gradient(135deg, var(--secondary-black), var(--tertiary-black));
@@ -1309,7 +1252,6 @@ HTML = r"""<!DOCTYPE html>
         }
         .episode-label { font-size: 14px; font-weight: 700; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px; }
         .server-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-        .server-row-label { font-size: 9px; font-weight: 900; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-tertiary); margin-right: 2px; }
         .navigation-controls { display: flex; gap: 12px; }
         .nav-btn {
             flex: 1; padding: 12px; border-radius: 8px; border: none; font-weight: 800;
@@ -1347,12 +1289,6 @@ HTML = r"""<!DOCTYPE html>
         .card-skeleton-line { height: 10px; border-radius: 4px; margin: 8px 8px 4px; background: linear-gradient(90deg, var(--secondary-black) 0%, #2e1a24 40%, var(--secondary-black) 80%); background-size: 200% 100%; animation: skeletonPulse 1.4s ease-in-out infinite; }
         .card-skeleton-line.short { width: 55%; height: 8px; }
         @keyframes skeletonPulse { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-        .card-skeleton:nth-child(1) .card-skeleton-img, .card-skeleton:nth-child(1) .card-skeleton-line { animation-delay: 0s; }
-        .card-skeleton:nth-child(2) .card-skeleton-img, .card-skeleton:nth-child(2) .card-skeleton-line { animation-delay: 0.07s; }
-        .card-skeleton:nth-child(3) .card-skeleton-img, .card-skeleton:nth-child(3) .card-skeleton-line { animation-delay: 0.14s; }
-        .card-skeleton:nth-child(4) .card-skeleton-img, .card-skeleton:nth-child(4) .card-skeleton-line { animation-delay: 0.21s; }
-        .card-skeleton:nth-child(5) .card-skeleton-img, .card-skeleton:nth-child(5) .card-skeleton-line { animation-delay: 0.28s; }
-        .card-skeleton:nth-child(6) .card-skeleton-img, .card-skeleton:nth-child(6) .card-skeleton-line { animation-delay: 0.35s; }
         .card.search-revealed { animation: cardReveal 0.45s cubic-bezier(0.22, 1, 0.36, 1) both; }
         @keyframes cardReveal { from { opacity: 0; transform: translateY(14px) scale(0.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
         #searchResultsSection { animation: none; }
@@ -1461,14 +1397,12 @@ HTML = r"""<!DOCTYPE html>
                             </div>
                         </div>
                         <div class="ro-right">
-                            <!-- Subtitle CC selector — enhanced multi-language v4 -->
                             <div id="roSubMenuWrap">
                                 <button class="ro-btn" id="roSubBtn" title="Subtitles / CC" style="display:none;">
                                     <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>
                                 </button>
                                 <div id="roSubDropdown" class="ro-sub-dropdown"></div>
                             </div>
-                            <!-- Fullscreen -->
                             <button class="ro-btn" id="roFsBtn" title="Fullscreen (F)">
                                 <svg id="roFsIcon" viewBox="0 0 24 24">
                                     <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
@@ -1483,11 +1417,9 @@ HTML = r"""<!DOCTYPE html>
         <div class="player-info">
             <h1 id="displayTitle" class="anime-title">Loading...</h1>
             <div id="displayEpisode" class="episode-label">Episode --</div>
-            <!-- Server pill selector (rendered dynamically) -->
             <div class="server-pill-row" id="serverPillRow" style="display:none;">
                 <span class="server-pill-label">Servers</span>
             </div>
-            <!-- Status badge -->
             <div class="server-row">
                 <span id="streamStatusBadge" class="stream-status"></span>
             </div>
@@ -1565,7 +1497,6 @@ HTML = r"""<!DOCTYPE html>
                     const u = new URL(href, location.href);
                     if (u.origin !== location.origin) {
                         e.preventDefault(); e.stopImmediatePropagation();
-                        console.warn('[RO-ANIME] Blocked redirect:', href);
                         return;
                     }
                 } catch(e) {}
@@ -1576,7 +1507,7 @@ HTML = r"""<!DOCTYPE html>
     // =========================================================================
     //  GLOBAL STATE
     // =========================================================================
-    const API_BASE        = '';   // same origin — all calls go to our FastAPI backend
+    const API_BASE        = '';
     const apiCache        = new Map();
     const suggestionCache = new Map();
 
@@ -1592,18 +1523,18 @@ HTML = r"""<!DOCTYPE html>
     let viewAllMode          = false;
 
     // ── V10 Stream State ────────────────────────────────────────────────────
-    let v10Cache             = null;   // full /api/v10/stream response (w/ _cacheKey tag)
-    let v10SrvIdx            = 0;      // current server index
-    let v10QualIdx           = 0;      // current quality index
-    let v10StallTimer        = null;   // stall watchdog interval
-    let v10LastTime          = -1;     // last video.currentTime seen by watchdog
-    let v10FilteredServers   = [];     // v10Cache.servers after banned CDN filter
+    let v10Cache             = null;
+    let v10SrvIdx            = 0;
+    let v10QualIdx           = 0;
+    let v10StallTimer        = null;
+    let v10LastTime          = -1;
+    let v10FilteredServers   = [];
 
     // ── Subtitle State ───────────────────────────────────────────────────────
-    let roSubtitleCues       = [];     // parsed VTT cues [{start, end, text}]
-    let roSubActive          = false;  // subtitle cues loaded and rendering
-    let roActiveSubLabel     = null;   // label of currently active track (null = Off)
-    let roEnglishSubFile     = null;   // VTT URL of English subtitle, or null
+    let roSubtitleCues       = [];
+    let roSubActive          = false;
+    let roActiveSubLabel     = null;
+    let roEnglishSubFile     = null;
 
     // ── Fullscreen State ────────────────────────────────────────────────────
     let roIsFullscreen       = false;
@@ -1677,7 +1608,6 @@ HTML = r"""<!DOCTYPE html>
     //  SPLASH SCREEN
     // =========================================================================
     window.addEventListener('load', () => {
-        // Fetch banners while splash is showing — hide splash when done (or after 3s max)
         const splashTimeout = setTimeout(() => {
             document.getElementById('splashScreen').classList.add('hidden');
         }, 3000);
@@ -1694,7 +1624,7 @@ HTML = r"""<!DOCTYPE html>
         const fragment = document.createDocumentFragment();
         fullAnimeList.forEach(anime => fragment.appendChild(createCard(anime, true)));
         document.getElementById('famousGrid').appendChild(fragment);
-        initHeroSlider([]);   // start with empty slider; banners fill it
+        initHeroSlider([]);
         startAsyncImageLoading();
         fetchDynamicHomeData();
     }
@@ -1728,8 +1658,6 @@ HTML = r"""<!DOCTYPE html>
         section.style.display = 'block';
     }
 
-    // initHeroSlider — accepts array of banner objects {title, anime_id, img_url}
-    // or falls back to static fullAnimeList images
     function initHeroSlider(banners) {
         const container = document.getElementById('heroSliderContainer');
         container.innerHTML = '';
@@ -1812,9 +1740,9 @@ HTML = r"""<!DOCTYPE html>
         const imgWrapper = document.createElement('div');
         imgWrapper.className = 'card-img-wrapper loading';
         const img = document.createElement('img');
-        img.loading = 'lazy';
-        img.onload  = () => { imgWrapper.classList.remove('loading'); img.classList.add('loaded'); };
-        img.onerror = () => {
+        img.loading  = 'lazy';
+        img.onload   = () => { imgWrapper.classList.remove('loading'); img.classList.add('loaded'); };
+        img.onerror  = () => {
             imgWrapper.classList.remove('loading');
             imgWrapper.style.background = 'var(--tertiary-black)';
             imgWrapper.innerHTML = `<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:9px;color:var(--text-tertiary);text-align:center;">IMAGE<br>UNAVAILABLE</div>`;
@@ -1874,11 +1802,7 @@ HTML = r"""<!DOCTYPE html>
         }
     }
 
-    // =========================================================================
-    //  START STREAMING FROM BANNER — uses anime_id directly, no search needed
-    // =========================================================================
     async function startStreamingFromBanner(animeId, title) {
-        // Show episode overlay and fetch episodes directly by anime_id
         const overlay   = document.getElementById('episodeOverlay');
         const container = document.getElementById('episodesContainer');
         container.innerHTML = `<div class="episode-loading"><div class="episode-spinner"></div><div class="episode-loading-text">LOADING EPISODES...</div></div>`;
@@ -1897,9 +1821,6 @@ HTML = r"""<!DOCTYPE html>
         }
     }
 
-    // =========================================================================
-    //  QUICK OPEN EPISODES
-    // =========================================================================
     async function quickOpenEpisodes(title) {
         const overlay   = document.getElementById('episodeOverlay');
         const container = document.getElementById('episodesContainer');
@@ -2083,7 +2004,6 @@ HTML = r"""<!DOCTYPE html>
     //  PLAYER RESET
     // =========================================================================
     function roPlayerReset() {
-        // Clear all v10 stream state
         clearInterval(v10StallTimer);
         v10StallTimer       = null;
         v10Cache            = null;
@@ -2112,9 +2032,7 @@ HTML = r"""<!DOCTYPE html>
         document.getElementById('roCurTime').textContent = '0:00';
         document.getElementById('roDur').textContent     = '0:00';
         document.getElementById('roProgBuf').style.width = '0%';
-        // Reset subtitle state completely
         roResetSubtitleState();
-        // Reset server pills
         const pillRow = document.getElementById('serverPillRow');
         pillRow.innerHTML = '<span class="server-pill-label">Servers</span>';
         pillRow.style.display = 'none';
@@ -2122,10 +2040,7 @@ HTML = r"""<!DOCTYPE html>
 
     // =========================================================================
     //  SUBTITLE SYSTEM
-    //  Simple, direct English-only subtitle loading.
-    //  No validation layers, no CDN fallback chains, no multi-track switching.
     // =========================================================================
-
     function roResetSubtitleState() {
         roSubtitleCues   = [];
         roSubActive      = false;
@@ -2135,17 +2050,14 @@ HTML = r"""<!DOCTYPE html>
         roRenderSubMenu();
     }
 
-    // ── VTT Parser ─────────────────────────────────────────────────────────
     function parseVTT(text) {
         if (!text) return [];
-        // Strip BOM and normalize line endings
         text = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
         const cues  = [];
         const lines = text.split('\n');
         let i = 0;
         while (i < lines.length) {
             const line = lines[i].trim();
-            // Find timecode lines — skip everything else
             if (line.includes('-->')) {
                 const match = line.match(
                     /(\d{1,2}:\d{2}:\d{2}[.,]\d{3}|\d{1,2}:\d{2}[.,]\d{3})\s+-->\s+(\d{1,2}:\d{2}:\d{2}[.,]\d{3}|\d{1,2}:\d{2}[.,]\d{3})/
@@ -2159,7 +2071,6 @@ HTML = r"""<!DOCTYPE html>
                         textLines.push(lines[i]);
                         i++;
                     }
-                    // Strip VTT inline tags like <c>, <i>, <b>, <ruby>, <00:01:02.000>
                     const cueText = textLines
                         .join('\n')
                         .replace(/<\d{2}:\d{2}:\d{2}\.\d{3}>/g, '')
@@ -2178,7 +2089,6 @@ HTML = r"""<!DOCTYPE html>
     }
 
     function vttTimeToSec(t) {
-        // Handle both HH:MM:SS.mmm and MM:SS.mmm
         t = t.replace(',', '.');
         const parts = t.split(':');
         if (parts.length === 3) return parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
@@ -2186,11 +2096,6 @@ HTML = r"""<!DOCTYPE html>
         return 0;
     }
 
-    // ── Subtitle Button visibility ──────────────────────────────────────────
-    /**
-     * Shows the subtitle button when English subtitles are available,
-     * hides it when they are not. No multi-track dropdown needed.
-     */
     function roRenderSubMenu() {
         const btn      = document.getElementById('roSubBtn');
         const dropdown = document.getElementById('roSubDropdown');
@@ -2203,9 +2108,7 @@ HTML = r"""<!DOCTYPE html>
         }
 
         btn.style.display = 'flex';
-        btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>`;
         btn.onclick = roToggleSubMenu;
-
         dropdown.innerHTML = '';
 
         const makeItem = (label, isActive) => {
@@ -2237,7 +2140,6 @@ HTML = r"""<!DOCTYPE html>
         dropdown.classList.toggle('open');
     }
 
-    // Close dropdown when clicking outside
     document.addEventListener('click', (e) => {
         if (!e.target.closest('#roSubMenuWrap')) {
             const dd = document.getElementById('roSubDropdown');
@@ -2245,7 +2147,6 @@ HTML = r"""<!DOCTYPE html>
         }
     });
 
-    // ── Subtitle Rendering on timeupdate ────────────────────────────────────
     function roRenderSubtitle(currentTime) {
         const overlay = document.getElementById('roSubtitleOverlay');
         if (!roSubActive || roSubtitleCues.length === 0) {
@@ -2263,10 +2164,8 @@ HTML = r"""<!DOCTYPE html>
         }
     }
 
-    // ── Switch Subtitle Track ────────────────────────────────────────────────
     async function roSwitchSubtitle(fileUrl, label) {
         document.getElementById('roSubDropdown').classList.remove('open');
-
         if (!fileUrl) {
             roActiveSubLabel = null;
             roSubtitleCues   = [];
@@ -2275,42 +2174,25 @@ HTML = r"""<!DOCTYPE html>
             roRenderSubMenu();
             return;
         }
-
-        // Already loaded — nothing to do
         if (label === roActiveSubLabel && roSubActive && roSubtitleCues.length > 0) return;
-
         roActiveSubLabel = label;
         roSubtitleCues   = [];
         roSubActive      = false;
         document.getElementById('roSubtitleOverlay').innerHTML = '';
 
         const proxyUrl = `${API_BASE}/proxy?url=${encodeURIComponent(fileUrl)}`;
-
         let txt = null;
 
-        // Try direct first (works if CDN allows CORS)
         try {
             const r = await fetch(fileUrl);
-            if (r.ok) {
-                txt = await r.text();
-                console.log('[SUB] Direct fetch OK');
-            }
-        } catch(e) {
-            console.log('[SUB] Direct fetch blocked, trying proxy...');
-        }
+            if (r.ok) txt = await r.text();
+        } catch(e) {}
 
-        // Fallback to backend proxy if direct failed
         if (!txt) {
             try {
                 const r = await fetch(proxyUrl);
-                if (r.ok) {
-                    txt = await r.text();
-                    console.log('[SUB] Proxy fetch OK');
-                } else {
-                    throw new Error(`Proxy HTTP ${r.status}`);
-                }
+                if (r.ok) txt = await r.text();
             } catch(e) {
-                console.warn('[SUB] Both direct and proxy failed:', e.message);
                 roActiveSubLabel = null;
                 roRenderSubMenu();
                 return;
@@ -2318,26 +2200,22 @@ HTML = r"""<!DOCTYPE html>
         }
 
         const cues = parseVTT(txt);
-        console.log(`[SUB] Parsed ${cues.length} cues. VTT preview:`, txt.slice(0, 300));
         if (cues.length > 0) {
             roSubtitleCues = cues;
             roSubActive    = true;
         } else {
-            console.warn('[SUB] VTT loaded but 0 cues parsed — first 200 chars:', txt.slice(0, 200));
             roActiveSubLabel = null;
         }
         roRenderSubMenu();
     }
 
-    // ── Auto-Select English Subtitle ─────────────────────────────────────────
     async function roAutoSelectDefaultSubtitle() {
         if (!roEnglishSubFile) return;
-        console.log('[SUB] Auto-selecting English subtitle');
         await roSwitchSubtitle(roEnglishSubFile, 'English');
     }
 
     // =========================================================================
-    //  V10 TIMEUPDATE — subtitle rendering
+    //  V10 TIMEUPDATE
     // =========================================================================
     function v10OnTimeUpdate() {
         roRenderSubtitle(document.getElementById('roVideoEl').currentTime);
@@ -2345,23 +2223,18 @@ HTML = r"""<!DOCTYPE html>
 
     // =========================================================================
     //  V10 STALL WATCHDOG
-    //  Checks every 5 seconds if video has been stuck at the same timestamp.
-    //  If so, falls through to the next server automatically.
     // =========================================================================
     function v10StartWatchdog() {
         clearInterval(v10StallTimer);
         const video = document.getElementById('roVideoEl');
         v10LastTime = video.currentTime;
         v10StallTimer = setInterval(() => {
-            // Stall detection disabled — user must manually switch servers
             v10LastTime = video.currentTime;
         }, 5000);
     }
 
     // =========================================================================
-    //  V10 SERVER FALLBACK — infinite retry loop
-    //  Cycles through all servers. When last server fails, wraps back to 0
-    //  and re-fetches fresh API data so URLs are not stale.
+    //  V10 SERVER FALLBACK
     // =========================================================================
     async function v10NextServer() {
         clearInterval(v10StallTimer);
@@ -2373,14 +2246,12 @@ HTML = r"""<!DOCTYPE html>
         v10SrvIdx++;
 
         if (v10SrvIdx >= v10FilteredServers.length) {
-            // All servers exhausted — re-fetch fresh URLs and wrap around
             v10SrvIdx  = 0;
             v10QualIdx = 0;
             const badge = document.getElementById('streamStatusBadge');
             badge.textContent = 'Retrying... re-fetching stream data';
             badge.className   = 'stream-status loading';
             roShowSpinner(true);
-            console.warn('[v10] All servers tried — re-fetching API for fresh URLs');
 
             try {
                 const episodeId = currentStreamData.id;
@@ -2390,10 +2261,7 @@ HTML = r"""<!DOCTYPE html>
                 fresh._cacheKey    = episodeId + '_sub';
                 v10Cache           = fresh;
                 v10FilteredServers = (fresh.servers || []).filter(s => !isBannedCDN(s.m3u8Url));
-                console.log('[v10] Fresh data: ' + v10FilteredServers.length + ' servers');
             } catch(err) {
-                console.warn('[v10] Re-fetch failed:', err.message, '— retrying with stale cache');
-                // If we have no servers at all, show not-available
                 if (v10FilteredServers.length === 0) {
                     document.getElementById('streamStatusBadge').textContent = '\u26a0 Video not available yet';
                     document.getElementById('streamStatusBadge').className   = 'stream-status error';
@@ -2434,7 +2302,6 @@ HTML = r"""<!DOCTYPE html>
                 v10SrvIdx  = i;
                 v10QualIdx = 0;
                 roRenderServerPills();
-                // Re-load subtitle for new server
                 roResetSubtitleState();
                 if (v10Cache && v10Cache.subtitles && v10Cache.subtitles.length > 0) {
                     const sub =
@@ -2462,14 +2329,7 @@ HTML = r"""<!DOCTYPE html>
     }
 
     // =========================================================================
-    //  V10 HLS ATTACH — wires HLS.js (or native Safari) to the video element
-    //
-    //  CDN routing:
-    //    vod.netmagcdn.com → load DIRECT (CF-free, no Referer needed)
-    //    everything else   → route manifest through /proxy (adds Referer/Origin)
-    //    megaplay referer  → iframe embed (no HLS.js)
-    //
-    //  4-second manifest timeout → v10NextServer() automatically
+    //  V10 HLS ATTACH  ←  KEY FIX: non-VOD uses /stream.m3u8 (curl_cffi)
     // =========================================================================
     function v10AttachHLS(resumeTime) {
         resumeTime = resumeTime || 0;
@@ -2489,15 +2349,23 @@ HTML = r"""<!DOCTYPE html>
         const pw         = document.getElementById('playerWrapper');
         const iframeWrap = document.getElementById('roIframeWrap');
 
-        const isVod      = rawUrl.toLowerCase().includes('vod.netmagcdn.com') || rawUrl.toLowerCase().includes('vod.');
-        const isMegaplay = server.referer && server.referer.includes('megaplay.buzz');
+        const isVod = rawUrl.toLowerCase().includes('vod.netmagcdn.com') ||
+                      rawUrl.toLowerCase().includes('vod.');
+
+        // ── FIX: Only use megaplay iframe when the m3u8 URL itself is megaplay
+        //    (not just because the referer mentions megaplay.buzz)
+        const isMegaplay = rawUrl.includes('megaplay.buzz') ||
+                           (server.referer && server.referer.includes('megaplay.buzz') && !rawUrl.includes('.m3u8'));
 
         let playUrl;
         if (isVod) {
+            // VidCloud VOD — CF-free, load direct, no proxy needed
             playUrl = rawUrl;
         } else if (!isMegaplay) {
+            // ── FIX: Route ALL non-VOD HLS through /stream.m3u8 (curl_cffi)
+            //    The old /proxy route used httpx which Cloudflare blocks on VidStream etc.
             const ref = encodeURIComponent(server.referer || '');
-            playUrl = `${API_BASE}/proxy?url=${encodeURIComponent(rawUrl)}&referer=${ref}`;
+            playUrl = `${API_BASE}/stream.m3u8?src=${encodeURIComponent(rawUrl)}&referer=${ref}`;
         }
 
         clearInterval(v10StallTimer);
@@ -2508,7 +2376,7 @@ HTML = r"""<!DOCTYPE html>
         roShowSpinner(true);
         roUpdateServerPill(v10SrvIdx, 'loading');
 
-        // ── Megaplay: iframe embed ────────────────────────────────────────
+        // ── Megaplay: iframe embed ───────────────────────────────────────────
         if (isMegaplay) {
             video.pause(); video.src = ''; video.style.display = 'none';
             iframeWrap.innerHTML = '';
@@ -2531,7 +2399,7 @@ HTML = r"""<!DOCTYPE html>
             return;
         }
 
-        // ── HLS path ─────────────────────────────────────────────────────
+        // ── HLS path ────────────────────────────────────────────────────────
         pw.classList.remove('megaplay-mode');
         iframeWrap.innerHTML = ''; iframeWrap.style.display = 'none';
         ['roCtrl','roCenterPlay','roFlashL','roFlashR'].forEach(id => {
@@ -2554,7 +2422,7 @@ HTML = r"""<!DOCTYPE html>
             v10StartWatchdog();
         };
 
-        console.log('[v10] Attaching', server.serverName, isVod ? '(direct)' : '(proxied)', playUrl.slice(0, 80));
+        console.log('[v10] Attaching', server.serverName, isVod ? '(direct VOD)' : '(curl_cffi proxy)', playUrl.slice(0, 80));
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             hlsInstance = new Hls({
@@ -2575,31 +2443,24 @@ HTML = r"""<!DOCTYPE html>
             hlsInstance.on(Hls.Events.ERROR, (_, d) => {
                 console.warn('[v10] HLS error:', d.type, d.details, 'fatal:', d.fatal, 'code:', d.response?.code);
                 if (d.fatal || [403, 404].includes(d.response?.code)) {
+                    // ── FIX: Auto-fallback to next server on fatal error
                     roUpdateServerPill(v10SrvIdx, 'failed');
-                    const badge = document.getElementById('streamStatusBadge');
-                    badge.textContent = '\u26a0 Server failed — please select another server';
-                    badge.className   = 'stream-status error';
-                    roShowSpinner(false);
+                    console.warn('[v10] Fatal — auto-trying next server');
+                    v10NextServer();
                     return;
                 }
                 if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
                 else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
             });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Native Safari HLS
             video.src = playUrl;
-            video.addEventListener('loadedmetadata', () => {
-                onReady();
-            }, { once: true });
+            video.addEventListener('loadedmetadata', () => { onReady(); }, { once: true });
             video.addEventListener('error', () => {
                 roUpdateServerPill(v10SrvIdx, 'failed');
-                const badge = document.getElementById('streamStatusBadge');
-                badge.textContent = '\u26a0 Server failed — please select another server';
-                badge.className   = 'stream-status error';
-                roShowSpinner(false);
+                console.warn('[v10] Safari native — error, trying next server');
+                v10NextServer();
             }, { once: true });
         } else {
-            clearTimeout(v10LoadTimeout);
             badge.textContent = '\u26a0 HLS not supported in this browser';
             badge.className   = 'stream-status error';
             roShowSpinner(false);
@@ -2607,12 +2468,7 @@ HTML = r"""<!DOCTYPE html>
     }
 
     // =========================================================================
-    //  LOAD STREAM — fetches API v10 once per episode (cached), then attaches
-    //
-    //  FIX v4: Subtitle auto-select is now triggered with a 200ms delay instead
-    //  of 800ms. The per-episode token in roResetSubtitleState() ensures
-    //  roAutoSelectDefaultSubtitle() always runs for new episodes, even when
-    //  v10Cache is reused from a previous fetch (needsFetch=false path).
+    //  LOAD STREAM
     // =========================================================================
     async function loadStream() {
         const episodeId  = currentStreamData.id;
@@ -2635,7 +2491,6 @@ HTML = r"""<!DOCTYPE html>
         roShowSpinner(true);
         document.getElementById('roCenterPlay').classList.add('visible');
 
-        // Clear subtitle state for new episode — generates new episode token
         roResetSubtitleState();
 
         const cacheKey   = episodeId + '_sub';
@@ -2650,9 +2505,7 @@ HTML = r"""<!DOCTYPE html>
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 v10Cache           = await res.json();
                 v10Cache._cacheKey = cacheKey;
-                console.log('[v10] API response:', v10Cache);
             } catch(err) {
-                console.warn('[v10] API fetch failed:', err.message);
                 badge.textContent = '\u26a0 Could not load stream. Please retry.';
                 badge.className   = 'stream-status error';
                 roShowSpinner(false);
@@ -2660,7 +2513,6 @@ HTML = r"""<!DOCTYPE html>
             }
         }
 
-        // Filter out banned CDNs
         v10FilteredServers = (v10Cache.servers || []).filter(s => !isBannedCDN(s.m3u8Url));
 
         if (!v10FilteredServers.length) {
@@ -2670,32 +2522,25 @@ HTML = r"""<!DOCTYPE html>
             return;
         }
 
-        // Render server pill selector
         roRenderServerPills();
 
-        // ─── Load English subtitle from API response ──────────────────────────
         roEnglishSubFile = null;
         if (v10Cache.subtitles && v10Cache.subtitles.length > 0) {
-            // Priority: exact "English" label → default:true → first track
             const sub =
                 v10Cache.subtitles.find(s => s.file && s.label === 'English') ||
                 v10Cache.subtitles.find(s => s.file && s.default === true)    ||
                 v10Cache.subtitles.find(s => s.file);
             if (sub) {
                 roEnglishSubFile = sub.file;
-                console.log('[SUB] Using subtitle:', sub.label, sub.file.slice(0, 70));
                 roRenderSubMenu();
                 setTimeout(() => roAutoSelectDefaultSubtitle(), 300);
             } else {
-                console.log('[SUB] No usable subtitle in API response');
                 roRenderSubMenu();
             }
         } else {
-            console.log('[SUB] No subtitles in API response');
             roRenderSubMenu();
         }
 
-        // Start HLS playback on first server
         v10AttachHLS(0);
     }
 
@@ -2777,7 +2622,7 @@ HTML = r"""<!DOCTYPE html>
     // =========================================================================
     //  SEARCH AS YOU TYPE
     // =========================================================================
-    let searchTimeout     = null;
+    let searchTimeout       = null;
     let suggestionsDropdown = null;
 
     function createSuggestionsDropdown() {
@@ -2819,11 +2664,11 @@ HTML = r"""<!DOCTYPE html>
             const suggestions = data.results || data.result || [];
             suggestionCache.set(query, suggestions);
             showSuggestions(suggestions);
-        } catch(error) { console.error('Suggestion fetch error:', error); }
+        } catch(error) {}
     }
-    document.getElementById('searchInput').addEventListener('input',   e => { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => fetchSuggestions(e.target.value.trim()), 200); });
+    document.getElementById('searchInput').addEventListener('input',    e => { clearTimeout(searchTimeout); searchTimeout = setTimeout(() => fetchSuggestions(e.target.value.trim()), 200); });
     document.getElementById('searchInput').addEventListener('keypress', e => { if (e.key === 'Enter') { hideSuggestions(); searchAnime(); } });
-    document.getElementById('searchInput').addEventListener('focus',   e => { if (e.target.value.trim().length >= 2) fetchSuggestions(e.target.value.trim()); });
+    document.getElementById('searchInput').addEventListener('focus',    e => { if (e.target.value.trim().length >= 2) fetchSuggestions(e.target.value.trim()); });
     document.addEventListener('click', e => { if (!e.target.closest('.search-container')) hideSuggestions(); });
     document.getElementById('episodeOverlay').addEventListener('click', e => { if (e.target.id === 'episodeOverlay') closeOverlay(); });
 
@@ -2860,9 +2705,6 @@ HTML = r"""<!DOCTYPE html>
         }
     }
 
-    // ── Smart Controls Visibility ───────────────────────────────────────────
-    // Outside fullscreen: always visible (CSS default)
-    // Inside fullscreen: hidden by default, reveal on interaction, hide after 2s
     function roShowControls() {
         const pw = roPW();
         pw.classList.add('ctrl-show');
@@ -2920,7 +2762,6 @@ HTML = r"""<!DOCTYPE html>
     pw.addEventListener('touchstart', () => { roShowControls(); }, { passive: true });
     pw.addEventListener('touchmove',  roShowControls, { passive: true });
 
-    // Play / Pause
     document.getElementById('roPlayBtn').addEventListener('click', roTogglePlay);
     document.getElementById('roCenterPlay').addEventListener('click', (e) => { e.stopPropagation(); roTogglePlay(); });
     document.getElementById('roVideoEl').addEventListener('click',  () => { if (!roIsDragging) roTogglePlay(); });
@@ -2928,12 +2769,10 @@ HTML = r"""<!DOCTYPE html>
     document.getElementById('roVideoEl').addEventListener('pause',  roSyncIcons);
     document.getElementById('roVideoEl').addEventListener('ended',  roSyncIcons);
 
-    // Buffering indicators
     document.getElementById('roVideoEl').addEventListener('waiting', () => roShowSpinner(true));
     document.getElementById('roVideoEl').addEventListener('canplay', () => roShowSpinner(false));
     document.getElementById('roVideoEl').addEventListener('playing', () => roShowSpinner(false));
 
-    // Time / Progress update
     document.getElementById('roVideoEl').addEventListener('timeupdate', () => {
         const v = roVideo();
         if (!roIsDragging && v.duration) {
@@ -2952,7 +2791,6 @@ HTML = r"""<!DOCTYPE html>
         }
     });
 
-    // Progress bar drag
     function roSeekFromEvent(e) {
         const rect = document.getElementById('roProg').getBoundingClientRect();
         const pct  = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
@@ -2969,7 +2807,6 @@ HTML = r"""<!DOCTYPE html>
     document.addEventListener('touchmove', e => { if (roIsDragging) roSeekFromEvent(e.touches[0]); }, { passive: true });
     document.addEventListener('touchend',  () => { roIsDragging = false; });
 
-    // Rewind / Forward
     document.getElementById('roRwdBtn').addEventListener('click', () => {
         roVideo().currentTime = Math.max(0, roVideo().currentTime - 10);
         roFlashSkip(document.getElementById('roFlashL')); roShowControls();
@@ -2980,7 +2817,6 @@ HTML = r"""<!DOCTYPE html>
         roFlashSkip(document.getElementById('roFlashR')); roShowControls();
     });
 
-    // Volume
     const VOL_ON  = 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z';
     const VOL_OFF = 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z';
 
@@ -3092,12 +2928,12 @@ HTML = r"""<!DOCTYPE html>
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await http_client.start()
-    logger.info("AniStream v10.5 — English Subtitle Edition — Online")
+    logger.info("AniStream v10.5 — VidStream curl_cffi fix — Online")
     yield
     await http_client.stop()
     executor.shutdown()
 
-app = FastAPI(lifespan=lifespan, title="AniStream v10.5 — English Subtitle Edition")
+app = FastAPI(lifespan=lifespan, title="AniStream v10.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
@@ -3109,39 +2945,24 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 async def index():
     return HTMLResponse(HTML)
 
-# ── V10 unified stream endpoint ──────────────────────────────────────────────
 @app.get("/api/v10/stream/{episode_id}")
 async def route_unified_stream(
     episode_id: str,
     type: str = Query(default="sub", pattern="^(sub|dub)$"),
 ):
-    """
-    Primary stream endpoint called by the player.
-    Returns EpisodeResponse with servers[], subtitles[], cdnDomain.
-    Servers are labeled VidCloud/VidStream/etc and sorted (VOD CDN first).
-    Banned CDNs (strom/douvid) are removed at collection time.
-    """
     res = await get_unified_stream(episode_id)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
 
-
-# ── Proxy — handles subtitle VTT CDN fallback + m3u8 manifest proxy ─────────
+# /proxy — VidCloud subtitle VTT only (httpx is fine for that CDN)
 @app.get("/proxy")
 async def route_proxy(request: Request, url: str = "", referer: str = ""):
-    """
-    Universal proxy for fetching protected resources:
-    - HLS m3u8 manifests — VidCloud via httpx, others via curl_cffi
-    - VTT subtitle files — proxied with correct Referer/Origin
-    """
     if not url:
         raise HTTPException(400, "Missing url param")
-
     decoded_url = unquote(url)
     resp        = await _proxy_url(decoded_url, referer)
-
-    # If it's an m3u8, rewrite all chunk URLs to go through /chunk
-    body         = resp.body.decode("utf-8", errors="replace")
+    body        = resp.body.decode("utf-8", errors="replace")
+    # If somehow an m3u8 hits /proxy, rewrite it through /chunk
     if is_m3u8(decoded_url, body):
         base_local = str(request.base_url).rstrip("/")
         body       = rewrite_m3u8(body, decoded_url, base_local, referer=unquote(referer))
@@ -3155,10 +2976,11 @@ async def route_proxy(request: Request, url: str = "", referer: str = ""):
         )
     return resp
 
-# ── HLS chunk proxy (curl_cffi path — unchanged from original) ───────────────
+
+# /stream.m3u8 — curl_cffi path for ALL non-VidCloud servers (VidStream, etc.)
 @app.get("/stream.m3u8")
 async def stream_m3u8(request: Request, src: str = "", referer: str = ""):
-    master_url     = unquote(src) if src else ""
+    master_url      = unquote(src) if src else ""
     decoded_referer = unquote(referer) if referer else ""
     if not master_url:
         return Response("No src provided", status_code=400)
@@ -3177,6 +2999,8 @@ async def stream_m3u8(request: Request, src: str = "", referer: str = ""):
         },
     )
 
+
+# /chunk — curl_cffi for all TS segments and child m3u8 playlists
 @app.get("/chunk")
 async def proxy_chunk(request: Request):
     raw = str(request.url).split("?", 1)[-1]
@@ -3214,6 +3038,7 @@ async def proxy_chunk(request: Request):
         },
     )
 
+
 # ── Auxiliary routes ─────────────────────────────────────────────────────────
 
 @app.get("/search/{query}")
@@ -3244,10 +3069,9 @@ async def route_banners():
 @app.get("/health")
 async def health():
     return {
-        "status":     "ok",
-        "version":    "10.3",
-        "cache":      cache.stats(),
-        "inflight":   0,
+        "status":  "ok",
+        "version": "10.5-cffi-fix",
+        "cache":   cache.stats(),
     }
 
 if __name__ == "__main__":
