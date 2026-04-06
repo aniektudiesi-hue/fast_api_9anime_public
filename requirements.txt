@@ -9,3 +9,5 @@ python-multipart
 orjson
 bs4
 curl_cffi
+msgspec
+selectolax
