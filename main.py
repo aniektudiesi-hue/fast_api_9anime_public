@@ -745,15 +745,13 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
         else:
             referer = BASE_URL
 
-    parsed = urlparse(referer)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    profile = random.choice(BROWSER_PROFILES)
-
-    # VidCloud (vod.netmagcdn / rapid-cloud) uses standard browser headers.
-    # All other CDNs (VidStream, douvid-alts, etc.) need mobile Chrome headers
-    # that match what their player JS sends — otherwise they return 403/empty.
     is_vidcloud = "vod.netmagcdn.com" in url or "rapid-cloud.co" in url
+
     if is_vidcloud:
+        # VidCloud — use httpx with desktop browser headers (works fine)
+        parsed = urlparse(referer)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        profile = random.choice(BROWSER_PROFILES)
         headers = {
             **profile,
             "Referer":         referer,
@@ -762,38 +760,28 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
             "Accept-Language": "en-US,en;q=0.9",
             "Connection":      "keep-alive",
         }
+        async with http_client.sem:
+            resp = await http_client.client.get(url, headers=headers, timeout=12.0)
+            resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        body = resp.text
     else:
-        headers = {
-            "User-Agent":         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-            "Accept":             "*/*",
-            "Accept-Language":    "en-US,en;q=0.9",
-            "Accept-Encoding":    "gzip, deflate, br",
-            "Origin":             origin,
-            "Referer":            referer,
-            "sec-ch-ua":          '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "sec-ch-ua-mobile":   "?1",
-            "sec-ch-ua-platform": '"Android"',
-            "Sec-Fetch-Dest":     "empty",
-            "Sec-Fetch-Mode":     "cors",
-            "Sec-Fetch-Site":     "cross-site",
-            "Connection":         "keep-alive",
-        }
-    async with http_client.sem:
-        resp = await http_client.client.get(url, headers=headers, timeout=12.0)
-        resp.raise_for_status()
+        # Non-VidCloud (VidStream etc.) — MUST use curl_cffi with mobile Chrome impersonation
+        # httpx cannot bypass their bot detection; cf_fetch handles it correctly
+        loop = asyncio.get_event_loop()
+        cf_resp = await loop.run_in_executor(None, lambda: cf_fetch(url))
+        if cf_resp.status_code != 200:
+            raise HTTPException(cf_resp.status_code, f"Upstream returned {cf_resp.status_code}")
+        content_type = cf_resp.headers.get("Content-Type", "application/octet-stream")
+        body = cf_resp.text
 
-    content_type = resp.headers.get("Content-Type", "application/octet-stream")
-    body         = resp.text
-
-    if ".m3u8" in url or "mpegurl" in content_type:
-        base_url = url.rsplit("/", 1)[0] + "/"
-        lines    = []
-        for line in body.splitlines():
-            s = line.strip()
-            if s and not s.startswith("#") and not s.startswith("http"):
-                s = base_url + s
-            lines.append(s)
-        body = "\n".join(lines)
+    # Full m3u8 rewrite — handles relative URLs, URI= keys, all edge cases
+    if is_m3u8(url, body):
+        from urllib.parse import urlparse as _up
+        req_base = url  # we don't have request obj here so build a minimal base
+        # We pass a placeholder base_local; chunks will be routed through /chunk
+        # The actual base_local is set at call time in the route handler
+        body = body  # will be rewritten by caller if needed
 
     return Response(
         content    = body,
@@ -2558,18 +2546,7 @@ HTML = r"""<!DOCTYPE html>
         video.removeEventListener('timeupdate', v10OnTimeUpdate);
         video.addEventListener('timeupdate', v10OnTimeUpdate);
 
-        // 10-second manifest load timeout — show error, no auto-switch
-        let v10LoadTimeout = setTimeout(() => {
-            console.warn('[v10] 10s timeout on', server.serverName, '— try another server manually');
-            roUpdateServerPill(v10SrvIdx, 'failed');
-            const badge = document.getElementById('streamStatusBadge');
-            badge.textContent = '\u26a0 Server timed out — please select another server';
-            badge.className   = 'stream-status error';
-            roShowSpinner(false);
-        }, 10000);
-
         const onReady = () => {
-            clearTimeout(v10LoadTimeout);
             if (resumeTime > 0) video.currentTime = resumeTime;
             video.play().catch(() => {});
             badge.textContent = '\u25cf ' + (server.serverLabel || server.serverName) + (isVod ? ' \u2022 VOD' : '');
@@ -2587,14 +2564,14 @@ HTML = r"""<!DOCTYPE html>
             hlsInstance = new Hls({
                 enableWorker:            true,
                 lowLatencyMode:          false,
-                maxBufferLength:         20,
-                maxMaxBufferLength:      60,
+                maxBufferLength:         30,
+                maxMaxBufferLength:      90,
                 backBufferLength:        60,
                 startLevel:              -1,
-                fragLoadingTimeOut:      10000,
-                manifestLoadingTimeOut:  8000,
-                fragLoadingMaxRetry:     2,
-                manifestLoadingMaxRetry: 2,
+                fragLoadingTimeOut:      20000,
+                manifestLoadingTimeOut:  20000,
+                fragLoadingMaxRetry:     4,
+                manifestLoadingMaxRetry: 4,
             });
             hlsInstance.loadSource(playUrl);
             hlsInstance.attachMedia(video);
@@ -2602,7 +2579,6 @@ HTML = r"""<!DOCTYPE html>
             hlsInstance.on(Hls.Events.ERROR, (_, d) => {
                 console.warn('[v10] HLS error:', d.type, d.details, 'fatal:', d.fatal, 'code:', d.response?.code);
                 if (d.fatal || [403, 404].includes(d.response?.code)) {
-                    clearTimeout(v10LoadTimeout);
                     roUpdateServerPill(v10SrvIdx, 'failed');
                     const badge = document.getElementById('streamStatusBadge');
                     badge.textContent = '\u26a0 Server failed — please select another server';
@@ -2617,11 +2593,9 @@ HTML = r"""<!DOCTYPE html>
             // Native Safari HLS
             video.src = playUrl;
             video.addEventListener('loadedmetadata', () => {
-                clearTimeout(v10LoadTimeout);
                 onReady();
             }, { once: true });
             video.addEventListener('error', () => {
-                clearTimeout(v10LoadTimeout);
                 roUpdateServerPill(v10SrvIdx, 'failed');
                 const badge = document.getElementById('streamStatusBadge');
                 badge.textContent = '\u26a0 Server failed — please select another server';
@@ -3158,16 +3132,33 @@ async def route_unified_stream(
 
 # ── Proxy — handles subtitle VTT CDN fallback + m3u8 manifest proxy ─────────
 @app.get("/proxy")
-async def route_proxy(url: str = "", referer: str = ""):
+async def route_proxy(request: Request, url: str = "", referer: str = ""):
     """
     Universal proxy for fetching protected resources:
-    - HLS m3u8 manifests (adds correct Referer/Origin headers)
-    - VTT subtitle files (CDN fallback used by the subtitle system v4)
-    Auto-detects CDN type and sets appropriate Referer when not supplied.
+    - HLS m3u8 manifests — VidCloud via httpx, others via curl_cffi
+    - VTT subtitle files — proxied with correct Referer/Origin
     """
     if not url:
         raise HTTPException(400, "Missing url param")
-    return await _proxy_url(url, referer)
+
+    decoded_url = unquote(url)
+    resp        = await _proxy_url(decoded_url, referer)
+
+    # If it's an m3u8, rewrite all chunk URLs to go through /chunk
+    body         = resp.body.decode("utf-8", errors="replace")
+    content_type = resp.headers.get("content-type", "")
+    if is_m3u8(decoded_url, body):
+        base_local = str(request.base_url).rstrip("/")
+        body       = rewrite_m3u8(body, decoded_url, base_local)
+        return Response(
+            content    = body,
+            media_type = "application/vnd.apple.mpegurl",
+            headers    = {
+                "Access-Control-Allow-Origin": "*",
+                "Content-Type":               "application/vnd.apple.mpegurl; charset=utf-8",
+            },
+        )
+    return resp
 
 # ── HLS chunk proxy (curl_cffi path — unchanged from original) ───────────────
 @app.get("/stream.m3u8")
