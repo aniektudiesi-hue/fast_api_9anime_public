@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import random
@@ -33,12 +32,13 @@ CACHE_MAX_SIZE       = 3000
 PARSER_WORKERS       = 4
 
 TTL = {
-    "unified_stream": 120,
-    "home":           180,
-    "search":         600,
-    "suggest":        600,
-    "episode":        300,
-    "banners":        300,
+    "unified_stream":  120,
+    "home":            180,
+    "search":          600,
+    "suggest":         600,
+    "episode":         300,
+    "banners":         300,
+    "recently_added":  300,   # ← NEW
 }
 
 SERVER_LABELS = [
@@ -260,11 +260,6 @@ cf_session = cf_requests.Session()
 # PARSERS
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_server_ids_by_type(html: str, ep_type: str) -> List[Tuple[str, str]]:
-    """
-    Extract (server_id, server_name) pairs matching ep_type (sub/dub).
-    Mirrors File-1's BeautifulSoup logic using selectolax — filters by
-    data-type attribute exactly as File 1 does.
-    """
     parser     = LexborHTMLParser(html)
     server_ids = []
     for item in parser.css("div.item.server-item"):
@@ -392,20 +387,80 @@ def parse_banners(html: str) -> List[Dict]:
         })
     return banners
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ NEW: parse_recently_added
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_recently_added(html: str) -> List[Dict]:
+    """
+    Scrape recently-added / trending anime from the MEW home page.
+    Mirrors the user-provided scraper: looks for div.film-poster[data-id]
+    inside .flw-item cards, extracting anime_id, title, and poster image.
+    """
+    parser  = LexborHTMLParser(html)
+    results = []
+    seen    = set()
+
+    # Primary strategy — same structure as parse_home but pulls data-id from film-poster
+    for item in parser.css("div.flw-item"):
+        poster = item.css_first("div.film-poster")
+        if not poster:
+            continue
+        anime_id  = (poster.attributes.get("data-id") or "").strip()
+        img       = poster.css_first("img")
+        if not img or not anime_id:
+            continue
+        image_url = (
+            img.attributes.get("data-src") or
+            img.attributes.get("src") or ""
+        ).strip()
+        # Try film-name anchor first (has richer title), then img alt
+        title_node = item.css_first("h3.film-name a, .film-name a")
+        if title_node:
+            title = (
+                title_node.attributes.get("title") or
+                title_node.text() or ""
+            ).strip()
+        else:
+            title = (img.attributes.get("alt") or "").strip()
+        if title and anime_id and anime_id not in seen:
+            seen.add(anime_id)
+            results.append({
+                "anime_id": anime_id,
+                "title":    title,
+                "poster":   image_url,
+            })
+
+    # Fallback — any film-poster with data-id anywhere on page
+    if not results:
+        for poster in parser.css("div.film-poster[data-id]"):
+            anime_id  = (poster.attributes.get("data-id") or "").strip()
+            img       = poster.css_first("img")
+            if not img or not anime_id or anime_id in seen:
+                continue
+            image_url = (
+                img.attributes.get("data-src") or
+                img.attributes.get("src") or ""
+            ).strip()
+            title = (img.attributes.get("alt") or "").strip()
+            if title and anime_id:
+                seen.add(anime_id)
+                results.append({
+                    "anime_id": anime_id,
+                    "title":    title,
+                    "poster":   image_url,
+                })
+
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def get_date_param() -> str:
-    """
-    Build the URL-encoded date param exactly as File 1 does:
-    'M/D/YYYY HH:MM' → percent-encoded for query string.
-    File 1 used a hardcoded value; we generate it dynamically but
-    keep the SAME format the MEW_BASE server expects.
-    """
     now = datetime.now(timezone.utc)
-    # Format matching File 1: "3/29/2026 12:00" style (no zero-padding on month/day)
     raw = f"{now.month}/{now.day}/{now.year} {now.hour:02d}:{now.minute:02d}"
-    return quote(raw, safe="")  # fully percent-encode including / and :
+    return quote(raw, safe="")
 
 def is_banned_cdn(url: str) -> bool:
     low = url.lower()
@@ -472,13 +527,6 @@ def deduplicate_subtitles(tracks: List[Dict]) -> List[Dict]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # V10 UNIFIED STREAM SERVICE
-#
-# Core logic is now identical to File 1's /api/servers route:
-#   1. GET /ajax/episode/servers?episodeId=ID&type=TYPE-DATE
-#   2. Parse ALL server items filtered by data-type == ep_type  (File 1 logic)
-#   3. For each server: GET /ajax/episode/sources?id=SID&type=TYPE-DATE
-#   4. If link is rapid-cloud / megacloud → call getSources → extract m3u8 + subtitles
-#   5. Filter banned CDNs, sort VOD first, label servers
 # ─────────────────────────────────────────────────────────────────────────────
 async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeResponse:
     key           = f"us:{episode_id}:{ep_type}"
@@ -487,12 +535,11 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
         return val
 
     async def refresh() -> EpisodeResponse:
-        date = get_date_param()   # e.g. "3%2F29%2F2026%2012%3A00"
+        date = get_date_param()
 
         all_servers:       List[ServerSource] = []
         all_subtitles_raw: List[Dict]         = []
 
-        # Use a plain AsyncClient with the same headers File 1 uses for getSources
         getSources_headers = {
             "Accept":             "*/*",
             "X-Requested-With":   "XMLHttpRequest",
@@ -504,7 +551,6 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
             timeout=Timeout(15.0),
         ) as client:
 
-            # ── STEP 1: Get server list ───────────────────────────────────────
             servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type={ep_type}-{date}"
             logger.info(f"[v10] servers url: {servers_url}")
             try:
@@ -514,14 +560,12 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
                 logger.error(f"[v10] servers fetch failed: {e}")
                 raise HTTPException(502, "Failed to fetch server list")
 
-            # ── STEP 2: Parse server IDs — File 1 exact logic ─────────────────
             server_items = parse_server_ids_by_type(html, ep_type)
             logger.info(f"[v10] found {len(server_items)} server items for type={ep_type}")
 
             if not server_items:
                 raise HTTPException(404, f"No {ep_type} servers for episode {episode_id}")
 
-            # ── STEP 3-4: For each server, fetch source link → getSources ─────
             for sid, name in server_items:
                 try:
                     src_url = f"{MEW_BASE}/ajax/episode/sources?id={sid}&type={ep_type}-{date}"
@@ -531,7 +575,6 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
                         logger.warning(f"[v10] sid={sid} ({name}): empty link")
                         continue
 
-                    # Direct VTT subtitle track
                     if ".vtt" in link:
                         all_subtitles_raw.append({
                             "file": link, "label": "Sub",
@@ -539,14 +582,12 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
                         })
                         continue
 
-                    # Only handle rapid-cloud / megacloud embeds (same as File 1)
                     if "rapid-cloud.co" not in link and "megacloud" not in link:
                         logger.info(f"[v10] sid={sid} ({name}): unsupported embed host, skipping")
                         continue
 
                     embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
 
-                    # ── getSources — exact File 1 headers ────────────────────
                     src_resp = await client.get(
                         f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
                         headers={
@@ -557,7 +598,6 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
                     api = src_resp.json()
                     logger.info(f"[v10] getSources for {name}/{embed_id}: sources={len(api.get('sources',[]))}, tracks={len(api.get('tracks',[]))}")
 
-                    # ── Subtitles ─────────────────────────────────────────────
                     for t in api.get("tracks", []):
                         if t.get("kind") in ("captions", "subtitles") and t.get("file"):
                             all_subtitles_raw.append({
@@ -567,7 +607,6 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
                                 "default": bool(t.get("default", False)),
                             })
 
-                    # ── Sources → ServerSource ────────────────────────────────
                     for s in api.get("sources", []):
                         m3u8 = s.get("file", "")
                         if not m3u8:
@@ -592,10 +631,8 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
         if not all_servers:
             raise HTTPException(404, "No playable streams found")
 
-        # Sort: vod.netmagcdn first (no Cloudflare), others after
         all_servers.sort(key=lambda s: 0 if "vod.netmagcdn.com" in s.m3u8Url.lower() else 1)
 
-        # Re-label after sort
         for i, s in enumerate(all_servers):
             s.serverLabel = get_server_label(i)
             s.serverName  = f"{s.serverLabel} (S{i+1})"
@@ -629,7 +666,7 @@ async def get_unified_stream(episode_id: str, ep_type: str = "sub") -> EpisodeRe
     return await refresh()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUXILIARY SERVICE FUNCTIONS  (unchanged)
+# AUXILIARY SERVICE FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 async def get_search(query: str) -> List[Dict]:
     key           = f"search:{query.lower().strip()}"
@@ -726,6 +763,40 @@ async def get_banners() -> List[Dict]:
         return val
     return await refresh()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ NEW: get_recently_added service
+# ─────────────────────────────────────────────────────────────────────────────
+async def get_recently_added() -> List[Dict]:
+    """
+    Fetches the MEW home page and extracts recently-added anime cards.
+    Results are cached for 5 minutes (TTL["recently_added"]).
+    """
+    key           = "recently_added"
+    val, is_stale = cache.get(key)
+    if val and not is_stale:
+        return val
+
+    async def refresh():
+        html    = await http_client.fetch(f"{MEW_BASE}/home")
+        loop    = asyncio.get_running_loop()
+        results = await loop.run_in_executor(executor, parse_recently_added, html)
+        # Deduplicate by anime_id
+        seen, unique = set(), []
+        for r in results:
+            if r["anime_id"] not in seen:
+                seen.add(r["anime_id"])
+                unique.append(r)
+        cache.set(key, unique, TTL["recently_added"])
+        logger.info(f"[recently_added] scraped {len(unique)} anime")
+        return unique
+
+    if is_stale:
+        asyncio.create_task(refresh())
+        return val
+    return await refresh()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROXY HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -744,10 +815,8 @@ async def _proxy_url(url: str, referer: str = "") -> Response:
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRONTEND HTML  — 100% unchanged from File 2 (your RO-ANIME UI)
+# FRONTEND HTML
 # ─────────────────────────────────────────────────────────────────────────────
-# paste your full HTML = r"""...""" variable from File 2 here — not repeated
-# to save space; at runtime this is the complete RO-ANIME HTML string.
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -826,6 +895,56 @@ HTML = r"""<!DOCTYPE html>
         .stream-status.loading { color: var(--accent-pink); }
         .stream-status.live    { color: #00e676; }
         .stream-status.error   { color: #ff5252; }
+
+        /* ===== RECENTLY ADDED SECTION STYLES ===== */
+        #recentlyAddedSection { display: none; animation: fadeInUp 0.8s var(--transition-smooth) 0.1s both; }
+        .recently-added-header {
+            display: flex; align-items: center; justify-content: space-between;
+            margin: 25px 0 16px 0; padding-bottom: 12px;
+            border-bottom: 3px solid var(--accent-pink);
+        }
+        .recently-added-title {
+            font-size: 20px; font-weight: 800;
+            display: flex; align-items: center; gap: 10px;
+        }
+        @media (min-width: 768px)  { .recently-added-title { font-size: 24px; } }
+        @media (min-width: 1024px) { .recently-added-title { font-size: 28px; } }
+        .recently-added-title::before {
+            content: ''; width: 4px; height: 20px;
+            background: linear-gradient(180deg, var(--accent-pink), var(--accent-neon));
+            border-radius: 3px;
+        }
+        @media (min-width: 768px)  { .recently-added-title::before { height: 24px; width: 5px; } }
+        .recently-added-badge {
+            display: inline-flex; align-items: center; gap: 5px;
+            background: linear-gradient(135deg, rgba(255,0,110,0.15), rgba(255,0,128,0.08));
+            border: 1px solid rgba(255,0,110,0.3); border-radius: 20px;
+            padding: 3px 10px; font-size: 10px; font-weight: 700;
+            color: var(--accent-pink); letter-spacing: 1px; text-transform: uppercase;
+        }
+        .recently-added-badge::before {
+            content: ''; width: 6px; height: 6px; border-radius: 50%;
+            background: var(--accent-pink);
+            box-shadow: 0 0 6px var(--accent-pink);
+            animation: livePulse 1.2s ease-in-out infinite;
+        }
+        #recentlyAddedGrid {
+            display: grid; grid-template-columns: repeat(3, 1fr);
+            gap: 10px; margin-bottom: 30px;
+        }
+        @media (min-width: 480px)  { #recentlyAddedGrid { grid-template-columns: repeat(4, 1fr); gap: 12px; } }
+        @media (min-width: 768px)  { #recentlyAddedGrid { grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 40px; } }
+        @media (min-width: 1024px) { #recentlyAddedGrid { grid-template-columns: repeat(7, 1fr); gap: 18px; } }
+        @media (min-width: 1400px) { #recentlyAddedGrid { grid-template-columns: repeat(9, 1fr); gap: 20px; } }
+        /* NEW badge on cards */
+        .card-new-badge {
+            position: absolute; top: 8px; left: 8px; z-index: 5;
+            background: linear-gradient(135deg, var(--accent-pink), var(--accent-neon));
+            color: white; font-size: 8px; font-weight: 900; padding: 2px 7px;
+            border-radius: 4px; letter-spacing: 1px; text-transform: uppercase;
+            box-shadow: 0 2px 8px rgba(255,0,110,0.5);
+        }
+
         /* ===== SPLASH SCREEN ===== */
         #splashScreen {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -1072,7 +1191,6 @@ HTML = r"""<!DOCTYPE html>
         #roVideoEl { width: 100%; height: 100%; display: block; cursor: pointer; background: #000; object-fit: contain; }
         #roIframeWrap { position: absolute; inset: 0; display: none; z-index: 5; }
         #roIframeWrap iframe { width: 100%; height: 100%; border: none; }
-        /* ===== SUBTITLE OVERLAY ===== */
         #roSubtitleOverlay {
             position: absolute; bottom: 52px; left: 50%; transform: translateX(-50%);
             z-index: 35; pointer-events: none; text-align: center; width: 80%;
@@ -1095,7 +1213,6 @@ HTML = r"""<!DOCTYPE html>
         .player-wrapper:fullscreen #roSubtitleOverlay { bottom: 48px; width: 72%; max-width: 800px; }
         .player-wrapper.ro-fs-active #roSubtitleOverlay .ro-sub-line,
         .player-wrapper:fullscreen #roSubtitleOverlay .ro-sub-line { font-size: clamp(18px, 2.8vw, 30px); -webkit-text-stroke: 3px #000; }
-        /* ===== BUFFERING ===== */
         .ro-buffer { position: absolute; inset: 0; display: none; z-index: 50; pointer-events: none; }
         .ro-buffer.active { display: block; }
         .ro-topbar {
@@ -1118,7 +1235,6 @@ HTML = r"""<!DOCTYPE html>
         }
         .ro-buffer-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.18); z-index: 50; }
         .ro-spinner-wrap, .ro-ring-outer, .ro-ring-inner, .ro-ring-inner2, .ro-buffer-label { display: none !important; }
-        /* ===== CENTER PLAY BUTTON ===== */
         .ro-center-play {
             position: absolute; top: 50%; left: 50%;
             transform: translate(-50%, -50%) scale(0.75); width: 74px; height: 74px;
@@ -1143,7 +1259,6 @@ HTML = r"""<!DOCTYPE html>
         .ro-skip.left  { left: 7%; }
         .ro-skip.right { right: 7%; }
         .ro-skip.show  { opacity: 1; }
-        /* ===== CONTROLS ===== */
         .ro-controls {
             position: absolute; bottom: 0; left: 0; right: 0;
             background: linear-gradient(0deg, rgba(0,0,0,0.97) 0%, rgba(0,0,0,0.75) 40%, rgba(0,0,0,0.3) 70%, transparent 100%);
@@ -1193,7 +1308,6 @@ HTML = r"""<!DOCTYPE html>
         .ro-vol-slider { -webkit-appearance: none; appearance: none; width: 72px; height: 3px; background: rgba(255,255,255,0.18); border-radius: 99px; outline: none; cursor: pointer; flex-shrink: 0; }
         .ro-vol-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #fff; cursor: pointer; box-shadow: 0 0 6px rgba(255,0,110,0.5); }
         .ro-vol-slider::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: none; cursor: pointer; }
-        /* ===== SERVER PILL SELECTOR ===== */
         .server-pill-row { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
         .server-pill-label { font-size: 9px; font-weight: 900; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-tertiary); margin-right: 4px; }
         .srv-pill {
@@ -1210,7 +1324,6 @@ HTML = r"""<!DOCTYPE html>
         .srv-pill.failed  { border-color: #ff5252; color: #ff5252; opacity: 0.5; }
         .srv-pill.loading { border-color: var(--accent-pink); color: var(--accent-pink); animation: pilPulse 1s infinite; }
         @keyframes pilPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        /* ===== SUBTITLE DROPDOWN ===== */
         #roSubMenuWrap { position: relative; display: inline-block; }
         .ro-sub-dropdown {
             display: none; position: absolute; bottom: 44px; right: 0;
@@ -1242,7 +1355,6 @@ HTML = r"""<!DOCTYPE html>
         .ro-sub-status-dot.active  { background: #00e676; box-shadow: 0 0 6px rgba(0,230,118,0.6); }
         .ro-sub-status-dot.loading { background: var(--accent-pink); animation: subItemPulse 1s infinite; }
         .ro-sub-status-dot.failed  { background: #ff5252; }
-        /* ===== INFO PANEL ===== */
         .player-info {
             background: linear-gradient(135deg, var(--secondary-black), var(--tertiary-black));
             padding: 20px; border-radius: 10px; border: 2px solid var(--accent-pink);
@@ -1268,7 +1380,6 @@ HTML = r"""<!DOCTYPE html>
         .next-btn { background: linear-gradient(135deg, var(--accent-pink), var(--accent-neon)); color: white; box-shadow: 0 4px 15px rgba(255,0,110,0.3); }
         .next-btn:hover:not(:disabled) { transform: scale(1.02); box-shadow: 0 8px 25px rgba(255,0,110,0.5); }
         .nav-btn:disabled { opacity: 0.3; cursor: not-allowed; filter: grayscale(1); }
-        /* ===== EPISODES SECTION ===== */
         .episodes-section { background: var(--secondary-black); border-radius: 12px; padding: 20px; border: 2px solid var(--border-color); transition: all var(--transition-smooth); }
         .episodes-section.active { border-color: var(--accent-pink); box-shadow: var(--shadow-md); }
         .episodes-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid var(--border-color); }
@@ -1279,7 +1390,6 @@ HTML = r"""<!DOCTYPE html>
         .episode-item { background: var(--tertiary-black); border: 2px solid var(--border-color); padding: 10px; border-radius: 8px; text-align: center; cursor: pointer; font-size: 10px; font-weight: 700; transition: all var(--transition-fast); color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
         .episode-item:hover { background: linear-gradient(135deg, var(--accent-pink), var(--accent-neon)); color: white; border-color: var(--accent-pink); transform: translateY(-4px); box-shadow: 0 8px 20px rgba(255,0,110,0.4); }
         .episode-item.current { background: linear-gradient(135deg, var(--accent-pink), var(--accent-neon)); color: white; border-color: var(--accent-pink); box-shadow: 0 0 20px rgba(255,0,110,0.6); }
-        /* ===== EPISODE OVERLAY ===== */
         #episodeOverlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(10,10,10,0.95); align-items: center; justify-content: center; z-index: 2000; padding: 16px; backdrop-filter: blur(10px); animation: fadeIn 0.3s ease-out; }
         #episodeOverlay.active { display: flex; }
         .panel-content { background: linear-gradient(135deg, var(--secondary-black), var(--tertiary-black)); border-radius: 14px; max-width: 700px; width: 100%; max-height: 85vh; display: flex; flex-direction: column; border: 2px solid var(--accent-pink); box-shadow: 0 25px 60px rgba(255,0,110,0.2); animation: slideUp 0.4s var(--transition-smooth); }
@@ -1288,7 +1398,6 @@ HTML = r"""<!DOCTYPE html>
         .close-btn { background: linear-gradient(135deg, var(--accent-pink), var(--accent-neon)); color: white; border: none; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; font-weight: 900; font-size: 20px; display: flex; align-items: center; justify-content: center; transition: all var(--transition-fast); box-shadow: 0 8px 20px rgba(255,0,110,0.4); }
         .close-btn:hover { transform: rotate(90deg) scale(1.1); box-shadow: 0 12px 32px rgba(255,0,110,0.6); }
         .panel-body { padding: 20px; overflow-y: auto; flex-grow: 1; }
-        /* ===== SKELETON CARDS ===== */
         .card-skeleton { background: var(--tertiary-black); border-radius: 8px; overflow: hidden; border: 2px solid var(--border-color); display: flex; flex-direction: column; position: relative; }
         .card-skeleton-img { width: 100%; aspect-ratio: 2 / 3; background: linear-gradient(90deg, var(--secondary-black) 0%, #2e1a24 40%, var(--secondary-black) 80%); background-size: 200% 100%; animation: skeletonPulse 1.4s ease-in-out infinite; }
         .card-skeleton-line { height: 10px; border-radius: 4px; margin: 8px 8px 4px; background: linear-gradient(90deg, var(--secondary-black) 0%, #2e1a24 40%, var(--secondary-black) 80%); background-size: 200% 100%; animation: skeletonPulse 1.4s ease-in-out infinite; }
@@ -1451,6 +1560,18 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- Home Section -->
     <div id="homeSection">
+
+        <!-- ★ NEW: Recently Added Section -->
+        <div id="recentlyAddedSection">
+            <div class="recently-added-header">
+                <div class="recently-added-title">
+                    Recently Added
+                </div>
+                <div class="recently-added-badge">Live Feed</div>
+            </div>
+            <div id="recentlyAddedGrid"></div>
+        </div>
+
         <div id="dynamicSection" style="display:none;">
             <h2 class="section-title">
                 <span class="live-badge">LIVE</span> Now on RO-Anime
@@ -1632,6 +1753,7 @@ HTML = r"""<!DOCTYPE html>
         initHeroSlider([]);
         startAsyncImageLoading();
         fetchDynamicHomeData();
+        fetchRecentlyAdded();   // ← NEW
     }
 
     async function fetchBannersForSplash() {
@@ -1652,6 +1774,122 @@ HTML = r"""<!DOCTYPE html>
             const list = Array.isArray(data) ? data : (data.results || []);
             if (list.length) renderDynamicThumbnails(list);
         } catch(e) { console.error('Error fetching dynamic home data:', e); }
+    }
+
+    // =========================================================================
+    //  ★ NEW: RECENTLY ADDED
+    // =========================================================================
+    async function fetchRecentlyAdded() {
+        const section = document.getElementById('recentlyAddedSection');
+        const grid    = document.getElementById('recentlyAddedGrid');
+
+        // Show skeleton while loading
+        grid.innerHTML = '';
+        const skelFrag = document.createDocumentFragment();
+        for (let i = 0; i < 9; i++) {
+            const sk = document.createElement('div');
+            sk.className = 'card-skeleton';
+            sk.innerHTML = `<div class="card-skeleton-img"></div>
+                            <div class="card-skeleton-line"></div>
+                            <div class="card-skeleton-line short" style="margin-bottom:8px"></div>`;
+            skelFrag.appendChild(sk);
+        }
+        grid.appendChild(skelFrag);
+        section.style.display = 'block';
+
+        try {
+            const resp = await fetch(`${API_BASE}/home/recently-added`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const list = await resp.json();
+            if (!Array.isArray(list) || list.length === 0) {
+                section.style.display = 'none';
+                return;
+            }
+            renderRecentlyAdded(list);
+        } catch(e) {
+            console.warn('Recently added fetch failed:', e);
+            section.style.display = 'none';
+        }
+    }
+
+    function renderRecentlyAdded(animeList) {
+        const grid    = document.getElementById('recentlyAddedGrid');
+        const section = document.getElementById('recentlyAddedSection');
+        grid.innerHTML = '';
+        const fragment = document.createDocumentFragment();
+        animeList.forEach((anime, i) => {
+            // Build a card element directly so we can add the NEW badge
+            const card = createRecentCard(anime, i);
+            fragment.appendChild(card);
+        });
+        grid.appendChild(fragment);
+        section.style.display = 'block';
+        startAsyncImageLoading();
+    }
+
+    function createRecentCard(anime, idx) {
+        const card = document.createElement('div');
+        card.className = 'card search-revealed';
+        card.style.animationDelay = `${Math.min(idx * 40, 500)}ms`;
+
+        const imgWrapper = document.createElement('div');
+        imgWrapper.className = 'card-img-wrapper loading';
+
+        // NEW badge
+        const badge = document.createElement('span');
+        badge.className   = 'card-new-badge';
+        badge.textContent = 'NEW';
+        imgWrapper.appendChild(badge);
+
+        const img = document.createElement('img');
+        img.loading = 'lazy';
+        img.onload  = () => { imgWrapper.classList.remove('loading'); img.classList.add('loaded'); };
+        img.onerror = () => {
+            imgWrapper.classList.remove('loading');
+            imgWrapper.style.background = 'var(--tertiary-black)';
+        };
+        const imageUrl = anime.poster || anime.image || anime.thumbnail || '';
+        if (imageUrl) { img.dataset.src = imageUrl; observeNewImage(img); }
+        imgWrapper.appendChild(img);
+
+        const overlay = document.createElement('div');
+        overlay.className = 'card-overlay';
+        const watchBtn = document.createElement('button');
+        watchBtn.className   = 'card-watch-btn';
+        watchBtn.textContent = '\u25b6 WATCH NOW';
+        watchBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            openRecentAnime(anime);
+        });
+        overlay.appendChild(watchBtn);
+        imgWrapper.appendChild(overlay);
+
+        const info = document.createElement('div');
+        info.className = 'card-info';
+        const title = document.createElement('div');
+        title.className   = 'card-title';
+        title.textContent = anime.title;
+        const meta = document.createElement('div');
+        meta.className   = 'card-meta';
+        meta.textContent = 'Series \u2022 HD';
+        info.appendChild(title);
+        info.appendChild(meta);
+
+        card.appendChild(imgWrapper);
+        card.appendChild(info);
+
+        // Clicking anywhere on card opens episodes
+        card.addEventListener('click', () => openRecentAnime(anime));
+        return card;
+    }
+
+    /**
+     * Open a recently-added anime. Since we have the anime_id directly,
+     * we skip the search step and go straight to episode fetch.
+     */
+    async function openRecentAnime(anime) {
+        const animeObj = { anime_id: anime.anime_id, title: anime.title };
+        fetchEpisodes(animeObj);
     }
 
     function renderDynamicThumbnails(animeList) {
@@ -2424,7 +2662,6 @@ HTML = r"""<!DOCTYPE html>
 
         roRenderServerPills();
 
-        // Load English subtitle
         roEnglishSubFile = null;
         if (v10Cache.subtitles && v10Cache.subtitles.length > 0) {
             const sub =
@@ -2843,13 +3080,8 @@ async def route_unified_stream(
     res = await get_unified_stream(episode_id, type)
     return Response(msgspec.json.encode(res), media_type="application/json")
 
-# ── File 1's /api/servers — kept as-is for debugging / direct testing ────────
 @app.get("/api/servers")
 async def api_servers_compat(episodeId: int, type: str = "sub"):
-    """
-    File 1 compatible endpoint — useful for debugging.
-    Returns the same data as /api/v10/stream but in File 1's flat format.
-    """
     try:
         result = await get_unified_stream(str(episodeId), type)
         servers = [
@@ -2957,6 +3189,20 @@ async def route_home():
 async def route_banners():
     res = await get_banners()
     return Response(msgspec.json.encode(res), media_type="application/json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★ NEW: Recently Added route
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/home/recently-added")
+async def route_recently_added():
+    """
+    Returns a list of recently-added anime scraped from the MEW home page.
+    Each item: { anime_id, title, poster }
+    """
+    res = await get_recently_added()
+    return Response(msgspec.json.encode(res), media_type="application/json")
+
 
 @app.get("/health")
 async def health():
