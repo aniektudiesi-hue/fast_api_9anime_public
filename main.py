@@ -2455,10 +2455,12 @@ HTML = r"""<!DOCTYPE html>
 
         let playUrl;
         if (isVod) {
+            // VidCloud — direct, no proxy needed
             playUrl = rawUrl;
         } else if (!isMegaplay) {
-            const ref = encodeURIComponent(server.referer || '');
-            playUrl = `${API_BASE}/proxy?url=${encodeURIComponent(rawUrl)}&referer=${ref}`;
+            // All other servers (VidStream etc.) — route through stream.m3u8
+            // which uses cf_fetch with correct mobile Chrome headers
+            playUrl = `${API_BASE}/stream.m3u8?src=${encodeURIComponent(rawUrl)}`;
         }
 
         clearInterval(v10StallTimer);
