@@ -2576,15 +2576,8 @@ HTML = r"""<!DOCTYPE html>
         const pw         = document.getElementById('playerWrapper');
         const iframeWrap = document.getElementById('roIframeWrap');
 
-        const isVod      = rawUrl.toLowerCase().includes('vod.netmagcdn.com') || rawUrl.toLowerCase().includes('vod.');
-        const isMegaplay = server.referer && server.referer.includes('megaplay.buzz');
-
-        let playUrl;
-        if (isVod) {
-            playUrl = rawUrl;
-        } else if (!isMegaplay) {
-            playUrl = `${API_BASE}/stream.m3u8?src=${encodeURIComponent(rawUrl)}`;
-        }
+        // Always use external HLS loader — no proxy, no iframe
+        const playUrl = `https://anime-search-api-burw.onrender.com/stream?src=${encodeURIComponent(rawUrl)}`;
 
         clearInterval(v10StallTimer);
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
@@ -2593,28 +2586,6 @@ HTML = r"""<!DOCTYPE html>
         badge.className   = 'stream-status loading';
         roShowSpinner(true);
         roUpdateServerPill(v10SrvIdx, 'loading');
-
-        if (isMegaplay) {
-            video.pause(); video.src = ''; video.style.display = 'none';
-            iframeWrap.innerHTML = '';
-            ['roCtrl','roCenterPlay','roFlashL','roFlashR'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.style.visibility = 'hidden';
-            });
-            pw.classList.add('megaplay-mode');
-            const epId = currentStreamData.id;
-            iframeWrap.innerHTML = `<iframe src="https://megaplay.buzz/stream/s-2/${epId}/sub"
-                allowfullscreen allow="autoplay; encrypted-media; fullscreen"
-                sandbox="allow-scripts allow-same-origin allow-forms allow-presentation allow-downloads"
-                referrerpolicy="no-referrer" loading="lazy"
-                style="pointer-events:auto;"></iframe>`;
-            iframeWrap.style.display = 'block';
-            badge.textContent = '\u25cf ' + (server.serverLabel || server.serverName);
-            badge.className   = 'stream-status live';
-            roShowSpinner(false);
-            roUpdateServerPill(v10SrvIdx, 'active');
-            return;
-        }
 
         pw.classList.remove('megaplay-mode');
         iframeWrap.innerHTML = ''; iframeWrap.style.display = 'none';
@@ -2629,7 +2600,7 @@ HTML = r"""<!DOCTYPE html>
         const onReady = () => {
             if (resumeTime > 0) video.currentTime = resumeTime;
             video.play().catch(() => {});
-            badge.textContent = '\u25cf ' + (server.serverLabel || server.serverName) + (isVod ? ' \u2022 VOD' : '');
+            badge.textContent = '\u25cf ' + (server.serverLabel || server.serverName);
             badge.className   = 'stream-status live';
             roShowSpinner(false);
             roShowControls();
@@ -2709,10 +2680,21 @@ HTML = r"""<!DOCTYPE html>
             v10SrvIdx = 0; v10QualIdx = 0;
             try {
                 badge.textContent = 'Fetching stream data...';
-                const res = await fetch(`${API_BASE}/api/v10/stream/${episodeId}?type=sub`);
+                const res = await fetch(`${API_BASE}/api/servers/${episodeId}/sub`);
                 if (!res.ok) throw new Error('HTTP ' + res.status);
-                v10Cache           = await res.json();
-                v10Cache._cacheKey = cacheKey;
+                const data = await res.json();
+                // Normalise into the shape v10AttachHLS expects
+                v10Cache = {
+                    _cacheKey: cacheKey,
+                    servers: (data.servers || []).map(s => ({
+                        serverName:  s.id,
+                        serverLabel: s.name,
+                        m3u8Url:     s.m3u8url,
+                        qualities:   [{ label: 'Auto', url: s.m3u8url }],
+                        referer:     '',
+                    })),
+                    subtitles: [],
+                };
             } catch(err) {
                 badge.textContent = '\u26a0 Could not load stream. Please retry.';
                 badge.className   = 'stream-status error';
@@ -2729,20 +2711,7 @@ HTML = r"""<!DOCTYPE html>
         }
 
         roRenderServerPills();
-
-        roEnglishSubFile = null;
-        if (v10Cache.subtitles && v10Cache.subtitles.length > 0) {
-            const sub =
-                v10Cache.subtitles.find(s => s.file && s.label === 'English') ||
-                v10Cache.subtitles.find(s => s.file && s.default === true)    ||
-                v10Cache.subtitles.find(s => s.file);
-            if (sub) {
-                roEnglishSubFile = sub.file;
-                roRenderSubMenu();
-                setTimeout(() => roAutoSelectDefaultSubtitle(), 300);
-            } else { roRenderSubMenu(); }
-        } else { roRenderSubMenu(); }
-
+        roRenderSubMenu();
         v10AttachHLS(0);
     }
 
@@ -3140,98 +3109,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 async def index():
     return HTMLResponse(HTML)
 
-@app.get("/api/v10/stream/{episode_id}")
-async def route_unified_stream(
-    episode_id: str,
-    type: str = Query(default="sub", pattern="^(sub|dub)$"),
-):
-    res = await get_unified_stream(episode_id, type)
-    return Response(msgspec.json.encode(res), media_type="application/json")
 
-@app.get("/api/servers")
-async def api_servers_compat(episodeId: int, type: str = "sub"):
-    try:
-        result = await get_unified_stream(str(episodeId), type)
-        servers = [
-            {"id": s.serverName, "name": s.serverLabel, "m3u8url": s.m3u8Url}
-            for s in result.servers
-        ]
-        return {"servers": servers}
-    except HTTPException as e:
-        return JSONResponse({"error": e.detail, "servers": []}, status_code=e.status_code)
-
-@app.get("/proxy")
-async def route_proxy(request: Request, url: str = "", referer: str = ""):
-    if not url:
-        raise HTTPException(400, "Missing url param")
-    decoded_url = unquote(url)
-    resp        = await _proxy_url(decoded_url)
-    body        = resp.body.decode("utf-8", errors="replace")
-    if is_m3u8(decoded_url, body):
-        base_local = str(request.base_url).rstrip("/")
-        return Response(
-            content    = rewrite_m3u8(body, decoded_url, base_local),
-            media_type = "application/vnd.apple.mpegurl",
-            headers    = {
-                "Access-Control-Allow-Origin": "*",
-                "Content-Type":               "application/vnd.apple.mpegurl; charset=utf-8",
-            },
-        )
-    return resp
-
-@app.get("/stream.m3u8")
-async def stream_m3u8(request: Request, src: str = ""):
-    master_url = unquote(src) if src else ""
-    if not master_url:
-        return Response("No src provided", status_code=400)
-    loop = asyncio.get_event_loop()
-    resp = await loop.run_in_executor(None, lambda: cf_fetch(master_url))
-    if resp.status_code != 200:
-        return Response(content=f"Upstream {resp.status_code}", status_code=502)
-    base_local = str(request.base_url).rstrip("/")
-    rewritten  = rewrite_m3u8(resp.text, master_url, base_local)
-    return Response(
-        content    = rewritten,
-        media_type = "application/vnd.apple.mpegurl",
-        headers    = {
-            "Access-Control-Allow-Origin": "*",
-            "Content-Type":               "application/vnd.apple.mpegurl; charset=utf-8",
-        },
-    )
-
-@app.get("/chunk")
-async def proxy_chunk(request: Request):
-    raw = str(request.url).split("?", 1)[-1]
-    url = ""
-    for p in raw.split("&"):
-        if p.startswith("url="):
-            url = p[4:]
-            break
-    url  = fix_url(unquote(url))
-    loop = asyncio.get_event_loop()
-    resp = await loop.run_in_executor(None, lambda: cf_fetch(url))
-    if resp.status_code != 200:
-        return Response(content=f"Upstream {resp.status_code}", status_code=502)
-    text = resp.text
-    if is_m3u8(url, text):
-        base_local = str(request.base_url).rstrip("/")
-        return Response(
-            content    = rewrite_m3u8(text, url, base_local),
-            media_type = "application/vnd.apple.mpegurl",
-            headers    = {
-                "Access-Control-Allow-Origin": "*",
-                "Content-Type":               "application/vnd.apple.mpegurl; charset=utf-8",
-            },
-        )
-    return Response(
-        content    = resp.content,
-        media_type = "video/mp2t",
-        headers    = {
-            "Access-Control-Allow-Origin": "*",
-            "Content-Type":               "video/mp2t",
-            "Cache-Control":              "public, max-age=3600",
-        },
-    )
 
 @app.get("/search/{query}")
 async def route_search(query: str):
@@ -3257,56 +3135,57 @@ async def route_home():
 async def route_banners():
     res = await get_banners()
     return Response(msgspec.json.encode(res), media_type="application/json")
-BASE = "https://nine.mewcdn.online"
-DATE = "3/29/2026%2012:00"
-
 @app.get("/api/servers/{episodeId}/{type}")
 async def api_servers(episodeId: int, type: str = "sub"):
+    date    = get_date_param()
     results = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
-        url = f"{BASE}/ajax/episode/servers?episodeId={episodeId}&type={type}-{DATE}"
+    loop    = asyncio.get_event_loop()
+
+    def _fetch_json(url: str, referer: str = "") -> dict:
+        h = HEADERS.copy()
+        h["Host"]    = urlparse(url).netloc
+        h["Referer"] = referer or MEW_BASE
+        r = session.get(fix_url(url), headers=h, impersonate="chrome110", allow_redirects=True)
+        return r.json()
+
+    try:
+        servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episodeId}&type={type}-{date}"
+        data        = await loop.run_in_executor(None, lambda: _fetch_json(servers_url))
+        server_items = parse_server_ids_by_type(data.get("html", ""), type)
+    except Exception as e:
+        return JSONResponse({"error": str(e), "servers": []}, status_code=502)
+
+    async def _resolve(sid: str, name: str):
         try:
-            resp = await client.get(url)
-            data = resp.json()
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=502)
+            src_url  = f"{MEW_BASE}/ajax/episode/sources?id={sid}&type={type}-{date}"
+            src_data = await loop.run_in_executor(None, lambda: _fetch_json(src_url))
+            link     = src_data.get("link", "")
+            if not link:
+                return None
+            if "rapid-cloud.co" not in link and "megacloud" not in link:
+                return None
+            embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
+            gs_url   = f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}"
+            def _gs():
+                h = HEADERS.copy()
+                h["Host"]              = "rapid-cloud.co"
+                h["Referer"]           = link
+                h["X-Requested-With"]  = "XMLHttpRequest"
+                return session.get(gs_url, headers=h, impersonate="chrome110", allow_redirects=True).json()
+            gs = await loop.run_in_executor(None, _gs)
+            srcs = gs.get("sources", [])
+            if not srcs:
+                return None
+            m3u8 = srcs[0].get("file", "")
+            if not m3u8 or is_banned_cdn(m3u8):
+                return None
+            return {"id": str(sid), "name": name, "m3u8url": m3u8}
+        except Exception:
+            return None
 
-        soup = BeautifulSoup(data.get('html', ''), 'lxml')
-        items = soup.find_all('div', class_='item server-item')
-        server_ids = [
-            (item.get('data-id'), item.get_text(strip=True))
-            for item in items
-            if item.get('data-id') and item.get('data-type') == type
-        ]
-
-        for sid, name in server_ids:
-            try:
-                src_url = f"{BASE}/ajax/episode/sources?id={sid}&type={type}-{DATE}"
-                r = await client.get(src_url)
-                link = r.json().get('link', '')
-                if not link:
-                    continue
-
-                m3u8url = None
-                if 'rapid-cloud.co' in link or 'megacloud' in link:
-                    embed_id = link.split('/')[-1].split('?')[0]
-                    sources_resp = await client.get(
-                        f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
-                        headers={
-                            "Accept": "*/*",
-                            "Referer": link,
-                            "X-Requested-With": "XMLHttpRequest",
-                            "User-Agent": HEADERS["User-Agent"],
-                        }
-                    )
-                    srcs = sources_resp.json().get('sources', [])
-                    if srcs:
-                        m3u8url = srcs[0].get('file', '')
-
-                if m3u8url:
-                    results.append({"id": sid, "name": name, "m3u8url": m3u8url})
-            except Exception:
-                continue
+    tasks   = [_resolve(sid, name) for sid, name in server_items]
+    settled = await asyncio.gather(*tasks)
+    results = [r for r in settled if r]
 
     return {"servers": results}
 
