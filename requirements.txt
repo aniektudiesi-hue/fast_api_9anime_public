@@ -11,3 +11,4 @@ bs4
 curl_cffi
 msgspec
 selectolax
+beautifulsoup4
