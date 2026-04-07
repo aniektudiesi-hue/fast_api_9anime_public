@@ -422,9 +422,9 @@ def get_date_param() -> str:
     return raw.replace("/", "%2F").replace(" ", "%20").replace(":", "%3A")
 
 def is_banned_cdn(url: str) -> bool:
-    """Ban strom and douvid CDNs — blocked or unreliable."""
+    """Ban storm/strom and douvid CDNs."""
     low = url.lower()
-    return "strom" in low or "douvid" in low
+    return "storm" in low or "strom" in low or "douvid" in low
 
 def get_server_label(index: int) -> str:
     """Return a human-friendly server label by position."""
@@ -497,115 +497,113 @@ async def get_unified_stream(episode_id: str) -> EpisodeResponse:
         return val
 
     async def refresh() -> EpisodeResponse:
-        date        = get_date_param()
-        servers_url = (
-            f"{MEW_BASE}/ajax/episode/servers"
-            f"?episodeId={episode_id}&type=sub-{date}"
-        )
-
-        try:
-            servers_data = await http_client.fetch(
-                servers_url, referer=MEW_BASE, origin=MEW_BASE, is_json=True
-            )
-        except Exception as e:
-            logger.error(f"[v10] servers fetch failed for {episode_id}: {e}")
-            raise HTTPException(502, "Failed to fetch episode server list")
-
-        html       = servers_data.get("html", "")
-        server_ids = parse_sub_server_ids(html)
-
-        if not server_ids:
-            raise HTTPException(404, f"No SUB servers found for episode {episode_id}")
-
-        # Fetch all source links in parallel
-        tasks = [
-            http_client.fetch(
-                f"{MEW_BASE}/ajax/episode/sources?id={sid}&type=sub-{date}",
-                referer=MEW_BASE, origin=MEW_BASE, is_json=True,
-            )
-            for sid in server_ids
-        ]
-        source_results = await asyncio.gather(*tasks, return_exceptions=True)
+        date = get_date_param()
 
         all_servers:       List[ServerSource] = []
         all_subtitles_raw: List[Dict]         = []
 
-        for res in source_results:
-            if isinstance(res, Exception):
-                continue
-            link = res.get("link", "")
-            if not link:
-                continue
-                        # 1. Handle direct VTT files (e.g., megastatics)
-            if ".vtt" in link:
-                all_subtitles_raw.append({
-                    "file":    link,
-                    "label":   res.get("label", "Sub"),
-                    "kind":    "captions",
-                    "default": False,
-                })
-                continue
-
-            # 2. Handle embed sources (RapidCloud, MegaCloud)
-            if "rapid-cloud.co" not in link and "megacloud" not in link:
-                continue
-
-            embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
-            api_url  = f"{RAPID_CLOUD_BASE}/embed-2/v2/e-1/getSources?id={embed_id}"
+        # ── Exact logic from reference code ──────────────────────────────────
+        async with AsyncClient(
+            http2=True,
+            follow_redirects=True,
+            timeout=Timeout(15.0),
+        ) as client:
+            # Step 1: get server list
+            servers_url = f"{MEW_BASE}/ajax/episode/servers?episodeId={episode_id}&type=sub-{date}"
             try:
-                api_res = await http_client.fetch(
-                    api_url, referer=link, origin=RAPID_CLOUD_BASE, is_json=True
-                )
-
-                # Collect all subtitle tracks from the embed API
-                for sub in api_res.get("tracks", []):
-                    kind = sub.get("kind", "")
-                    file = sub.get("file", "")
-                    if kind in ("captions", "subtitles") and file:
-                        all_subtitles_raw.append({
-                            "file":    file,
-                            "label":   sub.get("label", "Unknown"),
-                            "kind":    kind,
-                            "default": bool(sub.get("default", False)),
-                        })
-
-                for s in api_res.get("sources", []):
-                    m3u8 = s.get("file", "")
-                    if not m3u8:
-                        continue
-                    if is_banned_cdn(m3u8):
-                        logger.info(f"[v10] Banned CDN skipped: {m3u8[:60]}")
-                        continue
-                    idx   = len(all_servers)
-                    label = get_server_label(idx)
-                    all_servers.append(ServerSource(
-                        serverName  = f"{label} (Server {idx + 1})",
-                        serverLabel = label,
-                        m3u8Url     = m3u8,
-                        qualities   = [QualityInfo(label="Auto", url=m3u8)],
-                        referer     = link,
-                    ))
+                resp = await client.get(servers_url)
+                data = resp.json()
             except Exception as e:
-                logger.warning(f"[v10] embed fetch failed for {embed_id}: {e}")
-                continue
+                logger.error(f"[v10] servers fetch failed for {episode_id}: {e}")
+                raise HTTPException(502, "Failed to fetch episode server list")
+
+            html       = data.get("html", "")
+            server_ids = parse_sub_server_ids(html)
+            if not server_ids:
+                raise HTTPException(404, f"No SUB servers found for episode {episode_id}")
+
+            # Step 2: for each server get source link then extract m3u8
+            for sid in server_ids:
+                try:
+                    src_url = f"{MEW_BASE}/ajax/episode/sources?id={sid}&type=sub-{date}"
+                    r       = await client.get(src_url)
+                    link    = r.json().get("link", "")
+                    if not link:
+                        continue
+
+                    # Direct VTT subtitle link (megastatics etc.)
+                    if ".vtt" in link:
+                        all_subtitles_raw.append({
+                            "file":    link,
+                            "label":   "Sub",
+                            "kind":    "captions",
+                            "default": False,
+                        })
+                        continue
+
+                    # Only handle rapid-cloud / megacloud embeds
+                    if "rapid-cloud.co" not in link and "megacloud" not in link:
+                        continue
+
+                    embed_id = link.rstrip("/").split("/")[-1].split("?")[0]
+
+                    # Step 3: getSources — exact reference code headers
+                    sources_resp = await client.get(
+                        f"https://rapid-cloud.co/embed-2/v2/e-1/getSources?id={embed_id}",
+                        headers={
+                            "Accept":             "*/*",
+                            "Referer":            link,
+                            "X-Requested-With":   "XMLHttpRequest",
+                            "User-Agent":         PROXY_HEADERS["User-Agent"],
+                        }
+                    )
+                    api_res = sources_resp.json()
+
+                    # Collect subtitles
+                    for sub in api_res.get("tracks", []):
+                        kind = sub.get("kind", "")
+                        file = sub.get("file", "")
+                        if kind in ("captions", "subtitles") and file:
+                            all_subtitles_raw.append({
+                                "file":    file,
+                                "label":   sub.get("label", "Unknown"),
+                                "kind":    kind,
+                                "default": bool(sub.get("default", False)),
+                            })
+
+                    # Collect stream sources
+                    for s in api_res.get("sources", []):
+                        m3u8 = s.get("file", "")
+                        if not m3u8:
+                            continue
+                        if is_banned_cdn(m3u8):
+                            logger.info(f"[v10] Banned CDN skipped: {m3u8[:60]}")
+                            continue
+                        idx   = len(all_servers)
+                        label = get_server_label(idx)
+                        all_servers.append(ServerSource(
+                            serverName  = f"{label} (S{idx + 1})",
+                            serverLabel = label,
+                            m3u8Url     = m3u8,
+                            qualities   = [QualityInfo(label="Auto", url=m3u8)],
+                            referer     = link,
+                        ))
+                except Exception as e:
+                    logger.warning(f"[v10] source fetch failed for sid {sid}: {e}")
+                    continue
 
         if not all_servers:
             raise HTTPException(404, "No playable SUB streams found")
 
-        # Sort: vod.netmagcdn (CF-free) first, everything else second
-        def sort_key(s: ServerSource) -> int:
-            return 0 if "vod.netmagcdn.com" in s.m3u8Url.lower() else 1
-
-        all_servers.sort(key=sort_key)
+        # Sort: vod.netmagcdn first
+        all_servers.sort(key=lambda s: 0 if "vod.netmagcdn.com" in s.m3u8Url.lower() else 1)
         for i, s in enumerate(all_servers):
-            label       = get_server_label(i)
+            label         = get_server_label(i)
             s.serverLabel = label
             s.serverName  = f"{label} (S{i + 1})"
 
-        main_cdn = urlparse(all_servers[0].m3u8Url).hostname or "unknown"
-
-        # Deduplicate subtitles
-        deduped = deduplicate_subtitles(all_subtitles_raw)
+        main_cdn  = urlparse(all_servers[0].m3u8Url).hostname or "unknown"
+        deduped   = deduplicate_subtitles(all_subtitles_raw)
         subtitles = [
             Subtitle(
                 file    = t["file"],
@@ -2373,7 +2371,7 @@ HTML = r"""<!DOCTYPE html>
     // =========================================================================
     function isBannedCDN(url) {
         const l = url.toLowerCase();
-        return l.includes('strom') || l.includes('douvid');
+        return l.includes('storm') || l.includes('strom') || l.includes('douvid');
     }
 
     // =========================================================================
