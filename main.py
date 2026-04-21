@@ -895,6 +895,8 @@ HTML = r"""<!DOCTYPE html>
     <link rel="preconnect" href="https://cdn.noitatnemucod.net">
     <link rel="preconnect" href="https://cdn.jsdelivr.net">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.min.js"></script>
     <style>
         /* ===== GOJO SATORU PREMIUM THEME ===== */
         @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;500;600;700;800;900&display=swap');
@@ -2065,9 +2067,64 @@ HTML = r"""<!DOCTYPE html>
             font-size: 10px;
             letter-spacing: 1.5px;
         }
+
+        /* ===== CINEMATIC VOID INTRO ===== */
+        #cinematicIntro {
+            position: fixed; inset: 0; z-index: 10001;
+            background: #000; overflow: hidden; pointer-events: all;
+        }
+        #cinematicIntro.gone { display: none; }
+        #voidCanvas {
+            position: absolute; inset: 0;
+            width: 100% !important; height: 100% !important; display: block;
+        }
+        #voidGlitch1, #voidGlitch2 {
+            position: absolute; left: 0; right: 0; height: 2px;
+            opacity: 0; pointer-events: none; z-index: 10003;
+        }
+        #voidGlitch1 {
+            top: 30%;
+            background: linear-gradient(90deg, transparent, rgba(0,212,255,0.9), rgba(168,85,247,0.8), transparent);
+        }
+        #voidGlitch2 {
+            top: 68%;
+            background: linear-gradient(90deg, transparent, rgba(255,0,128,0.85), rgba(0,212,255,0.65), transparent);
+        }
+        #voidRgbSplit {
+            position: absolute; inset: 0; pointer-events: none; z-index: 10002; opacity: 0;
+        }
+        #voidInfoText {
+            position: absolute; bottom: 18%; left: 50%; transform: translateX(-50%);
+            font-family: 'Orbitron', monospace; font-size: clamp(9px,1.5vw,13px);
+            letter-spacing: 3px; color: rgba(0,212,255,0);
+            text-transform: uppercase; white-space: nowrap;
+            pointer-events: none; z-index: 10003;
+        }
+
+        /* ===== FUSION ANIMATION OVERLAY ===== */
+        #fusionOverlay {
+            position: fixed; inset: 0; z-index: 9998;
+            display: none; pointer-events: none; overflow: hidden; background: #000;
+        }
+        #fusionCanvas {
+            position: absolute; inset: 0;
+            width: 100% !important; height: 100% !important; display: block;
+        }
     </style>
 </head>
 <body>
+
+<!-- ===== CINEMATIC VOID INTRO ===== -->
+<div id="cinematicIntro">
+    <canvas id="voidCanvas"></canvas>
+    <div id="voidGlitch1"></div>
+    <div id="voidGlitch2"></div>
+    <div id="voidRgbSplit"></div>
+    <div id="voidInfoText">PROCESSING INFINITE DATA STREAM...</div>
+</div>
+
+<!-- ===== FUSION ANIMATION OVERLAY ===== -->
+<div id="fusionOverlay"><canvas id="fusionCanvas"></canvas></div>
 
 <!-- ===== GOJO INFINITY CANVAS ===== -->
 <canvas id="gojoCanvas"></canvas>
@@ -3820,11 +3877,433 @@ document.addEventListener('mousemove', function(e) {
     initHome();
 </script>
 
+<!-- ============================================================
+     CINEMATIC VOID INTRO — Three.js Black Hole / Infinite Void
+     ============================================================ -->
+<script>
+(function() {
+    if (typeof THREE === 'undefined') return;
+    const intro = document.getElementById('cinematicIntro');
+    if (!intro) return;
+
+    const W0 = window.innerWidth, H0 = window.innerHeight;
+    const scene    = new THREE.Scene();
+    const camera   = new THREE.PerspectiveCamera(70, W0/H0, 0.1, 1000);
+    camera.position.z = 6;
+    const renderer = new THREE.WebGLRenderer({
+        canvas: document.getElementById('voidCanvas'),
+        antialias: true, alpha: false
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(W0, H0);
+    renderer.setClearColor(0x000000, 1);
+
+    // ---- Void particles spiraling inward ----
+    const N = W0 < 600 ? 2500 : 5000;
+    const posArr = new Float32Array(N * 3);
+    const colArr = new Float32Array(N * 3);
+    const angArr = new Float32Array(N);
+    const radArr = new Float32Array(N);
+    const spdArr = new Float32Array(N);
+
+    const COLS = [
+        [0, 0.83, 1],
+        [0.66, 0.36, 0.97],
+        [1, 1, 1],
+        [0.53, 0, 1],
+        [1, 0.08, 0.3]
+    ];
+
+    for (let i = 0; i < N; i++) {
+        angArr[i] = Math.random() * Math.PI * 2;
+        radArr[i] = 1.2 + Math.random() * 9;
+        spdArr[i] = 0.003 + Math.random() * 0.012;
+        posArr[i*3]   = Math.cos(angArr[i]) * radArr[i];
+        posArr[i*3+1] = (Math.random() - 0.5) * 6;
+        posArr[i*3+2] = Math.sin(angArr[i]) * radArr[i];
+        const ci = Math.random() < 0.08 ? 4 : Math.floor(Math.random() * 4);
+        const c = COLS[ci];
+        colArr[i*3] = c[0]; colArr[i*3+1] = c[1]; colArr[i*3+2] = c[2];
+    }
+
+    const pGeo = new THREE.BufferGeometry();
+    pGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+    pGeo.setAttribute('color',    new THREE.BufferAttribute(colArr, 3));
+    const pMat = new THREE.PointsMaterial({
+        size: 0.038, vertexColors: true, transparent: true, opacity: 1,
+        blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true
+    });
+    scene.add(new THREE.Points(pGeo, pMat));
+
+    // ---- Black hole core ----
+    scene.add(new THREE.Mesh(
+        new THREE.SphereGeometry(0.3, 32, 32),
+        new THREE.MeshBasicMaterial({ color: 0x000000 })
+    ));
+
+    // ---- Lensing glow ----
+    const lensMat = new THREE.MeshBasicMaterial({
+        color: 0x00d4ff, transparent: true, opacity: 0.07,
+        blending: THREE.AdditiveBlending, depthWrite: false
+    });
+    scene.add(new THREE.Mesh(new THREE.SphereGeometry(0.65, 32, 32), lensMat));
+
+    // ---- Accretion rings ----
+    function mkRing(ri, ro, color, op, rx, rz) {
+        const m = new THREE.MeshBasicMaterial({
+            color, side: THREE.DoubleSide, transparent: true, opacity: op,
+            blending: THREE.AdditiveBlending, depthWrite: false
+        });
+        const mesh = new THREE.Mesh(new THREE.RingGeometry(ri, ro, 80), m);
+        mesh.rotation.x = rx; mesh.rotation.z = rz;
+        scene.add(mesh); return { mesh, mat: m };
+    }
+    const r1 = mkRing(0.34, 0.80, 0x00d4ff, 0.30,  1.15,  0.0);
+    const r2 = mkRing(0.30, 0.58, 0x8b5cf6, 0.45,  1.35,  0.9);
+    const r3 = mkRing(0.42, 1.00, 0xff0080, 0.14,  0.95, -0.5);
+
+    let t = 0, alive = true;
+    function voidTick() {
+        if (!alive) return;
+        requestAnimationFrame(voidTick);
+        t += 0.016;
+
+        for (let i = 0; i < N; i++) {
+            radArr[i] -= spdArr[i] * radArr[i] * 0.04;
+            angArr[i] += spdArr[i] * (1 + Math.max(0, 3 - radArr[i]) * 0.5);
+            posArr[i*3]   = Math.cos(angArr[i]) * radArr[i];
+            posArr[i*3+2] = Math.sin(angArr[i]) * radArr[i];
+            posArr[i*3+1] *= 0.994;
+            if (radArr[i] < 0.28) {
+                radArr[i] = 2.5 + Math.random() * 7;
+                angArr[i] = Math.random() * Math.PI * 2;
+                posArr[i*3+1] = (Math.random() - 0.5) * 6;
+            }
+        }
+        pGeo.attributes.position.needsUpdate = true;
+
+        r1.mesh.rotation.z += 0.009;
+        r2.mesh.rotation.z -= 0.013;
+        r3.mesh.rotation.z += 0.005;
+        r1.mat.opacity = 0.20 + Math.sin(t * 2.0) * 0.10;
+        r2.mat.opacity = 0.35 + Math.sin(t * 2.7 + 1) * 0.13;
+        r3.mat.opacity = 0.10 + Math.sin(t * 1.5 + 2) * 0.06;
+        lensMat.opacity = 0.05 + Math.sin(t * 3) * 0.03;
+
+        camera.position.z = Math.max(2.2, 6 - t * 0.65);
+        renderer.render(scene, camera);
+    }
+    voidTick();
+
+    // ---- Glitch / information overload ----
+    const g1 = document.getElementById('voidGlitch1');
+    const g2 = document.getElementById('voidGlitch2');
+    const ri = document.getElementById('voidRgbSplit');
+    const tx = document.getElementById('voidInfoText');
+
+    if (typeof anime !== 'undefined') {
+        anime({
+            targets: tx,
+            color: ['rgba(0,212,255,0)', 'rgba(0,212,255,0.5)'],
+            delay: 900, duration: 700, easing: 'easeOutSine'
+        });
+
+        setTimeout(() => {
+            anime.timeline({ loop: 7 })
+                .add({ targets: g1, opacity: [0,0.9,0],
+                    top: ['22%','78%','40%'], translateX: ['-12%','15%','-8%'],
+                    duration: 120, easing: 'steps(2)' }, 0)
+                .add({ targets: g2, opacity: [0,0.75,0],
+                    top: ['60%','25%','70%'], translateX: ['8%','-18%','5%'],
+                    duration: 120, easing: 'steps(2)' }, 0);
+
+            anime({
+                targets: ri, opacity: [0, 0.35, 0],
+                backgroundColor: [
+                    'rgba(255,0,80,0.06)',
+                    'rgba(0,212,255,0.06)',
+                    'rgba(168,85,247,0.04)'
+                ],
+                translateX: ['-3px','3px','0px'],
+                duration: 400, easing: 'steps(4)', loop: 4
+            });
+        }, 1800);
+
+        setTimeout(() => {
+            alive = false;
+            anime({
+                targets: '#cinematicIntro', opacity: [1, 0],
+                duration: 1400, easing: 'easeInQuart',
+                complete: () => {
+                    intro.classList.add('gone');
+                    renderer.dispose(); pGeo.dispose(); pMat.dispose();
+                }
+            });
+        }, 3800);
+    } else {
+        setTimeout(() => {
+            alive = false;
+            intro.style.transition = 'opacity 1.4s ease-in';
+            intro.style.opacity = '0';
+            setTimeout(() => { intro.classList.add('gone'); renderer.dispose(); }, 1400);
+        }, 3800);
+    }
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }, { passive: true });
+})();
+</script>
+
+<!-- ============================================================
+     FUSION ANIMATION — Watch Now → Hollow Purple Burst → Player
+     ============================================================ -->
+<script>
+(function() {
+    if (typeof THREE === 'undefined') return;
+    if (typeof window.startStreaming !== 'function') return;
+
+    const _origStartStreaming = window.startStreaming;
+    let busy = false;
+
+    window.startStreaming = async function(animeObj, episode, allEpisodes) {
+        if (busy) return _origStartStreaming(animeObj, episode, allEpisodes);
+        busy = true;
+        try { await runFusion(); } catch(e) { console.warn('Fusion err:', e); }
+        busy = false;
+        return _origStartStreaming(animeObj, episode, allEpisodes);
+    };
+
+    function runFusion() {
+        return new Promise(resolve => {
+            const overlay = document.getElementById('fusionOverlay');
+            const cvs     = document.getElementById('fusionCanvas');
+            overlay.style.display = 'block';
+            overlay.style.opacity = '1';
+
+            const Wf = window.innerWidth, Hf = window.innerHeight;
+            const scene    = new THREE.Scene();
+            const camera   = new THREE.PerspectiveCamera(65, Wf/Hf, 0.1, 500);
+            camera.position.z = 5.5;
+            const renderer = new THREE.WebGLRenderer({ canvas: cvs, antialias: true, alpha: false });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+            renderer.setSize(Wf, Hf);
+            renderer.setClearColor(0x000000, 1);
+
+            const CN = Wf < 600 ? 700 : 1400;
+
+            function mkCluster(rgb, spread) {
+                const g = new THREE.BufferGeometry();
+                const p = new Float32Array(CN * 3);
+                const c = new Float32Array(CN * 3);
+                const v = [];
+                for (let i = 0; i < CN; i++) {
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi   = Math.acos(2 * Math.random() - 1);
+                    const r     = 0.25 + Math.random() * spread;
+                    p[i*3]   = Math.sin(phi)*Math.cos(theta)*r;
+                    p[i*3+1] = Math.sin(phi)*Math.sin(theta)*r;
+                    p[i*3+2] = Math.cos(phi)*r;
+                    c[i*3]=rgb[0]; c[i*3+1]=rgb[1]; c[i*3+2]=rgb[2];
+                    v.push({
+                        x:(Math.random()-.5)*.014,
+                        y:(Math.random()-.5)*.014,
+                        z:(Math.random()-.5)*.014
+                    });
+                }
+                g.setAttribute('position', new THREE.BufferAttribute(p, 3));
+                g.setAttribute('color',    new THREE.BufferAttribute(c, 3));
+                const m = new THREE.PointsMaterial({
+                    size: 0.05, vertexColors: true, transparent: true, opacity: 0.95,
+                    blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true
+                });
+                return { pts: new THREE.Points(g, m), geo: g, mat: m, vels: v };
+            }
+
+            // Black/Attraction (dark indigo)
+            const cA = mkCluster([0.1, 0.0, 0.55], 1.8);
+            cA.pts.position.set(-2.8, 0.6, 0);
+            // Red/Repulsion (hot red)
+            const cR = mkCluster([1.0, 0.1, 0.02], 1.6);
+            cR.pts.position.set(2.8, -0.6, 0);
+            // Blue/Expansion (electric blue)
+            const cB = mkCluster([0.0, 0.65, 1.0], 1.6);
+            cB.pts.position.set(0, 2.4, -0.5);
+            [cA, cR, cB].forEach(cl => scene.add(cl.pts));
+
+            // Fusion core (hollow purple)
+            const orbMat = new THREE.MeshBasicMaterial({
+                color: 0x7c3aed, transparent: true, opacity: 0,
+                blending: THREE.AdditiveBlending, depthWrite: false
+            });
+            const orbMesh = new THREE.Mesh(new THREE.SphereGeometry(0.5, 32, 32), orbMat);
+            scene.add(orbMesh);
+
+            // Outer glow (pink)
+            const outerMat = new THREE.MeshBasicMaterial({
+                color: 0xff0080, transparent: true, opacity: 0,
+                blending: THREE.AdditiveBlending, depthWrite: false
+            });
+            scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.1, 32, 32), outerMat));
+
+            const orbData = [
+                { angle: 0,                   radius: 2.9, speed:  0.022, vy:  0.5 },
+                { angle: (Math.PI * 2 / 3),   radius: 2.9, speed: -0.027, vy: -0.5 },
+                { angle: (Math.PI * 4 / 3),   radius: 2.7, speed:  0.019, vy:  0.3 }
+            ];
+            const cls = [cA, cR, cB];
+
+            let phase = 0, phaseT = 0, animId = null;
+            let lastShakeT = 0;
+
+            function shake(amt) {
+                const now = performance.now();
+                if (now - lastShakeT < 55) return;
+                lastShakeT = now;
+                cvs.style.transform =
+                    `translate(${(Math.random()-.5)*amt}px,${(Math.random()-.5)*amt}px)`;
+                setTimeout(() => { cvs.style.transform = ''; }, 50);
+            }
+
+            function cleanup() {
+                cancelAnimationFrame(animId);
+                cls.forEach(cl => { cl.geo.dispose(); cl.mat.dispose(); });
+                orbMat.dispose(); outerMat.dispose();
+                overlay.querySelectorAll('.hs-line').forEach(l => l.remove());
+                overlay.style.display = 'none';
+                overlay.style.opacity = '1';
+                renderer.dispose();
+            }
+
+            function spawnHyperspace(onDone) {
+                const LN = 100;
+                const lines = [];
+                const palette = ['#00d4ff','#8b5cf6','#ff0080','#a855f7','#ffffff','#00ffaa'];
+                for (let i = 0; i < LN; i++) {
+                    const el = document.createElement('div');
+                    el.className = 'hs-line';
+                    const angle = (i / LN) * 360;
+                    const col   = palette[i % palette.length];
+                    el.style.cssText =
+                        'position:absolute;top:50%;left:50%;width:0;' +
+                        'height:' + (1 + Math.random()*2.5) + 'px;' +
+                        'background:' + col + ';' +
+                        'box-shadow:0 0 8px 2px ' + col + ';' +
+                        'transform:rotate(' + angle + 'deg);' +
+                        'transform-origin:left center;' +
+                        'pointer-events:none;opacity:0.95;';
+                    overlay.appendChild(el);
+                    lines.push(el);
+                }
+                if (typeof anime !== 'undefined') {
+                    anime({
+                        targets: lines,
+                        width: function() { return (40 + Math.random()*90) + 'vw'; },
+                        opacity: [0.95, 0],
+                        duration: 650,
+                        delay: anime.stagger(2),
+                        easing: 'easeOutExpo',
+                        complete: onDone
+                    });
+                } else {
+                    setTimeout(onDone, 700);
+                }
+            }
+
+            function tick() {
+                animId = requestAnimationFrame(tick);
+                phaseT += 0.016;
+
+                // Phase 0 – Orbiting (0.85s)
+                if (phase === 0) {
+                    cls.forEach((cl, i) => {
+                        const o = orbData[i];
+                        o.angle += o.speed;
+                        cl.pts.position.x = Math.cos(o.angle) * o.radius;
+                        cl.pts.position.z = Math.sin(o.angle) * o.radius;
+                        cl.pts.position.y = Math.sin(o.angle * 0.8) * o.vy;
+                        cl.pts.rotation.y += 0.024;
+                        cl.pts.rotation.x += 0.011;
+                        const pa = cl.geo.attributes.position.array;
+                        for (let j = 0; j < CN; j++) {
+                            pa[j*3]   += cl.vels[j].x;
+                            pa[j*3+1] += cl.vels[j].y;
+                            pa[j*3+2] += cl.vels[j].z;
+                            const d2 = pa[j*3]*pa[j*3] + pa[j*3+1]*pa[j*3+1] + pa[j*3+2]*pa[j*3+2];
+                            if (d2 > 9 || d2 < 0.04) {
+                                cl.vels[j].x *= -1; cl.vels[j].y *= -1; cl.vels[j].z *= -1;
+                            }
+                        }
+                        cl.geo.attributes.position.needsUpdate = true;
+                    });
+                    if (phaseT >= 0.85) { phase = 1; phaseT = 0; }
+                }
+                // Phase 1 – Converge (0.85s)
+                else if (phase === 1) {
+                    const pg = Math.min(1, phaseT / 0.85);
+                    const ease = 1 - (1-pg)*(1-pg)*(1-pg);
+                    cls.forEach(cl => {
+                        cl.pts.position.multiplyScalar(1 - ease * 0.07);
+                        cl.mat.opacity = 0.95 - ease * 0.35;
+                    });
+                    orbMat.opacity   = ease * 0.75;
+                    outerMat.opacity = ease * 0.3;
+                    orbMesh.scale.setScalar(1 + ease * 0.5);
+                    camera.position.z = 5.5 - ease * 2.0;
+                    if (pg > 0.5) shake(3 * ease);
+                    if (pg >= 1) { phase = 2; phaseT = 0; }
+                }
+                // Phase 2 – Fusion flash (0.3s)
+                else if (phase === 2) {
+                    const pg = Math.min(1, phaseT / 0.3);
+                    cls.forEach(cl => {
+                        cl.pts.position.multiplyScalar(0.86);
+                        cl.mat.opacity = Math.max(0, 0.6 - pg * 3);
+                    });
+                    orbMat.opacity   = 0.75 + pg * 3.0;
+                    outerMat.opacity = pg * 1.5;
+                    orbMesh.scale.setScalar(1.5 + pg * 5);
+                    camera.position.z = 3.5 - pg * 1.5;
+                    shake(5 * (1 - pg * 0.4));
+                    if (pg >= 1) {
+                        phase = 3; phaseT = 0;
+                        spawnHyperspace(() => {
+                            if (typeof anime !== 'undefined') {
+                                anime({
+                                    targets: overlay, opacity: [1, 0],
+                                    duration: 450, easing: 'easeInQuart',
+                                    complete: () => { cleanup(); resolve(); }
+                                });
+                            } else {
+                                cleanup(); resolve();
+                            }
+                        });
+                    }
+                }
+                // Phase 3 – Hold while hyperspace plays
+                else if (phase === 3) {
+                    orbMat.opacity   = Math.max(0, 3.5 - phaseT * 7);
+                    outerMat.opacity = Math.max(0, 1.5 - phaseT * 4);
+                    camera.position.z += 0.12;
+                }
+
+                renderer.render(scene, camera);
+            }
+
+            tick();
+        });
+    }
+})();
+</script>
+
 <footer style="text-align:center;padding:20px;color:var(--text-tertiary);font-size:11px;border-top:1px solid rgba(45,31,74,0.5);margin-top:40px;font-family:'Orbitron',sans-serif;letter-spacing:2px;text-transform:uppercase;position:relative;z-index:1;">
     Made by aniket with struggle &nbsp;·&nbsp; <span style="color:rgba(0,212,255,0.5);">∞ infinity</span>
 </footer>
 </body>
-</html>"""
+</html>
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
