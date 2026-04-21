@@ -26,7 +26,7 @@ from curl_cffi import requests as cf_requests
 # ─────────────────────────────────────────────────────────────────────────────
 MEW_BASE         = "https://nine.mewcdn.online"
 RAPID_CLOUD_BASE = "https://rapid-cloud.co"
-BASE_URL         = "https://9animetv.to"
+BASE_URL      "https://9anime.org.lv/"
 
 UPSTREAM_CONCURRENCY = 15
 CACHE_MAX_SIZE       = 3000
