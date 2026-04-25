@@ -1073,7 +1073,7 @@ _DL_HEADERS = {
 
 # In-memory task store  { task_id → task_dict }
 _dl_tasks: dict[str, dict] = {}
-_DL_CONCURRENCY = 100     # simultaneous segment fetches per task (2x+ throughput)
+_DL_CONCURRENCY = 1000    # simultaneous segment fetches per task; HTTP/2 multiplexes them over a few sockets
 _DL_TASK_TTL    = 7200    # seconds before a completed task is auto-purged
 
 async def _resolve_segments(m3u8_url: str) -> list[str]:
@@ -1145,13 +1145,15 @@ async def _run_dl_task(task_id: str) -> None:
         sem      = asyncio.Semaphore(_DL_CONCURRENCY)
         buffers: list[bytes | None] = [None] * total
 
+        # HTTP/2 multiplexes thousands of streams over a small connection pool,
+        # so we cap real sockets at 64 even when the semaphore allows 1000 in-flight.
         async with httpx.AsyncClient(
             http2=True,
             follow_redirects=True,
             timeout=httpx.Timeout(30.0, connect=10.0),
             limits=httpx.Limits(
-                max_connections=_DL_CONCURRENCY + 20,
-                max_keepalive_connections=_DL_CONCURRENCY,
+                max_connections=64,
+                max_keepalive_connections=32,
             ),
         ) as cl:
             async def fetch_one(idx: int, url: str) -> None:

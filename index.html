@@ -2505,6 +2505,56 @@ document.addEventListener('mousemove', function(e) {
         });
     }
 
+    // Generic pill state machine: 'loading' | 'ready' | 'failed' | 'hidden'
+    function _setPillState(id, state, label) {
+        const pillRow = document.getElementById('serverPillRow');
+        if (!pillRow) return;
+        let btn = document.getElementById(id);
+
+        if (state === 'hidden') { if (btn) btn.remove(); return; }
+
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id        = id;
+            btn.className = 'srv-pill';
+            btn.addEventListener('click', () => {
+                if (btn.classList.contains('loading')) return;
+                if (btn.classList.contains('failed'))  return;
+                const srv = id === 'roPill_moon' ? 'moon' : 'hd1';
+                switchServer(srv);
+            });
+            // Stable order: Moon before HD1
+            if (id === 'roPill_moon') {
+                const hd1 = document.getElementById('roPill_hd1');
+                if (hd1) pillRow.insertBefore(btn, hd1);
+                else     pillRow.appendChild(btn);
+            } else {
+                pillRow.appendChild(btn);
+            }
+        }
+
+        btn.classList.remove('loading', 'failed');
+        if (state === 'loading') {
+            btn.classList.add('loading');
+            btn.disabled    = true;
+            btn.textContent = label + '…';
+            btn.title       = label + ' loading…';
+        } else if (state === 'ready') {
+            btn.disabled    = false;
+            btn.textContent = '● ' + label;
+            btn.title       = 'Switch to ' + label + ' server';
+        } else if (state === 'failed') {
+            btn.classList.add('failed');
+            btn.disabled    = true;
+            btn.textContent = label + ' ✕';
+            btn.title       = label + ' is unavailable for this episode';
+        }
+    }
+
+    function _setMoonState(state) { _setPillState('roPill_moon', state, 'Moon'); }
+    function _setHD1State(state)  { _setPillState('roPill_hd1',  state, 'HD1');  }
+
+    // Legacy boolean wrappers — kept so old call sites still compile
     function _setMoonReady(ready) {
         const pillRow = document.getElementById('serverPillRow');
         if (!pillRow) return;
@@ -2598,35 +2648,35 @@ document.addEventListener('mousemove', function(e) {
 
     async function _fetchMoonBackground(mal_id, ep) {
         moonStreamData = null;
-        _setMoonReady(false);
+        _setMoonState('loading');
         try {
             const r = await fetch(`${API_BASE}/api/moon/${mal_id}/${ep}`);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
             if (!data.url) throw new Error('no url');
             moonStreamData = data;
-            _setMoonReady(true);
+            _setMoonState('ready');
             console.log('[Moon] ready:', data.url.slice(0, 60));
         } catch(e) {
             console.warn('[Moon] background fetch failed:', e.message);
-            _setMoonReady(false);
+            _setMoonState('failed');
         }
     }
 
     async function _fetchHD1Background(mal_id, ep) {
         hd1StreamData = null;
-        _setHD1Ready(null);   // remove pill if previously present
+        _setHD1State('loading');
         try {
             const r = await fetch(`${API_BASE}/api/hd1/${mal_id}/${ep}`);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
             if (!data.url) throw new Error('no url');
             hd1StreamData = data;
-            _setHD1Ready(data.url);   // adds pill only if URL found
+            _setHD1State('ready');
             console.log('[HD1] ready:', data.url.slice(0, 80));
         } catch(e) {
             console.warn('[HD1] background fetch failed:', e.message);
-            _setHD1Ready(null);
+            _setHD1State('failed');
         }
     }
 
