@@ -463,14 +463,68 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_headers=["*"])
 
 # ---------------------------------------------------------------------------
-# DATABASE  (SQLite – single file, lives next to main.py)
+# DATABASE  (PostgreSQL on Render via DATABASE_URL, SQLite locally)
 # ---------------------------------------------------------------------------
+_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if _DATABASE_URL.startswith("postgres://"):
+    _DATABASE_URL = "postgresql://" + _DATABASE_URL[len("postgres://"):]
+IS_PG = _DATABASE_URL.startswith("postgresql")
+
 _DB_PATH = Path(__file__).parent / "ro_anime_users.db"
 
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+if IS_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg import errors as pg_errors
+
+
+class _Conn:
+    """Thin wrapper that exposes a SQLite-like API on top of psycopg or sqlite3."""
+    def __init__(self):
+        if IS_PG:
+            self._c = psycopg.connect(_DATABASE_URL, row_factory=dict_row, autocommit=False)
+        else:
+            self._c = sqlite3.connect(_DB_PATH)
+            self._c.row_factory = sqlite3.Row
+
+    @staticmethod
+    def _adapt(sql: str) -> str:
+        if not IS_PG:
+            return sql
+        # SQLite → Postgres translations
+        sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+        sql = sql.replace("strftime('%s','now')", "EXTRACT(EPOCH FROM NOW())::BIGINT")
+        # parameter placeholders
+        sql = sql.replace("?", "%s")
+        return sql
+
+    def execute(self, sql: str, params=()):
+        sql = self._adapt(sql)
+        if IS_PG:
+            cur = self._c.cursor()
+            cur.execute(sql, params)
+            return cur
+        return self._c.execute(sql, params)
+
+    def executescript(self, sql: str):
+        if IS_PG:
+            cur = self._c.cursor()
+            cur.execute(self._adapt(sql))
+        else:
+            self._c.executescript(sql)
+
+    def commit(self): self._c.commit()
+    def close(self):  self._c.close()
+
+
+def _db() -> _Conn:
+    return _Conn()
+
+
+_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
+if IS_PG:
+    _INTEGRITY_ERRORS = (sqlite3.IntegrityError, pg_errors.UniqueViolation, pg_errors.IntegrityError)
+
 
 def _db_init() -> None:
     conn = _db()
@@ -482,6 +536,8 @@ def _db_init() -> None:
         token         TEXT    UNIQUE NOT NULL,
         created_at    INTEGER DEFAULT (strftime('%s','now'))
     );
+    """)
+    conn.executescript("""
     CREATE TABLE IF NOT EXISTS watch_history (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id      INTEGER NOT NULL REFERENCES users(id),
@@ -493,7 +549,9 @@ def _db_init() -> None:
         watched_at   INTEGER DEFAULT (strftime('%s','now')),
         UNIQUE(user_id, mal_id, episode)
     );
-    CREATE INDEX IF NOT EXISTS idx_hist_user ON watch_history(user_id, watched_at DESC);
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_hist_user ON watch_history(user_id, watched_at DESC);")
+    conn.executescript("""
     CREATE TABLE IF NOT EXISTS watchlist (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id   INTEGER NOT NULL REFERENCES users(id),
@@ -504,6 +562,8 @@ def _db_init() -> None:
         added_at  INTEGER DEFAULT (strftime('%s','now')),
         UNIQUE(user_id, mal_id)
     );
+    """)
+    conn.executescript("""
     CREATE TABLE IF NOT EXISTS downloads (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id       INTEGER NOT NULL REFERENCES users(id),
@@ -521,16 +581,20 @@ def _db_init() -> None:
     conn.commit()
     conn.close()
 
+
 def _db_migrate() -> None:
-    """Add new columns / constraints to existing databases gracefully."""
+    """Add playback_pos column to legacy SQLite databases."""
+    if IS_PG:
+        return
     conn = _db()
-    # Add playback_pos if missing
     cols = {r[1] for r in conn.execute("PRAGMA table_info(watch_history)")}
     if "playback_pos" not in cols:
         conn.execute("ALTER TABLE watch_history ADD COLUMN playback_pos REAL DEFAULT 0")
         conn.commit()
     conn.close()
 
+
+logger.info("DB backend: %s", "PostgreSQL" if IS_PG else "SQLite")
 _db_init()
 _db_migrate()
 
@@ -573,7 +637,7 @@ async def auth_register(request: Request):
         )
         conn.commit()
         conn.close()
-    except sqlite3.IntegrityError:
+    except _INTEGRITY_ERRORS:
         raise HTTPException(409, "Username already taken")
     return {"token": token, "username": username}
 
@@ -650,8 +714,12 @@ async def watchlist_add(request: Request):
     d    = await request.json()
     conn = _db()
     conn.execute(
-        """INSERT OR REPLACE INTO watchlist (user_id, mal_id, title, image_url, episodes)
-           VALUES (?,?,?,?,?)""",
+        """INSERT INTO watchlist (user_id, mal_id, title, image_url, episodes)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(user_id, mal_id) DO UPDATE SET
+               title     = EXCLUDED.title,
+               image_url = EXCLUDED.image_url,
+               episodes  = EXCLUDED.episodes""",
         (user["id"], d["mal_id"], d["title"], d.get("image_url",""), int(d.get("episodes",0)))
     )
     conn.commit(); conn.close()
@@ -685,9 +753,15 @@ async def downloads_save(request: Request):
     d    = await request.json()
     conn = _db()
     conn.execute(
-        """INSERT OR REPLACE INTO downloads
+        """INSERT INTO downloads
            (user_id, mal_id, title, episode, image_url, idb_key, size_bytes, has_subs)
-           VALUES (?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(user_id, mal_id, episode) DO UPDATE SET
+               title      = EXCLUDED.title,
+               image_url  = EXCLUDED.image_url,
+               idb_key    = EXCLUDED.idb_key,
+               size_bytes = EXCLUDED.size_bytes,
+               has_subs   = EXCLUDED.has_subs""",
         (user["id"], d["mal_id"], d["title"], int(d["episode"]),
          d.get("image_url",""), d["idb_key"], int(d.get("size_bytes",0)), int(d.get("has_subs",0)))
     )
