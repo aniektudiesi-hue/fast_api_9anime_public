@@ -1740,27 +1740,55 @@ async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
             except Exception:
                 pass
 
+            # Parse the mirror <select> ONCE — we use it for both Moon embed
+            # extraction AND to decide whether to even bother waiting for HD1.
+            hd1_listed = False
             try:
                 soup    = BeautifulSoup(await page.content(), "html.parser")
                 encoded = None
-                for btn in soup.find_all("button"):
-                    if "moon" in btn.get_text("", strip=True).lower():
-                        encoded = btn.get("data-option-id")
-                        break
-                if not encoded:
-                    sel = soup.find("select")
-                    if sel:
-                        opt = sel.find("option", string=re.compile(r"moon", re.I))
-                        if opt:
-                            encoded = opt.get("value")
-                if encoded:
-                    decoded = base64.b64decode(encoded + "==").decode("utf-8")
-                    m = re.search(r'src=["\']([^"\']+)["\']', decoded)
-                    moon_embed_url = m.group(1) if m else None
-            except Exception as e:
-                logger.warning("Moon embed parse: %s", e)
+                mirror_select = soup.find("select", class_="mirror") or soup.find("select")
+                all_options   = mirror_select.find_all("option") if mirror_select else []
 
-            if not hd1_url[0]:
+                # Decode every option once — we need to inspect iframe srcs to
+                # know whether an HD1 (workers.dev) source is even present.
+                for opt in all_options:
+                    val = opt.get("value") or ""
+                    if not val:
+                        continue
+                    try:
+                        decoded_html = base64.b64decode(val + "==").decode("utf-8", "ignore")
+                    except Exception:
+                        continue
+                    m = re.search(r'src=["\']([^"\']+)["\']', decoded_html)
+                    if not m:
+                        continue
+                    iframe_src = m.group(1)
+                    label      = opt.get_text(" ", strip=True).lower()
+
+                    if "moon" in label and not moon_embed_url:
+                        moon_embed_url = iframe_src
+                    if "workers.dev" in iframe_src.lower():
+                        hd1_listed = True
+
+                # Fallback: button-based UI (older site layout)
+                if not moon_embed_url:
+                    for btn in soup.find_all("button"):
+                        if "moon" in btn.get_text("", strip=True).lower():
+                            enc = btn.get("data-option-id")
+                            if enc:
+                                try:
+                                    decoded_html = base64.b64decode(enc + "==").decode("utf-8")
+                                    m = re.search(r'src=["\']([^"\']+)["\']', decoded_html)
+                                    if m:
+                                        moon_embed_url = m.group(1)
+                                except Exception:
+                                    pass
+                            break
+            except Exception as e:
+                logger.warning("Moon/HD1 parse: %s", e)
+
+            if hd1_listed and not hd1_url[0]:
+                # Try to provoke the player so HD1 worker URL fires
                 for sel in ('video', '.jw-display-icon-container', '[class*="play-btn"]',
                             '[class*="bigPlayBtn"]', '.vjs-big-play-button'):
                     try:
@@ -1769,13 +1797,14 @@ async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
                     except Exception:
                         continue
 
-            # Wait up to 45s for the workers.dev HD1 URL to fire on the network.
-            # Cold Render instances are slower than local so the old 25s ceiling
-            # was timing out before the URL appeared.
-            for _ in range(45):
-                if hd1_url[0]:
-                    break
-                await asyncio.sleep(1)
+                # Wait up to 45s for the workers.dev HD1 URL to fire.
+                for _ in range(45):
+                    if hd1_url[0]:
+                        break
+                    await asyncio.sleep(1)
+            elif not hd1_listed:
+                logger.info("HD1 unavailable for this episode — no workers.dev "
+                            "source listed in mirror select")
 
         except Exception as e:
             logger.warning("Combined scrape error: %s", e)
@@ -1801,12 +1830,16 @@ async def _moon_get_video_id(embed_url: str) -> str | None:
             "Origin":  "https://9anime.org.lv",
         })
         try:
+            # Upstream renamed the path from /embed/settings to /embed/details.
+            # Match either so we survive future renames as long as the route
+            # is /api/videos/<id>/embed/<something>.
             async with page.expect_response(
-                lambda r: "api/videos" in r.url and "embed/settings" in r.url,
+                lambda r: "/api/videos/" in r.url and "/embed/" in r.url,
                 timeout=35_000
             ) as resp_info:
                 await page.goto(embed_url, wait_until="domcontentloaded", timeout=60_000)
             resp  = await resp_info.value
+            # URL shape: https://host/api/videos/<id>/embed/<details|settings|playback>
             parts = resp.url.split("/")
             return parts[-3] if len(parts) >= 3 else None
         except Exception as e:
