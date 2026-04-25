@@ -1627,7 +1627,13 @@ def _get_scrape_lock(slug: str) -> asyncio.Lock:
     return _scrape_locks[slug]
 
 async def _combined_scrape(slug: str) -> tuple[str | None, str | None]:
-    """Returns (moon_embed_url, hd1_mp4_url). Cached; one browser per slug max."""
+    """Returns (moon_embed_url, hd1_mp4_url). Cached; one browser per slug max.
+
+    Only fully-successful scrapes (both Moon AND HD1 found) are cached, so a
+    cold-start failure on Render won't poison the cache for an entire episode.
+    Partial successes are still returned to the caller — they're just retried
+    on the next request.
+    """
     ck = f"scrape:{slug}"
     if ck in _anime_cache:
         return _anime_cache[ck]
@@ -1636,22 +1642,32 @@ async def _combined_scrape(slug: str) -> tuple[str | None, str | None]:
         if ck in _anime_cache:
             return _anime_cache[ck]
         result = await _do_combined_scrape(slug)
-        _anime_cache[ck] = result
+        moon_ok, hd1_ok = result
+        if moon_ok and hd1_ok:
+            _anime_cache[ck] = result
         return result
 
 async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
     try:
         from playwright.async_api import async_playwright
         from bs4 import BeautifulSoup
-    except ImportError:
-        logger.warning("playwright/bs4 missing — Moon+HD1 disabled")
+    except ImportError as e:
+        logger.error("playwright/bs4 import failed (%s) — Moon+HD1 disabled. "
+                     "Install playwright + beautifulsoup4 and run "
+                     "'playwright install --with-deps chromium'.", e)
         return None, None
 
     page_url = f"https://9animetv.org.lv/watch/{slug}"
     logger.info("Combined scrape: %s", page_url)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        try:
+            browser = await p.chromium.launch(headless=True)
+        except Exception as e:
+            logger.error("Chromium launch failed (likely missing system libs — "
+                         "run 'playwright install --with-deps chromium' in "
+                         "render.yaml build): %s", e)
+            return None, None
         ctx  = await browser.new_context(user_agent=MOON_UA)
         page = await ctx.new_page()
 
@@ -1709,7 +1725,10 @@ async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
                     except Exception:
                         continue
 
-            for _ in range(25):
+            # Wait up to 45s for the workers.dev HD1 URL to fire on the network.
+            # Cold Render instances are slower than local so the old 25s ceiling
+            # was timing out before the URL appeared.
+            for _ in range(45):
                 if hd1_url[0]:
                     break
                 await asyncio.sleep(1)
@@ -1763,12 +1782,18 @@ def _b64url_decode(data: str) -> bytes:
 def _decrypt_aes_gcm(payload_b64: str, key: bytes, iv_b64: str):
     try:
         from Crypto.Cipher import AES
+    except ImportError:
+        logger.error("pycryptodome not installed — Moon decryption disabled. "
+                     "Add 'pycryptodome' to requirements.txt.")
+        return None
+    try:
         full      = _b64url_decode(payload_b64)
         iv        = _b64url_decode(iv_b64)
         cipher    = AES.new(key, AES.MODE_GCM, nonce=iv)
         decrypted = cipher.decrypt_and_verify(full[:-16], full[-16:])
         return decrypted.decode("utf-8")
-    except Exception:
+    except Exception as e:
+        logger.warning("Moon AES-GCM decrypt failed: %s", e)
         return None
 
 def _find_url(obj) -> str | None:
