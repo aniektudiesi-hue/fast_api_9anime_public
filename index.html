@@ -4844,7 +4844,154 @@ function setDlProgress(pct) {
     fill.style.width = pct + '%';
 }
 
-// ── start a download (no lock — multiple concurrent allowed) ─────────────────
+// ── client-side download: browser fetches TS chunks straight from /proxy/chunk
+// and assembles them locally. Server is a stateless byte pass-through; nothing
+// is held in server RAM and nothing is double-streamed. ───────────────────────
+const _DL_CLIENT_PARALLEL = 16;   // segments in flight per download
+
+function _dlParseSegments(m3u8Text) {
+    return m3u8Text.split('\n').map(l => l.trim())
+        .filter(l => l && !l.startsWith('#'));
+}
+
+async function _dlResolveSegments(originalM3u8Url) {
+    // Fetch through /proxy/m3u8 — it returns the manifest with all internal
+    // URLs rewritten to point at /proxy/m3u8 and /proxy/chunk on our origin.
+    const proxied = `${API}/proxy/m3u8?src=${encodeURIComponent(originalM3u8Url)}`;
+    let r = await fetch(proxied);
+    if (!r.ok) throw new Error('manifest fetch ' + r.status);
+    let text = await r.text();
+
+    // Master playlist? Pick the highest-bandwidth variant.
+    if (text.includes('#EXT-X-STREAM-INF')) {
+        const lines = text.split('\n');
+        let bestBw = -1, bestUri = '';
+        for (let i = 0; i < lines.length; i++) {
+            const ln = lines[i].trim();
+            if (!ln.startsWith('#EXT-X-STREAM-INF')) continue;
+            const m = /BANDWIDTH=(\d+)/.exec(ln);
+            const bw = m ? parseInt(m[1], 10) : 0;
+            for (let j = i + 1; j < lines.length; j++) {
+                const nx = lines[j].trim();
+                if (!nx || nx.startsWith('#')) continue;
+                if (bw >= bestBw) { bestBw = bw; bestUri = nx; }
+                break;
+            }
+        }
+        if (!bestUri) throw new Error('no variant in master playlist');
+        // bestUri is already a /proxy/m3u8?src=... URL on our origin
+        r = await fetch(bestUri);
+        if (!r.ok) throw new Error('variant fetch ' + r.status);
+        text = await r.text();
+    }
+
+    const segments = _dlParseSegments(text);
+    if (!segments.length) throw new Error('playlist has no segments');
+    return segments;
+}
+
+async function _dlFetchOne(url, attempts = 3) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const r = await fetch(url);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return await r.arrayBuffer();
+        } catch (e) {
+            lastErr = e;
+            if (i < attempts - 1) await new Promise(res => setTimeout(res, 400 * (i + 1)));
+        }
+    }
+    throw lastErr;
+}
+
+async function _runClientDownload(taskState) {
+    const { idb_key, m3u8_url, subtitle_url } = taskState;
+
+    // 1. Resolve TS segment URLs (already rewritten to /proxy/chunk on our origin)
+    const segments = await _dlResolveSegments(m3u8_url);
+    taskState.total = segments.length;
+    taskState.status = 'downloading';
+    _refreshDlPaneIfOpen();
+
+    // 2. Parallel fetch with bounded concurrency, in-order buffer collection
+    const buffers = new Array(segments.length);
+    let cursor = 0, bytesDone = 0;
+
+    async function worker() {
+        while (true) {
+            const i = cursor++;
+            if (i >= segments.length) return;
+            try {
+                const buf = await _dlFetchOne(segments[i]);
+                buffers[i] = buf;
+                bytesDone += buf.byteLength;
+            } catch (e) {
+                // Allow a failed segment so progress doesn't stall forever;
+                // playback will still work for the rest. Log only.
+                console.warn('[DL] segment', i, 'failed:', e.message);
+            }
+            taskState.done++;
+            taskState.bytes_done = bytesDone;
+            taskState.progress = Math.min(99, Math.round(taskState.done / segments.length * 100));
+            _dlTasks.set(taskState.task_id, { ...taskState });
+            // Live-update the in-stream button if this matches the current episode
+            const sd = window.currentStreamData;
+            if (sd && String(taskState.mal_id) === String(sd.mal_id) && taskState.episode === sd.ep) {
+                setDlBtn('downloading', taskState.progress + '%');
+                setDlProgress(taskState.progress);
+            }
+            _refreshDlPaneIfOpen();
+        }
+    }
+    await Promise.all(Array.from({ length: _DL_CLIENT_PARALLEL }, worker));
+
+    // 3. Merge into a single Blob (TS bytes concatenated end-to-end)
+    const videoBlob = new Blob(buffers.filter(Boolean), { type: 'video/mp2t' });
+
+    // 4. Subtitle (best-effort, via /proxy/vtt)
+    let subData = null;
+    if (subtitle_url) {
+        try {
+            const proxiedVtt = `${API}/proxy/vtt?src=${encodeURIComponent(subtitle_url)}`;
+            const sr = await fetch(proxiedVtt);
+            if (sr.ok) subData = await sr.text();
+        } catch (e) { /* ignore */ }
+    }
+
+    // 5. Persist locally
+    const meta = {
+        mal_id:     taskState.mal_id,
+        title:      taskState.title,
+        episode:    taskState.episode,
+        image_url:  taskState.image_url || '',
+        idb_key:    idb_key,
+        size_bytes: videoBlob.size,
+        has_subs:   !!subData,
+    };
+    await idbPut(idb_key, { videoBlob, subData, meta });
+
+    // 6. Best-effort metadata save to backend (so the profile downloads list
+    //    survives switching devices / clearing site data)
+    try {
+        await apiPost('/user/downloads', meta);
+    } catch (e) { /* offline / not logged in — ignore */ }
+
+    taskState.status = 'done';
+    taskState.progress = 100;
+    taskState.size_bytes = videoBlob.size;
+    taskState.has_subs = !!subData;
+    taskState._idb_saved = true;
+    _dlTasks.set(taskState.task_id, { ...taskState });
+    _refreshDlPaneIfOpen();
+
+    const sd = window.currentStreamData;
+    if (sd && String(taskState.mal_id) === String(sd.mal_id) && taskState.episode === sd.ep) {
+        setDlBtn('done', '✔ Downloaded');
+        setDlProgress(-1);
+    }
+}
+
 window.startDownload = async function() {
     if (!isLoggedIn()) { openAuthModal(); return; }
     const sd     = window.currentStreamData;
@@ -4862,31 +5009,30 @@ window.startDownload = async function() {
     const cached = await idbGet(idbKey).catch(()=>null);
     if (cached && cached.videoBlob) { setDlBtn('done','✔ Downloaded'); return; }
 
+    // Build a local task record (no backend task_id needed anymore)
+    const task_id = `cli_${sd.mal_id}_${sd.ep}_${Date.now()}`;
+    const taskState = {
+        task_id, status: 'probing', progress: 0,
+        done: 0, total: 0, bytes_done: 0, size_bytes: 0,
+        mal_id: sd.mal_id, title: sd.title, episode: sd.ep,
+        image_url: sd.image_url || '', idb_key: idbKey,
+        has_subs: false, _idb_saved: false,
+        m3u8_url: hlsUrl,
+        subtitle_url: window._currentSubFile || null,
+    };
+    _dlTasks.set(task_id, taskState);
+    setDlBtn('downloading', 'Starting…');
+    _refreshDlPaneIfOpen();
+
     try {
-        setDlBtn('downloading', 'Starting…');
-        const data = await apiPost('/api/dl/start', {
-            m3u8_url:     hlsUrl,
-            subtitle_url: window._currentSubFile || null,
-            mal_id:       sd.mal_id,
-            title:        sd.title,
-            episode:      sd.ep,
-            image_url:    sd.image_url || '',
-            idb_key:      idbKey,
-        });
-        const taskId = data.task_id;
-        // Optimistically add to local map so UI shows immediately
-        _dlTasks.set(taskId, {
-            task_id: taskId, status: 'queued', progress: 0,
-            done: 0, total: 0, bytes_done: 0, size_bytes: 0,
-            mal_id: sd.mal_id, title: sd.title, episode: sd.ep,
-            image_url: sd.image_url || '', idb_key: idbKey,
-            has_subs: false, _idb_saved: false,
-        });
-        _startDlPolling();
-        // Refresh downloads tab if visible
+        await _runClientDownload(taskState);
+    } catch (e) {
+        console.error('[DL] client-side download failed:', e);
+        taskState.status = 'error';
+        taskState.error  = String(e.message || e);
+        _dlTasks.set(task_id, { ...taskState });
         _refreshDlPaneIfOpen();
-    } catch(e) {
-        setDlBtn('idle', '⚠ Failed: ' + (e.message||''));
+        setDlBtn('idle', '⚠ Failed: ' + (e.message || ''));
         setTimeout(() => setDlBtn('idle','Download EP'), 4000);
     }
 };
