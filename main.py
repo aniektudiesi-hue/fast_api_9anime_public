@@ -1661,7 +1661,19 @@ async def _moon_get_slug(mal_id: str, episode: str) -> str | None:
     return f"{slug}-episode-{episode}"
 
 # ---------------------------------------------------------------------------
-# MOON + HD1  — combined Playwright scraper (one browser visit per slug)
+# MOON + HD scraper pipeline  (pure httpx, no browser)
+#
+# Everything we need is in static HTML responses. No JS execution required.
+#
+#   1. /watch/{slug}                       -> mirror <select> with base64
+#                                             option values; each decodes to
+#                                             an <iframe src="..."> tag.
+#   2. HD iframe is gogoanime.me.uk/mp4    -> static HTML response of that
+#                                             page contains the workers.dev
+#                                             video URL directly.
+#   3. Moon iframe is bysesayeveum/e/<id>  -> video_id is the path tail.
+#   4. Moon playback API on 398fitus.com   -> AES-GCM payload, decrypted
+#                                             locally with pycryptodome.
 # ---------------------------------------------------------------------------
 _scrape_locks: dict[str, asyncio.Lock] = {}
 
@@ -1670,197 +1682,190 @@ def _get_scrape_lock(slug: str) -> asyncio.Lock:
         _scrape_locks[slug] = asyncio.Lock()
     return _scrape_locks[slug]
 
-async def _combined_scrape(slug: str) -> tuple[str | None, str | None]:
-    """Returns (moon_embed_url, hd1_mp4_url). Cached; one browser per slug max.
 
-    Only fully-successful scrapes (both Moon AND HD1 found) are cached, so a
-    cold-start failure on Render won't poison the cache for an entire episode.
-    Partial successes are still returned to the caller — they're just retried
-    on the next request.
+_WATCH_URL_TMPL = "https://9animetv.org.lv/watch/{}"
+_MIRROR_RE      = re.compile(r'<select[^>]*class="mirror"[^>]*>(.*?)</select>', re.S)
+_OPTION_RE      = re.compile(r'<option[^>]*value="([^"]+)"[^>]*>([^<]*)</option>')
+_BIG_VALUE_RE   = re.compile(r'<option[^>]*value="[A-Za-z0-9+/=]{20,}"')
+_WORKERS_RE     = re.compile(r'https://[^"\'<>\s]*workers\.dev[^"\'<>\s]+')
+_MOON_ID_RE     = re.compile(r'/e/([A-Za-z0-9_-]+)')
+
+
+async def _verify_watch_url(slug_with_ep: str) -> bool:
+    """True iff /watch/{slug} returns a real player page with a populated mirror."""
+    url = _WATCH_URL_TMPL.format(slug_with_ep)
+    try:
+        r = await _http.get(
+            url,
+            headers={"User-Agent": MOON_UA, "Accept": "text/html"},
+            timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0),
+            follow_redirects=True,
+        )
+    except Exception:
+        return False
+    if r.status_code != 200:
+        return False
+    m = _MIRROR_RE.search(r.text)
+    if not m:
+        return False
+    return bool(_BIG_VALUE_RE.search(m.group(1)))
+
+
+async def _resolve_real_slug(mal_id: str, episode: str) -> str | None:
+    """Return a fully-qualified slug (with -episode-N) verified against the
+    actual /watch page. Returns None if nothing matches.
     """
-    ck = f"scrape:{slug}"
-    if ck in _anime_cache:
-        return _anime_cache[ck]
-    lock = _get_scrape_lock(slug)
-    async with lock:
-        if ck in _anime_cache:
-            return _anime_cache[ck]
-        result = await _do_combined_scrape(slug)
-        moon_ok, hd1_ok = result
-        if moon_ok and hd1_ok:
-            _anime_cache[ck] = result
-        return result
+    # 0. Hardcoded override
+    if mal_id in _SLUG_OVERRIDES:
+        cand = f"{_SLUG_OVERRIDES[mal_id]}-episode-{episode}"
+        if await _verify_watch_url(cand):
+            return cand
 
-async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
+    # 1. Cache (verify before returning — site may have rerouted)
+    ck = f"slug:{mal_id}"
+    cached = _anime_cache.get(ck)
+    if cached:
+        cand = f"{cached}-episode-{episode}"
+        if await _verify_watch_url(cand):
+            return cand
+        try: del _anime_cache[ck]
+        except KeyError: pass
+
+    # 2. Generate variations from Jikan titles
     try:
-        from playwright.async_api import async_playwright
-        from bs4 import BeautifulSoup
-    except ImportError as e:
-        logger.error("playwright/bs4 import failed (%s) — Moon+HD1 disabled. "
-                     "Install playwright + beautifulsoup4 and run "
-                     "'playwright install --with-deps chromium'.", e)
-        return None, None
-
-    page_url = f"https://9animetv.org.lv/watch/{slug}"
-    logger.info("Combined scrape: %s", page_url)
-
-    async with async_playwright() as p:
-        try:
-            browser = await p.chromium.launch(headless=True)
-        except Exception as e:
-            logger.error("Chromium launch failed (likely missing system libs — "
-                         "run 'playwright install --with-deps chromium' in "
-                         "render.yaml build): %s", e)
-            return None, None
-        ctx  = await browser.new_context(user_agent=MOON_UA)
-        page = await ctx.new_page()
-
-        hd1_url: list[str | None] = [None]
-
-        def _is_hd1(url: str) -> bool:
-            return "workers.dev" in url and ("url=" in url or ".mp4" in url.lower())
-
-        async def _on_req(req):
-            if not hd1_url[0] and _is_hd1(req.url):
-                hd1_url[0] = req.url
-        async def _on_resp(resp):
-            if not hd1_url[0] and _is_hd1(resp.url):
-                hd1_url[0] = resp.url
-
-        page.on("request",  _on_req)
-        page.on("response", _on_resp)
-
-        moon_embed_url: str | None = None
-        try:
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
-
-            try:
-                await page.wait_for_selector(
-                    'button:has-text("Moon"), option:has-text("Moon")', timeout=10_000)
-            except Exception:
-                pass
-
-            # Parse the mirror <select> ONCE — we use it for both Moon embed
-            # extraction AND to decide whether to even bother waiting for HD1.
-            hd1_listed = False
-            try:
-                soup    = BeautifulSoup(await page.content(), "html.parser")
-                encoded = None
-                mirror_select = soup.find("select", class_="mirror") or soup.find("select")
-                all_options   = mirror_select.find_all("option") if mirror_select else []
-
-                # Decode every option once — we need to inspect iframe srcs to
-                # know whether an HD source is even present, AND to grab the
-                # Moon embed URL.
-                #
-                # The HD option's iframe points to gogoanime.me.uk/mp4.php — it
-                # is THAT page which then triggers a workers.dev video URL
-                # during its own JS execution. So presence of the HD source is
-                # determined by the option label ("HD") and/or a gogoanime
-                # iframe, NOT by a workers.dev URL appearing in the static HTML.
-                for opt in all_options:
-                    val = opt.get("value") or ""
-                    if not val:
-                        continue
-                    try:
-                        decoded_html = base64.b64decode(val + "==").decode("utf-8", "ignore")
-                    except Exception:
-                        continue
-                    m = re.search(r'src=["\']([^"\']+)["\']', decoded_html)
-                    if not m:
-                        continue
-                    iframe_src = m.group(1)
-                    label      = opt.get_text(" ", strip=True).lower()
-
-                    if "moon" in label and not moon_embed_url:
-                        moon_embed_url = iframe_src
-
-                    # HD detection: explicit "HD" label OR a gogoanime iframe
-                    # (the intermediary that redirects to workers.dev) OR an
-                    # already-direct workers.dev URL.
-                    iframe_lo = iframe_src.lower()
-                    if (re.search(r'\bhd\b', label)
-                            or "gogoanime" in iframe_lo
-                            or "workers.dev" in iframe_lo):
-                        hd1_listed = True
-
-                # Fallback: button-based UI (older site layout)
-                if not moon_embed_url:
-                    for btn in soup.find_all("button"):
-                        if "moon" in btn.get_text("", strip=True).lower():
-                            enc = btn.get("data-option-id")
-                            if enc:
-                                try:
-                                    decoded_html = base64.b64decode(enc + "==").decode("utf-8")
-                                    m = re.search(r'src=["\']([^"\']+)["\']', decoded_html)
-                                    if m:
-                                        moon_embed_url = m.group(1)
-                                except Exception:
-                                    pass
-                            break
-            except Exception as e:
-                logger.warning("Moon/HD1 parse: %s", e)
-
-            if hd1_listed and not hd1_url[0]:
-                # Try to provoke the player so HD1 worker URL fires
-                for sel in ('video', '.jw-display-icon-container', '[class*="play-btn"]',
-                            '[class*="bigPlayBtn"]', '.vjs-big-play-button'):
-                    try:
-                        await page.click(sel, timeout=2_000)
-                        break
-                    except Exception:
-                        continue
-
-                # Wait up to 45s for the workers.dev HD1 URL to fire.
-                for _ in range(45):
-                    if hd1_url[0]:
-                        break
-                    await asyncio.sleep(1)
-            elif not hd1_listed:
-                logger.info("HD1 unavailable for this episode — no workers.dev "
-                            "source listed in mirror select")
-
-        except Exception as e:
-            logger.warning("Combined scrape error: %s", e)
-        finally:
-            await browser.close()
-
-        logger.info("Scrape done  moon=%s  hd1=%s", bool(moon_embed_url), bool(hd1_url[0]))
-        return moon_embed_url, hd1_url[0]
-
-async def _moon_get_video_id(embed_url: str) -> str | None:
-    """Playwright: load embed page, use expect_response to get video ID instantly."""
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError:
+        r = await _http.get(f"https://api.jikan.moe/v4/anime/{mal_id}",
+                            headers={"Accept": "application/json"})
+        r.raise_for_status()
+        d = r.json().get("data", {})
+        title_en = (d.get("title_english") or "").strip()
+        title_jp = (d.get("title") or "").strip()
+        synonyms = [s.strip() for s in (d.get("title_synonyms") or []) if s.strip()]
+    except Exception as e:
+        logger.warning("Slug Jikan lookup mal_id=%s failed: %s", mal_id, e)
         return None
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx  = await browser.new_context(user_agent=MOON_UA)
-        page = await ctx.new_page()
-        await page.set_extra_http_headers({
-            "Referer": "https://9anime.org.lv/",
-            "Origin":  "https://9anime.org.lv",
-        })
-        try:
-            # Upstream renamed the path from /embed/settings to /embed/details.
-            # Match either so we survive future renames as long as the route
-            # is /api/videos/<id>/embed/<something>.
-            async with page.expect_response(
-                lambda r: "/api/videos/" in r.url and "/embed/" in r.url,
-                timeout=35_000
-            ) as resp_info:
-                await page.goto(embed_url, wait_until="domcontentloaded", timeout=60_000)
-            resp  = await resp_info.value
-            # URL shape: https://host/api/videos/<id>/embed/<details|settings|playback>
-            parts = resp.url.split("/")
-            return parts[-3] if len(parts) >= 3 else None
-        except Exception as e:
-            logger.warning("Moon video ID failed: %s", e)
+    titles = [t for t in [title_en, title_jp] + synonyms if t]
+    if not titles:
+        return None
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for title in titles:
+        for v in _get_slug_variations(title):
+            if v not in seen:
+                seen.add(v)
+                candidates.append(v)
+
+    # Test in batches of 6 in parallel
+    for i in range(0, len(candidates), 6):
+        batch = candidates[i:i+6]
+        results = await asyncio.gather(
+            *[_verify_watch_url(f"{c}-episode-{episode}") for c in batch],
+            return_exceptions=True,
+        )
+        for c, ok in zip(batch, results):
+            if ok is True:
+                _anime_cache[ck] = c
+                logger.info("Slug verified mal_id=%s: %s", mal_id, c)
+                return f"{c}-episode-{episode}"
+
+    # 3. Site search fallback
+    for title in titles:
+        slug = await _search_9anime_slug(title)
+        if not slug:
+            continue
+        cand = f"{slug}-episode-{episode}"
+        if await _verify_watch_url(cand):
+            _anime_cache[ck] = slug
+            logger.info("Slug via search mal_id=%s: %s", mal_id, slug)
+            return cand
+
+    logger.warning("Slug resolution exhausted for mal_id=%s", mal_id)
+    return None
+
+
+def _decode_iframe_from_option_value(b64: str) -> str | None:
+    try:
+        decoded = base64.b64decode(b64 + "==").decode("utf-8", "ignore")
+    except Exception:
+        return None
+    m = re.search(r'src=["\']([^"\']+)["\']', decoded)
+    return m.group(1) if m else None
+
+
+async def _fetch_watch_servers(slug_with_ep: str) -> dict[str, str]:
+    """Single httpx GET on the watch page; returns {'hd': iframe, 'moon': iframe, 'omega': iframe}."""
+    url = _WATCH_URL_TMPL.format(slug_with_ep)
+    try:
+        r = await _http.get(
+            url,
+            headers={"User-Agent": MOON_UA, "Accept": "text/html"},
+            timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        logger.warning("Watch page fetch failed for %s: %s", slug_with_ep, e)
+        return {}
+
+    out: dict[str, str] = {}
+    m = _MIRROR_RE.search(r.text)
+    if not m:
+        return out
+
+    for opt in _OPTION_RE.finditer(m.group(1)):
+        val   = opt.group(1)
+        label = opt.group(2).strip().lower()
+        if not val:
+            continue
+        iframe = _decode_iframe_from_option_value(val)
+        if not iframe:
+            continue
+        iframe_lo = iframe.lower()
+        if "moon" in label:
+            out["moon"] = iframe
+        elif "omega" in label:
+            out["omega"] = iframe
+        elif re.search(r'\bhd\b', label) or "gogoanime" in iframe_lo or "workers.dev" in iframe_lo:
+            out["hd"] = iframe
+
+    return out
+
+
+async def _fetch_hd_stream_url(hd_iframe_src: str) -> str | None:
+    """gogoanime.me.uk/mp4.php?id=X -> workers.dev video URL.
+
+    The gogoanime page is a thin static wrapper that embeds the workers.dev
+    URL directly inside an <iframe src="...">. No JS execution needed.
+    """
+    try:
+        r = await _http.get(
+            hd_iframe_src,
+            headers={
+                "User-Agent": MOON_UA,
+                "Referer":    "https://9animetv.org.lv/",
+            },
+            timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
+            follow_redirects=True,
+        )
+        if r.status_code != 200:
+            logger.warning("HD iframe HTTP %s for %s", r.status_code, hd_iframe_src)
             return None
-        finally:
-            await browser.close()
+    except Exception as e:
+        logger.warning("HD iframe fetch failed: %s", e)
+        return None
+
+    m = _WORKERS_RE.search(r.text)
+    if not m:
+        return None
+    return m.group(0).replace("&amp;", "&")
+
+
+def _moon_video_id_from_iframe(moon_iframe_src: str) -> str | None:
+    m = _MOON_ID_RE.search(moon_iframe_src)
+    return m.group(1) if m else None
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1966,21 +1971,22 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
 @app.get("/api/moon/{mal_id}/{episode_num}")
 async def get_moon_stream(mal_id: str, episode_num: str):
     ck = f"moon:{mal_id}:{episode_num}"
-    if ck in _anime_cache:
-        return _anime_cache[ck]
+    cached = _anime_cache.get(ck)
+    if cached:
+        return cached
 
-    slug = await _moon_get_slug(mal_id, episode_num)
+    slug = await _resolve_real_slug(mal_id, episode_num)
     if not slug:
-        raise HTTPException(502, "Moon: could not build slug from Jikan")
+        raise HTTPException(404, "Moon: anime not found on 9animetv")
 
-    # Shared scrape with HD1 — one browser visit (full episode slug needed)
-    moon_embed_url, _ = await _combined_scrape(slug)
-    if not moon_embed_url:
-        raise HTTPException(404, "Moon: server not found on 9anime page")
+    servers = await _fetch_watch_servers(slug)
+    moon_iframe = servers.get("moon")
+    if not moon_iframe:
+        raise HTTPException(404, "Moon: server not listed for this episode")
 
-    video_id = await _moon_get_video_id(moon_embed_url)
+    video_id = _moon_video_id_from_iframe(moon_iframe)
     if not video_id:
-        raise HTTPException(502, "Moon: could not intercept video ID")
+        raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
 
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _moon_fetch_playback_sync, video_id)
@@ -2000,17 +2006,22 @@ async def get_moon_stream(mal_id: str, episode_num: str):
 @app.get("/api/hd1/{mal_id}/{episode_num}")
 async def get_hd1_stream(mal_id: str, episode_num: str):
     ck = f"hd1:{mal_id}:{episode_num}"
-    if ck in _anime_cache:
-        return _anime_cache[ck]
+    cached = _anime_cache.get(ck)
+    if cached:
+        return cached
 
-    slug = await _moon_get_slug(mal_id, episode_num)
+    slug = await _resolve_real_slug(mal_id, episode_num)
     if not slug:
-        raise HTTPException(502, "HD1: could not build slug from Jikan")
+        raise HTTPException(404, "HD1: anime not found on 9animetv")
 
-    # Shared scrape with Moon — one browser visit (full episode slug needed)
-    _, mp4_url = await _combined_scrape(slug)
+    servers = await _fetch_watch_servers(slug)
+    hd_iframe = servers.get("hd")
+    if not hd_iframe:
+        raise HTTPException(404, "HD1: server not listed for this episode")
+
+    mp4_url = await _fetch_hd_stream_url(hd_iframe)
     if not mp4_url:
-        raise HTTPException(404, "HD1: workers.dev MP4 URL not found on page")
+        raise HTTPException(502, "HD1: workers.dev URL extraction from gogoanime failed")
 
     response = {"url": mp4_url, "server": "hd1"}
     _anime_cache[ck] = response
