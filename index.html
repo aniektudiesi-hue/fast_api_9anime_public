@@ -4841,21 +4841,12 @@ window.startDownload = async function() {
     }
 };
 
-// ── polling ───────────────────────────────────────────────────────────────────
-function _startDlPolling() {
-    if (_dlPollTid) return;
-    _dlPollTid = setInterval(_pollDlStatus, 1500);
-    _pollDlStatus();   // fire immediately
-}
-function _stopDlPolling() {
-    if (_dlPollTid) { clearInterval(_dlPollTid); _dlPollTid = null; }
-}
+// ── real-time progress: WebSocket-first, polling fallback ────────────────────
+let _dlWS         = null;
+let _dlWSRetryTid = null;
 
-async function _pollDlStatus() {
-    if (!isLoggedIn()) return;
-    let tasks;
-    try { tasks = await apiGet('/api/dl/status'); } catch(e) { return; }
-
+function _handleDlTasks(tasks) {
+    if (!Array.isArray(tasks)) return;
     let anyActive = false;
     const sd = window.currentStreamData;
 
@@ -4875,16 +4866,70 @@ async function _pollDlStatus() {
 
         if (t.status !== 'done' && t.status !== 'error') anyActive = true;
 
-        // When a task finishes, fetch its file and store in IndexedDB
         const local = _dlTasks.get(t.task_id);
         if (t.status === 'done' && local && !local._idb_saved) {
-            local._idb_saved = true;   // prevent double-fetch
+            local._idb_saved = true;
             _saveDlToIDB(t);
         }
     }
-
     _refreshDlPaneIfOpen();
+    return anyActive;
+}
 
+function _startDlPolling() {
+    // Prefer WebSocket; fall back to long-poll if WS dies / unsupported.
+    _openDlWebSocket();
+    if (_dlPollTid) return;
+    _dlPollTid = setInterval(_pollDlStatus, 2000);
+    _pollDlStatus();
+}
+
+function _stopDlPolling() {
+    if (_dlPollTid) { clearInterval(_dlPollTid); _dlPollTid = null; }
+    if (_dlWS) {
+        try { _dlWS.close(); } catch(e) {}
+        _dlWS = null;
+    }
+    if (_dlWSRetryTid) { clearTimeout(_dlWSRetryTid); _dlWSRetryTid = null; }
+}
+
+function _openDlWebSocket() {
+    if (_dlWS && (_dlWS.readyState === 0 || _dlWS.readyState === 1)) return;
+    if (!isLoggedIn() || !window.WebSocket) return;
+    const token = localStorage.getItem('ro_token');
+    if (!token) return;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const base  = (typeof API === 'string' && API) ? API.replace(/^http/, 'ws') :
+                  `${proto}://${location.host}`;
+    const url   = `${base}/api/dl/ws?token=${encodeURIComponent(token)}`;
+    try {
+        _dlWS = new WebSocket(url);
+    } catch(e) { return; }
+
+    _dlWS.onmessage = (ev) => {
+        try {
+            const tasks = JSON.parse(ev.data);
+            _handleDlTasks(tasks);
+        } catch(e) {}
+    };
+    _dlWS.onclose = () => {
+        _dlWS = null;
+        // Auto-reconnect with backoff while there's work to track
+        if (_dlWSRetryTid) clearTimeout(_dlWSRetryTid);
+        _dlWSRetryTid = setTimeout(() => {
+            if (_dlPollTid) _openDlWebSocket();
+        }, 3000);
+    };
+    _dlWS.onerror = () => { try { _dlWS.close(); } catch(e) {} };
+}
+
+async function _pollDlStatus() {
+    // Skip polling while a healthy WebSocket is delivering updates
+    if (_dlWS && _dlWS.readyState === 1) return;
+    if (!isLoggedIn()) return;
+    let tasks;
+    try { tasks = await apiGet('/api/dl/status'); } catch(e) { return; }
+    const anyActive = _handleDlTasks(tasks);
     if (!anyActive && tasks.length > 0) _stopDlPolling();
 }
 
