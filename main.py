@@ -1750,7 +1750,14 @@ async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
                 all_options   = mirror_select.find_all("option") if mirror_select else []
 
                 # Decode every option once — we need to inspect iframe srcs to
-                # know whether an HD1 (workers.dev) source is even present.
+                # know whether an HD source is even present, AND to grab the
+                # Moon embed URL.
+                #
+                # The HD option's iframe points to gogoanime.me.uk/mp4.php — it
+                # is THAT page which then triggers a workers.dev video URL
+                # during its own JS execution. So presence of the HD source is
+                # determined by the option label ("HD") and/or a gogoanime
+                # iframe, NOT by a workers.dev URL appearing in the static HTML.
                 for opt in all_options:
                     val = opt.get("value") or ""
                     if not val:
@@ -1767,7 +1774,14 @@ async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
 
                     if "moon" in label and not moon_embed_url:
                         moon_embed_url = iframe_src
-                    if "workers.dev" in iframe_src.lower():
+
+                    # HD detection: explicit "HD" label OR a gogoanime iframe
+                    # (the intermediary that redirects to workers.dev) OR an
+                    # already-direct workers.dev URL.
+                    iframe_lo = iframe_src.lower()
+                    if (re.search(r'\bhd\b', label)
+                            or "gogoanime" in iframe_lo
+                            or "workers.dev" in iframe_lo):
                         hd1_listed = True
 
                 # Fallback: button-based UI (older site layout)
