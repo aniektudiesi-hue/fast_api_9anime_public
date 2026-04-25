@@ -1626,76 +1626,6 @@ def _get_scrape_lock(slug: str) -> asyncio.Lock:
         _scrape_locks[slug] = asyncio.Lock()
     return _scrape_locks[slug]
 
-# ── Persistent Playwright browser ──────────────────────────────────────────
-_PW_PLAYWRIGHT = None
-_PW_BROWSER    = None
-_PW_LOCK       = asyncio.Lock()
-
-# Resource types that don't affect HD1/Moon detection but bloat the page load.
-_PW_BLOCK_TYPES   = {"image", "media", "font", "stylesheet"}
-_PW_BLOCK_DOMAINS = ("googletagmanager", "google-analytics", "doubleclick",
-                     "facebook.net", "scorecardresearch", "hotjar",
-                     "googlesyndication", "adservice", "amazon-adsystem")
-
-async def _pw_route_blocker(route, request):
-    try:
-        if request.resource_type in _PW_BLOCK_TYPES:
-            await route.abort(); return
-        url = request.url.lower()
-        if any(d in url for d in _PW_BLOCK_DOMAINS):
-            await route.abort(); return
-        await route.continue_()
-    except Exception:
-        try: await route.continue_()
-        except Exception: pass
-
-async def _get_pw_browser():
-    """Launch Chromium once and reuse it across scrapes — saves ~2-4s per call."""
-    global _PW_PLAYWRIGHT, _PW_BROWSER
-    if _PW_BROWSER is not None and _PW_BROWSER.is_connected():
-        return _PW_BROWSER
-    async with _PW_LOCK:
-        if _PW_BROWSER is not None and _PW_BROWSER.is_connected():
-            return _PW_BROWSER
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            logger.warning("playwright missing — Moon+HD1 disabled")
-            return None
-        try:
-            _PW_PLAYWRIGHT = await async_playwright().start()
-            _PW_BROWSER    = await _PW_PLAYWRIGHT.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                ],
-            )
-            logger.info("Playwright browser launched (persistent)")
-            return _PW_BROWSER
-        except Exception as e:
-            logger.error("Failed to launch Chromium: %s", e)
-            _PW_PLAYWRIGHT = None
-            _PW_BROWSER    = None
-            return None
-
-
-@app.on_event("shutdown")
-async def _pw_shutdown():
-    global _PW_PLAYWRIGHT, _PW_BROWSER
-    try:
-        if _PW_BROWSER:    await _PW_BROWSER.close()
-        if _PW_PLAYWRIGHT: await _PW_PLAYWRIGHT.stop()
-    except Exception:
-        pass
-    _PW_BROWSER = None
-    _PW_PLAYWRIGHT = None
-
-
 async def _combined_scrape(slug: str) -> tuple[str | None, str | None]:
     """Returns (moon_embed_url, hd1_mp4_url). Cached; one browser per slug max."""
     ck = f"scrape:{slug}"
@@ -1711,125 +1641,117 @@ async def _combined_scrape(slug: str) -> tuple[str | None, str | None]:
 
 async def _do_combined_scrape(slug: str) -> tuple[str | None, str | None]:
     try:
+        from playwright.async_api import async_playwright
         from bs4 import BeautifulSoup
     except ImportError:
         logger.warning("playwright/bs4 missing — Moon+HD1 disabled")
         return None, None
 
-    browser = await _get_pw_browser()
-    if browser is None:
-        return None, None
-
     page_url = f"https://9animetv.org.lv/watch/{slug}"
     logger.info("Combined scrape: %s", page_url)
 
-    ctx  = await browser.new_context(
-        user_agent=MOON_UA,
-        viewport={"width": 1280, "height": 720},
-        java_script_enabled=True,
-    )
-    # Block heavy/non-essential resources to speed up page load dramatically
-    await ctx.route("**/*", _pw_route_blocker)
-    page = await ctx.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx  = await browser.new_context(user_agent=MOON_UA)
+        page = await ctx.new_page()
 
-    hd1_url: list[str | None] = [None]
-    moon_embed_url: str | None = None
+        hd1_url: list[str | None] = [None]
 
-    def _is_hd1(url: str) -> bool:
-        return "workers.dev" in url and ("url=" in url or ".mp4" in url.lower())
+        def _is_hd1(url: str) -> bool:
+            return "workers.dev" in url and ("url=" in url or ".mp4" in url.lower())
 
-    async def _on_req(req):
-        if not hd1_url[0] and _is_hd1(req.url):
-            hd1_url[0] = req.url
-    async def _on_resp(resp):
-        if not hd1_url[0] and _is_hd1(resp.url):
-            hd1_url[0] = resp.url
+        async def _on_req(req):
+            if not hd1_url[0] and _is_hd1(req.url):
+                hd1_url[0] = req.url
+        async def _on_resp(resp):
+            if not hd1_url[0] and _is_hd1(resp.url):
+                hd1_url[0] = resp.url
 
-    page.on("request",  _on_req)
-    page.on("response", _on_resp)
+        page.on("request",  _on_req)
+        page.on("response", _on_resp)
 
-    try:
-        await page.goto(page_url, wait_until="domcontentloaded", timeout=45_000)
-
+        moon_embed_url: str | None = None
         try:
-            await page.wait_for_selector(
-                'button:has-text("Moon"), option:has-text("Moon")', timeout=8_000)
-        except Exception:
-            pass
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
 
-        try:
-            soup    = BeautifulSoup(await page.content(), "html.parser")
-            encoded = None
-            for btn in soup.find_all("button"):
-                if "moon" in btn.get_text("", strip=True).lower():
-                    encoded = btn.get("data-option-id")
+            try:
+                await page.wait_for_selector(
+                    'button:has-text("Moon"), option:has-text("Moon")', timeout=10_000)
+            except Exception:
+                pass
+
+            try:
+                soup    = BeautifulSoup(await page.content(), "html.parser")
+                encoded = None
+                for btn in soup.find_all("button"):
+                    if "moon" in btn.get_text("", strip=True).lower():
+                        encoded = btn.get("data-option-id")
+                        break
+                if not encoded:
+                    sel = soup.find("select")
+                    if sel:
+                        opt = sel.find("option", string=re.compile(r"moon", re.I))
+                        if opt:
+                            encoded = opt.get("value")
+                if encoded:
+                    decoded = base64.b64decode(encoded + "==").decode("utf-8")
+                    m = re.search(r'src=["\']([^"\']+)["\']', decoded)
+                    moon_embed_url = m.group(1) if m else None
+            except Exception as e:
+                logger.warning("Moon embed parse: %s", e)
+
+            if not hd1_url[0]:
+                for sel in ('video', '.jw-display-icon-container', '[class*="play-btn"]',
+                            '[class*="bigPlayBtn"]', '.vjs-big-play-button'):
+                    try:
+                        await page.click(sel, timeout=2_000)
+                        break
+                    except Exception:
+                        continue
+
+            for _ in range(25):
+                if hd1_url[0]:
                     break
-            if not encoded:
-                sel = soup.find("select")
-                if sel:
-                    opt = sel.find("option", string=re.compile(r"moon", re.I))
-                    if opt:
-                        encoded = opt.get("value")
-            if encoded:
-                decoded = base64.b64decode(encoded + "==").decode("utf-8")
-                m = re.search(r'src=["\']([^"\']+)["\']', decoded)
-                moon_embed_url = m.group(1) if m else None
+                await asyncio.sleep(1)
+
         except Exception as e:
-            logger.warning("Moon embed parse: %s", e)
+            logger.warning("Combined scrape error: %s", e)
+        finally:
+            await browser.close()
 
-        if not hd1_url[0]:
-            for sel in ('video', '.jw-display-icon-container', '[class*="play-btn"]',
-                        '[class*="bigPlayBtn"]', '.vjs-big-play-button'):
-                try:
-                    await page.click(sel, timeout=1_500)
-                    break
-                except Exception:
-                    continue
-
-        # Event-driven HD1 wait — exits the moment the URL is captured (tight 250 ms granularity)
-        for _ in range(80):  # 80 * 0.25s = 20s ceiling
-            if hd1_url[0]:
-                break
-            await asyncio.sleep(0.25)
-
-    except Exception as e:
-        logger.warning("Combined scrape error: %s", e)
-    finally:
-        try:
-            await ctx.close()
-        except Exception:
-            pass
-
-    logger.info("Scrape done  moon=%s  hd1=%s", bool(moon_embed_url), bool(hd1_url[0]))
-    return moon_embed_url, hd1_url[0]
+        logger.info("Scrape done  moon=%s  hd1=%s", bool(moon_embed_url), bool(hd1_url[0]))
+        return moon_embed_url, hd1_url[0]
 
 async def _moon_get_video_id(embed_url: str) -> str | None:
     """Playwright: load embed page, use expect_response to get video ID instantly."""
-    browser = await _get_pw_browser()
-    if browser is None:
-        return None
-    ctx  = await browser.new_context(user_agent=MOON_UA, viewport={"width": 1280, "height": 720})
-    await ctx.route("**/*", _pw_route_blocker)
-    page = await ctx.new_page()
-    await page.set_extra_http_headers({
-        "Referer": "https://9anime.org.lv/",
-        "Origin":  "https://9anime.org.lv",
-    })
     try:
-        async with page.expect_response(
-            lambda r: "api/videos" in r.url and "embed/settings" in r.url,
-            timeout=30_000
-        ) as resp_info:
-            await page.goto(embed_url, wait_until="domcontentloaded", timeout=45_000)
-        resp  = await resp_info.value
-        parts = resp.url.split("/")
-        return parts[-3] if len(parts) >= 3 else None
-    except Exception as e:
-        logger.warning("Moon video ID failed: %s", e)
+        from playwright.async_api import async_playwright
+    except ImportError:
         return None
-    finally:
-        try: await ctx.close()
-        except Exception: pass
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx  = await browser.new_context(user_agent=MOON_UA)
+        page = await ctx.new_page()
+        await page.set_extra_http_headers({
+            "Referer": "https://9anime.org.lv/",
+            "Origin":  "https://9anime.org.lv",
+        })
+        try:
+            async with page.expect_response(
+                lambda r: "api/videos" in r.url and "embed/settings" in r.url,
+                timeout=35_000
+            ) as resp_info:
+                await page.goto(embed_url, wait_until="domcontentloaded", timeout=60_000)
+            resp  = await resp_info.value
+            parts = resp.url.split("/")
+            return parts[-3] if len(parts) >= 3 else None
+        except Exception as e:
+            logger.warning("Moon video ID failed: %s", e)
+            return None
+        finally:
+            await browser.close()
+
 
 # ---------------------------------------------------------------------------
 # MOON CRYPTO HELPERS
