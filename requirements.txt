@@ -1,5 +1,10 @@
-httpx
-cachetools
-curl_cffi
-fastapi
-uvicorn
+fastapi==0.136.0
+uvicorn==0.44.0
+httpx==0.28.1
+cachetools==5.5.2
+curl_cffi==0.14.0
+pydantic==2.11.9
+starlette==1.0.0
+anyio==4.11.0
+h11==0.16.0
+sniffio==1.3.1

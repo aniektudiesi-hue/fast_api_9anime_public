@@ -462,11 +462,11 @@
 
         /* ===== HERO BANNER ===== */
         #heroBanner {
-            position: relative; width: 100%; height: 250px; border-radius: 16px;
+            position: relative; width: 100%; height: 220px; border-radius: 16px;
             overflow: hidden; margin-bottom: 20px;
             border: 1px solid rgba(0, 212, 255, 0.2);
             box-shadow: 0 0 40px rgba(0, 212, 255, 0.1), 0 20px 60px rgba(0, 0, 0, 0.7);
-            display: none;
+            display: none; /* shown by JS after data loads */
         }
         #heroBanner::before {
             content: '';
@@ -481,7 +481,7 @@
             pointer-events: none;
             z-index: 5;
         }
-        @media (min-width: 768px) { #heroBanner { height: 350px; margin-bottom: 30px; display: block; } }
+        @media (min-width: 768px)  { #heroBanner { height: 350px; margin-bottom: 30px; } }
         @media (min-width: 1024px) { #heroBanner { height: 450px; margin-bottom: 40px; } }
         .hero-slider-container { width: 100%; height: 100%; position: relative; }
         .hero-slide {
@@ -1223,6 +1223,719 @@
             position: absolute; inset: 0;
             width: 100% !important; height: 100% !important; display: block;
         }
+
+        /* =====================================================================
+           9ANIME LAYOUT OVERHAUL  — robux / Gojo palette
+           ===================================================================== */
+
+        /* --- hamburger --- */
+        .hamburger-btn {
+            background: none; border: none; cursor: pointer; padding: 6px;
+            display: flex; flex-direction: column; gap: 5px; flex-shrink: 0;
+        }
+        .hamburger-btn span {
+            display: block; width: 22px; height: 2px; border-radius: 2px;
+            background: linear-gradient(90deg, var(--gojo-blue), var(--hollow-purple));
+            transition: all 0.3s ease;
+        }
+        .hamburger-btn:hover span { box-shadow: 0 0 8px rgba(0,212,255,0.7); }
+
+        /* --- search pill --- */
+        .search-container input {
+            border-radius: 50px !important;
+            padding: 10px 20px !important;
+        }
+        .search-container button {
+            border-radius: 50px !important;
+        }
+
+        /* --- main two-col wrapper --- */
+        .main-two-col {
+            display: flex; gap: 24px; align-items: flex-start;
+        }
+        .main-content { flex: 1; min-width: 0; }
+
+        /* --- hero 9anime style --- */
+        #heroBanner {
+            border-radius: 12px !important;
+            border: 1px solid rgba(139,92,246,0.25) !important;
+            box-shadow: 0 0 40px rgba(124,58,237,0.12), 0 20px 60px rgba(0,0,0,0.7) !important;
+        }
+        .hero-slide-overlay {
+            background: linear-gradient(
+                0deg,
+                rgba(7,3,18,0.97) 0%,
+                rgba(60,20,100,0.55) 45%,
+                transparent 100%
+            ) !important;
+            padding: 36px 40px !important;
+        }
+        .hero-slide-title {
+            font-size: 32px !important;
+            letter-spacing: 0 !important;
+            text-transform: none !important;
+        }
+        .hero-watch-btn {
+            background: rgba(20,10,40,0.9) !important;
+            border: 1.5px solid rgba(139,92,246,0.5) !important;
+            color: #fff !important;
+            border-radius: 40px !important;
+            padding: 12px 30px !important;
+            font-size: 13px !important;
+            letter-spacing: 1.5px !important;
+            box-shadow: none !important;
+            backdrop-filter: blur(8px) !important;
+        }
+        .hero-watch-btn:hover {
+            background: rgba(139,92,246,0.35) !important;
+            border-color: var(--hollow-purple) !important;
+            box-shadow: 0 0 24px rgba(139,92,246,0.45) !important;
+            transform: scale(1.04) !important;
+        }
+
+        /* --- section title 9anime style --- */
+        .section-title {
+            font-size: 17px !important; font-weight: 700 !important;
+            color: #fff !important;
+            background: none !important;
+            -webkit-text-fill-color: #fff !important;
+            -webkit-background-clip: unset !important;
+            background-clip: unset !important;
+            letter-spacing: 0.3px !important;
+            text-transform: none !important;
+            border-bottom: none !important;
+            border-image: none !important;
+            margin: 22px 0 14px !important;
+            padding-bottom: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            font-family: 'Inter', sans-serif !important;
+        }
+        .section-title::before { display: none !important; }
+        .section-title .title-left {
+            display: flex; align-items: center; gap: 10px;
+        }
+        .section-title .title-bar {
+            width: 4px; height: 18px; border-radius: 3px;
+            background: linear-gradient(180deg, var(--gojo-blue), var(--hollow-purple));
+            box-shadow: 0 0 8px rgba(0,212,255,0.5);
+            flex-shrink: 0;
+        }
+        .view-all-link {
+            font-size: 11px; color: var(--gojo-blue);
+            font-weight: 600; text-transform: uppercase;
+            letter-spacing: 1px; cursor: pointer;
+            font-family: 'Inter', sans-serif; text-decoration: none;
+            flex-shrink: 0; transition: color 0.2s;
+        }
+        .view-all-link:hover { color: var(--hollow-purple); }
+
+        /* --- recently added header tweak --- */
+        .recently-added-title {
+            font-size: 17px !important; font-weight: 700 !important;
+            color: #fff !important; background: none !important;
+            -webkit-text-fill-color: #fff !important;
+            letter-spacing: 0.3px !important;
+            font-family: 'Inter', sans-serif !important;
+        }
+        .recently-added-title::before { display: none !important; }
+
+        /* --- grid: 9anime-style columns --- */
+        #grid, #famousGrid, #dynamicGrid {
+            grid-template-columns: repeat(2, 1fr) !important;
+        }
+        #recentlyAddedGrid {
+            grid-template-columns: repeat(2, 1fr) !important;
+        }
+        @media (min-width: 480px) {
+            #grid, #famousGrid, #dynamicGrid, #recentlyAddedGrid {
+                grid-template-columns: repeat(3, 1fr) !important;
+            }
+        }
+        @media (min-width: 768px) {
+            #grid, #famousGrid, #dynamicGrid, #recentlyAddedGrid {
+                grid-template-columns: repeat(4, 1fr) !important;
+            }
+        }
+        @media (min-width: 1024px) {
+            #grid, #famousGrid, #dynamicGrid, #recentlyAddedGrid {
+                grid-template-columns: repeat(5, 1fr) !important;
+            }
+        }
+
+        /* --- cards: 9anime clean style --- */
+        .card {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        .card:hover {
+            transform: translateY(-8px) scale(1.03) !important;
+            box-shadow: none !important;
+            border: none !important;
+        }
+        .card:hover::before { background: none !important; }
+        .card-img-wrapper {
+            border-radius: 8px !important;
+        }
+        .card-info {
+            background: transparent !important;
+            padding: 8px 2px 4px !important;
+        }
+        .card-title {
+            font-size: 12px !important; font-weight: 600 !important;
+            color: #ddd !important; font-family: 'Inter', sans-serif !important;
+            transition: color 0.2s;
+        }
+        .card:hover .card-title { color: #fff !important; }
+        .card-meta {
+            font-size: 10px !important; color: rgba(0,212,255,0.7) !important;
+            font-family: 'Inter', sans-serif !important;
+            letter-spacing: 0 !important; text-transform: none !important;
+        }
+        .card-overlay {
+            background: linear-gradient(0deg, rgba(3,1,10,0.9) 0%, transparent 70%) !important;
+            backdrop-filter: none !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        .card-watch-btn {
+            background: rgba(139,92,246,0.85) !important;
+            border: none !important;
+            color: #fff !important;
+            border-radius: 50px !important;
+            padding: 8px 18px !important;
+            font-size: 11px !important;
+            letter-spacing: 0.5px !important;
+            box-shadow: 0 0 18px rgba(139,92,246,0.5) !important;
+        }
+        .card-watch-btn:hover {
+            background: var(--hollow-purple) !important;
+            box-shadow: 0 0 30px rgba(139,92,246,0.7) !important;
+        }
+
+        /* 9anime-style on-image badges */
+        .badge-format {
+            position: absolute; top: 7px; right: 7px; z-index: 5;
+            background: rgba(0,140,200,0.88);
+            color: #fff; font-size: 9px; font-weight: 700;
+            padding: 2px 7px; border-radius: 4px;
+            font-family: 'Inter', sans-serif; letter-spacing: 0.3px;
+        }
+        .badge-sub-dub {
+            position: absolute; bottom: 7px; right: 7px; z-index: 5;
+            background: #e67e22; color: #fff;
+            font-size: 9px; font-weight: 800;
+            padding: 2px 8px; border-radius: 4px;
+            font-family: 'Inter', sans-serif;
+        }
+        .badge-sub-dub.is-dub { background: var(--hollow-purple); }
+        .badge-ep {
+            position: absolute; bottom: 7px; left: 7px; z-index: 5;
+            background: rgba(0,0,0,0.72); color: #ff9f43;
+            font-size: 9px; font-weight: 700;
+            padding: 2px 7px; border-radius: 4px;
+            font-family: 'Orbitron', sans-serif;
+        }
+
+        /* --- sidebar --- */
+        #homeSidebar {
+            width: 270px; flex-shrink: 0;
+            position: sticky; top: 80px;
+            display: none;
+            max-height: calc(100vh - 90px);
+            overflow-y: auto;
+            overflow-x: hidden;
+            scrollbar-width: thin;
+            scrollbar-color: var(--hollow-purple) transparent;
+        }
+        #homeSidebar::-webkit-scrollbar { width: 4px; }
+        #homeSidebar::-webkit-scrollbar-track { background: transparent; }
+        #homeSidebar::-webkit-scrollbar-thumb { background: var(--hollow-purple); border-radius: 4px; }
+        @media (min-width: 1100px) { #homeSidebar { display: block; } }
+
+        .sidebar-box {
+            background: rgba(13, 8, 24, 0.85);
+            border: 1px solid var(--border-color);
+            border-radius: 10px; padding: 16px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(12px);
+        }
+        .sidebar-box-title {
+            font-size: 15px; font-weight: 700;
+            color: var(--text-primary); margin-bottom: 14px;
+            font-family: 'Rajdhani', sans-serif;
+            letter-spacing: 0.5px; text-transform: uppercase;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(45,31,74,0.7);
+            display: flex; align-items: center; gap: 8px;
+        }
+        .sidebar-box-title::before {
+            content: '';
+            width: 3px; height: 16px; border-radius: 2px;
+            background: linear-gradient(180deg, var(--gojo-blue), var(--hollow-purple));
+            box-shadow: 0 0 8px rgba(0,212,255,0.5);
+        }
+        .sidebar-top-item {
+            display: flex; align-items: center;
+            gap: 10px; padding: 9px 0;
+            border-bottom: 1px solid rgba(45,31,74,0.4);
+            cursor: pointer; transition: all 0.2s ease;
+        }
+        .sidebar-top-item:last-child { border-bottom: none; }
+        .sidebar-top-item:hover .sidebar-anime-title { color: var(--gojo-blue); }
+        .sidebar-rank {
+            width: 22px; height: 22px; border-radius: 5px;
+            background: rgba(45,31,74,0.8);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 10px; font-weight: 800; color: var(--text-tertiary);
+            font-family: 'Orbitron', sans-serif; flex-shrink: 0;
+        }
+        .sidebar-rank.top3 {
+            background: linear-gradient(135deg, rgba(0,212,255,0.15), rgba(139,92,246,0.2));
+            color: var(--gojo-blue);
+            border: 1px solid rgba(0,212,255,0.3);
+        }
+        .sidebar-thumb {
+            width: 40px; height: 54px; border-radius: 5px;
+            object-fit: cover; flex-shrink: 0;
+            background: var(--border-color);
+            border: 1px solid rgba(45,31,74,0.6);
+        }
+        .sidebar-info { flex: 1; min-width: 0; }
+        .sidebar-anime-title {
+            font-size: 11px; font-weight: 600;
+            color: var(--text-primary); line-height: 1.35; margin-bottom: 4px;
+            display: -webkit-box; -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical; overflow: hidden;
+            font-family: 'Inter', sans-serif;
+            transition: color 0.2s;
+        }
+        .sidebar-anime-score {
+            font-size: 10px; color: var(--gojo-blue);
+            font-weight: 600; font-family: 'Inter', sans-serif;
+            display: flex; align-items: center; gap: 4px;
+        }
+        .sidebar-anime-score .star { color: #f1c40f; font-size: 10px; }
+
+        /* hide sidebar on streaming/search view */
+        #streamingSection:not([style*="none"]) ~ #homeSidebar,
+        body.streaming-view #homeSidebar { display: none !important; }
+
+        /* =====================================================================
+           PLAYER — 9anime wide layout + right episode sidebar
+           ===================================================================== */
+        .stream-layout {
+            display: flex; gap: 16px; align-items: flex-start;
+        }
+        .stream-main { flex: 1; min-width: 0; }
+
+        /* ── wide player: full container width, 16:9 ── */
+        @media (min-width: 768px) {
+            .player-wrapper {
+                width: 100% !important; height: auto !important;
+                max-height: 72vh !important; aspect-ratio: 16/9 !important;
+                margin: 0 !important;
+            }
+        }
+
+        /* ── right episode sidebar ── */
+        .stream-ep-sidebar {
+            width: 280px; flex-shrink: 0;
+            background: rgba(10, 6, 20, 0.92);
+            border: 1px solid var(--border-color);
+            border-radius: 10px; overflow: hidden;
+            display: none; flex-direction: column;
+            max-height: 72vh;
+            position: sticky; top: 76px;
+            backdrop-filter: blur(12px);
+        }
+        @media (min-width: 1100px) { .stream-ep-sidebar { display: flex; } }
+
+        .ep-sidebar-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 14px; flex-shrink: 0;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 12px; font-weight: 700; color: var(--text-primary);
+            font-family: 'Rajdhani', sans-serif; letter-spacing: 1px; text-transform: uppercase;
+        }
+        .ep-count-badge {
+            font-size: 10px; color: var(--gojo-blue);
+            font-family: 'Orbitron', sans-serif; font-weight: 600;
+        }
+        .ep-sidebar-list {
+            overflow-y: auto; flex: 1;
+            scrollbar-width: thin; scrollbar-color: var(--hollow-purple) transparent;
+        }
+        .ep-sidebar-list::-webkit-scrollbar { width: 4px; }
+        .ep-sidebar-list::-webkit-scrollbar-track { background: transparent; }
+        .ep-sidebar-list::-webkit-scrollbar-thumb { background: var(--hollow-purple); border-radius: 4px; }
+
+        /* episode thumbnail row */
+        .ep-thumb-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px 12px; cursor: pointer;
+            border-bottom: 1px solid rgba(45,31,74,0.35);
+            transition: background 0.18s ease;
+            border-left: 3px solid transparent;
+        }
+        .ep-thumb-item:hover { background: rgba(139,92,246,0.1); }
+        .ep-thumb-item.ep-current {
+            background: rgba(0,212,255,0.07);
+            border-left-color: var(--gojo-blue);
+        }
+        .ep-thumb-wrap {
+            position: relative; width: 78px; height: 44px;
+            border-radius: 5px; overflow: hidden; flex-shrink: 0;
+            background: var(--tertiary-black);
+        }
+        .ep-thumb-wrap img {
+            width: 100%; height: 100%; object-fit: cover; display: block;
+        }
+        .ep-thumb-overlay {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,0.45);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 11px; font-weight: 800;
+            color: #fff; font-family: 'Orbitron', sans-serif;
+        }
+        .ep-thumb-item.ep-current .ep-thumb-overlay {
+            background: rgba(0,212,255,0.35); color: var(--gojo-blue);
+        }
+        .ep-thumb-info { flex: 1; min-width: 0; }
+        .ep-thumb-title {
+            font-size: 11px; font-weight: 600; color: var(--text-primary);
+            font-family: 'Inter', sans-serif; white-space: nowrap;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        .ep-thumb-item.ep-current .ep-thumb-title { color: var(--gojo-blue); }
+        .ep-thumb-sub {
+            font-size: 9px; color: var(--text-tertiary);
+            font-family: 'Inter', sans-serif; margin-top: 2px;
+        }
+        .ep-thumb-item.ep-current .ep-thumb-sub { color: rgba(0,212,255,0.55); }
+        .ep-now-dot {
+            width: 6px; height: 6px; border-radius: 50%;
+            background: var(--gojo-blue);
+            box-shadow: 0 0 6px var(--gojo-blue);
+            animation: livePulse 1.2s ease-in-out infinite;
+            flex-shrink: 0;
+        }
+
+        /* =====================================================================
+           UNIQUE BUFFER — Warp Diamond Tunnel  (NO circles!)
+           ===================================================================== */
+        .ro-buffer-overlay { background: rgba(0,0,0,0.78) !important; }
+
+        .ro-spinner-wrap {
+            position: relative !important;
+            width: 110px !important; height: 110px !important;
+            display: flex !important; align-items: center !important;
+            justify-content: center !important;
+        }
+
+        /* repurpose the 3 ring elements as concentric diamonds */
+        .ro-ring-outer, .ro-ring-inner, .ro-ring-inner2 {
+            border-radius: 0 !important;
+            border-style: solid !important; border-width: 2px !important;
+            background: transparent !important;
+            position: absolute !important; top: 50% !important; left: 50% !important;
+            animation: warpDiamondIn 1.8s ease-out infinite !important;
+        }
+        .ro-ring-outer {
+            width: 96px !important; height: 96px !important;
+            margin: -48px 0 0 -48px !important;
+            border-color: rgba(0,212,255,0.95) !important;
+            box-shadow: 0 0 14px rgba(0,212,255,0.5), inset 0 0 8px rgba(0,212,255,0.15) !important;
+            animation-delay: 0s !important;
+        }
+        .ro-ring-inner {
+            width: 64px !important; height: 64px !important;
+            margin: -32px 0 0 -32px !important;
+            border-color: rgba(139,92,246,0.95) !important;
+            box-shadow: 0 0 14px rgba(139,92,246,0.5) !important;
+            animation-delay: -0.6s !important;
+        }
+        .ro-ring-inner2 {
+            width: 32px !important; height: 32px !important;
+            margin: -16px 0 0 -16px !important;
+            border-color: rgba(255,0,128,0.95) !important;
+            box-shadow: 0 0 14px rgba(255,0,128,0.5) !important;
+            animation-delay: -1.2s !important;
+        }
+        @keyframes warpDiamondIn {
+            0%   { transform: rotate(45deg) scale(1.9); opacity: 0; }
+            18%  { opacity: 1; }
+            82%  { opacity: 0.75; }
+            100% { transform: rotate(45deg) scale(0.05); opacity: 0; }
+        }
+        /* buffer label tweak */
+        .ro-buffer-label {
+            font-family: 'Orbitron', sans-serif !important;
+            font-size: 9px !important; letter-spacing: 3px !important;
+            color: rgba(0,212,255,0.7) !important;
+            text-transform: uppercase !important;
+            animation: livePulse 1.2s ease-in-out infinite !important;
+            margin-top: 16px !important;
+        }
+
+        /* =====================================================================
+           AUTH MODAL
+           ===================================================================== */
+        .auth-modal-bg {
+            display: none; position: fixed; inset: 0; z-index: 9000;
+            background: rgba(3,1,10,0.85); backdrop-filter: blur(8px);
+            align-items: center; justify-content: center;
+        }
+        .auth-modal-bg.open { display: flex; }
+        .auth-modal {
+            width: 400px; max-width: 95vw;
+            background: linear-gradient(145deg, #0d0818 0%, #1a0f2e 100%);
+            border: 1px solid rgba(139,92,246,0.4);
+            border-radius: 18px; padding: 40px 36px 36px;
+            box-shadow: 0 0 60px rgba(124,58,237,0.3), 0 0 120px rgba(0,212,255,0.08);
+            position: relative;
+        }
+        .auth-modal-logo {
+            text-align: center; margin-bottom: 28px;
+            font-family: 'Orbitron', sans-serif; font-weight: 900;
+            font-size: 22px; letter-spacing: 3px;
+            background: linear-gradient(90deg, #00d4ff, #8b5cf6, #ff0080);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .auth-tabs { display: flex; gap: 0; margin-bottom: 28px; border-radius: 8px; overflow: hidden; border: 1px solid rgba(139,92,246,0.3); }
+        .auth-tab {
+            flex: 1; padding: 10px; text-align: center; cursor: pointer;
+            font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: 13px;
+            letter-spacing: 1px; color: var(--text-tertiary);
+            background: transparent; border: none; transition: all .2s;
+        }
+        .auth-tab.active { background: rgba(139,92,246,0.25); color: #fff; }
+        .auth-field { margin-bottom: 16px; }
+        .auth-field label { display: block; font-size: 11px; font-weight: 700; letter-spacing: 1px; color: var(--text-secondary); margin-bottom: 7px; font-family: 'Rajdhani', sans-serif; text-transform: uppercase; }
+        .auth-field input {
+            width: 100%; padding: 12px 14px;
+            background: rgba(255,255,255,0.04); border: 1px solid rgba(139,92,246,0.3);
+            border-radius: 9px; color: #fff; font-size: 14px; font-family: 'Inter', sans-serif;
+            outline: none; transition: border-color .2s;
+        }
+        .auth-field input:focus { border-color: var(--gojo-blue); box-shadow: 0 0 0 3px rgba(0,212,255,0.08); }
+        .auth-submit {
+            width: 100%; padding: 13px; margin-top: 6px;
+            background: linear-gradient(90deg, #7c3aed, #00d4ff);
+            border: none; border-radius: 9px; color: #fff;
+            font-family: 'Orbitron', sans-serif; font-size: 13px; font-weight: 700;
+            letter-spacing: 2px; cursor: pointer; transition: opacity .2s;
+        }
+        .auth-submit:hover { opacity: .88; }
+        .auth-error { color: #ff6b6b; font-size: 12px; text-align: center; margin-top: 10px; min-height: 18px; font-family: 'Inter', sans-serif; }
+        .auth-close {
+            position: absolute; top: 14px; right: 16px; width: 28px; height: 28px;
+            background: none; border: none; color: var(--text-tertiary);
+            font-size: 20px; cursor: pointer; line-height: 1;
+        }
+
+        /* header auth button */
+        .header-auth-btn {
+            padding: 7px 18px; border-radius: 50px;
+            background: linear-gradient(90deg, rgba(124,58,237,.3), rgba(0,212,255,.2));
+            border: 1px solid rgba(139,92,246,.5);
+            color: var(--text-primary); font-family: 'Rajdhani', sans-serif;
+            font-weight: 700; font-size: 13px; letter-spacing: 1px;
+            cursor: pointer; transition: all .2s; white-space: nowrap;
+        }
+        .header-auth-btn:hover { border-color: var(--gojo-blue); color: var(--gojo-blue); }
+        .header-user-chip {
+            display: flex; align-items: center; gap: 8px;
+            padding: 5px 14px 5px 8px; border-radius: 50px;
+            background: rgba(124,58,237,.18); border: 1px solid rgba(139,92,246,.4);
+            cursor: pointer; transition: all .2s;
+        }
+        .header-user-chip:hover { border-color: var(--gojo-blue); }
+        .header-user-avatar {
+            width: 28px; height: 28px; border-radius: 50%;
+            background: linear-gradient(135deg, #7c3aed, #00d4ff);
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 900; font-size: 12px; font-family: 'Orbitron', sans-serif;
+        }
+        .header-user-name { font-size: 12px; font-weight: 700; font-family: 'Rajdhani', sans-serif; letter-spacing: .5px; }
+
+        /* =====================================================================
+           PROFILE PAGE
+           ===================================================================== */
+        #profileSection {
+            display: none; animation: fadeIn .5s ease-out;
+            max-width: 1100px; margin: 0 auto; padding: 20px;
+        }
+        .profile-header {
+            display: flex; align-items: center; gap: 18px;
+            margin-bottom: 32px; padding-bottom: 24px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .profile-avatar-lg {
+            width: 64px; height: 64px; border-radius: 50%;
+            background: linear-gradient(135deg, #7c3aed, #00d4ff);
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 900; font-size: 26px; font-family: 'Orbitron', sans-serif;
+            box-shadow: 0 0 24px rgba(124,58,237,.5);
+        }
+        .profile-name-block .profile-username { font-family: 'Orbitron', sans-serif; font-size: 20px; font-weight: 900; }
+        .profile-name-block .profile-sub { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+        .profile-tabs { display: flex; gap: 4px; margin-bottom: 24px; }
+        .profile-tab {
+            padding: 10px 24px; border-radius: 50px; cursor: pointer;
+            font-family: 'Rajdhani', sans-serif; font-weight: 700; font-size: 13px;
+            letter-spacing: 1px; border: 1px solid rgba(139,92,246,.3);
+            background: transparent; color: var(--text-tertiary); transition: all .2s;
+        }
+        .profile-tab.active { background: rgba(124,58,237,.3); border-color: var(--gojo-blue); color: #fff; }
+        .profile-tab-pane { display: none; }
+        .profile-tab-pane.active { display: block; animation: fadeIn .4s ease-out; }
+        .profile-empty {
+            text-align: center; padding: 60px 20px;
+            color: var(--text-tertiary); font-size: 14px; font-family: 'Inter', sans-serif;
+        }
+        .profile-empty .empty-icon { font-size: 48px; margin-bottom: 12px; opacity: .4; }
+
+        /* history list */
+        .history-item {
+            display: flex; align-items: center; gap: 14px;
+            padding: 12px 16px; border-radius: 10px;
+            background: rgba(255,255,255,.025); border: 1px solid rgba(45,31,74,.6);
+            margin-bottom: 8px; cursor: pointer; transition: background .2s;
+        }
+        .history-item:hover { background: rgba(124,58,237,.1); }
+        .history-thumb {
+            width: 54px; height: 76px; border-radius: 6px; object-fit: cover;
+            background: var(--tertiary-black); flex-shrink: 0;
+        }
+        .history-info { flex: 1; min-width: 0; }
+        .history-title { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .history-ep { font-size: 11px; color: var(--gojo-blue); margin-top: 4px; font-family: 'Orbitron', sans-serif; }
+        .history-date { font-size: 10px; color: var(--text-tertiary); margin-top: 3px; }
+        .history-clear-btn {
+            margin-bottom: 16px; padding: 7px 16px; border-radius: 50px; cursor: pointer;
+            background: transparent; border: 1px solid rgba(255,107,107,.4);
+            color: #ff6b6b; font-size: 12px; font-family: 'Rajdhani', sans-serif;
+            font-weight: 700; letter-spacing: 1px; transition: all .2s;
+        }
+        .history-clear-btn:hover { background: rgba(255,107,107,.1); }
+
+        /* watchlist grid */
+        .watchlist-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px;
+        }
+        .wl-card {
+            border-radius: 10px; overflow: hidden; position: relative;
+            background: var(--tertiary-black); cursor: pointer;
+            border: 1px solid rgba(45,31,74,.6); transition: transform .2s, box-shadow .2s;
+        }
+        .wl-card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(124,58,237,.3); }
+        .wl-card img { width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block; }
+        .wl-card-info { padding: 8px 10px; }
+        .wl-card-title { font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .wl-card-eps { font-size: 10px; color: var(--text-tertiary); margin-top: 2px; }
+        .wl-remove-btn {
+            position: absolute; top: 6px; right: 6px; width: 24px; height: 24px;
+            border-radius: 50%; background: rgba(255,0,110,.85); border: none; color: #fff;
+            font-size: 14px; line-height: 1; cursor: pointer; display: flex;
+            align-items: center; justify-content: center;
+        }
+
+        /* downloads list */
+        .dl-item {
+            display: flex; align-items: center; gap: 14px;
+            padding: 14px 16px; border-radius: 10px;
+            background: rgba(255,255,255,.025); border: 1px solid rgba(45,31,74,.6);
+            margin-bottom: 8px;
+        }
+        .dl-thumb {
+            width: 54px; height: 76px; border-radius: 6px; object-fit: cover;
+            background: var(--tertiary-black); flex-shrink: 0;
+        }
+        .dl-info { flex: 1; min-width: 0; }
+        .dl-title { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dl-meta { font-size: 11px; color: var(--gojo-blue); margin-top: 4px; font-family: 'Orbitron', sans-serif; }
+        .dl-size { font-size: 10px; color: var(--text-tertiary); margin-top: 2px; }
+        .dl-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+        .dl-play-btn, .dl-del-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 11px;
+            font-family: 'Rajdhani', sans-serif; font-weight: 700; letter-spacing: 1px;
+            cursor: pointer; border: none; transition: opacity .2s;
+        }
+        .dl-play-btn { background: linear-gradient(90deg,#7c3aed,#00d4ff); color: #fff; }
+        .dl-del-btn  { background: rgba(255,0,110,.15); color: #ff006e; border: 1px solid rgba(255,0,110,.3); }
+        .dl-play-btn:hover, .dl-del-btn:hover { opacity: .8; }
+
+        /* active download row */
+        .dl-item.dl-active {
+            border-color: rgba(139,92,246,.5);
+            background: rgba(139,92,246,.06);
+        }
+        .dl-active-badge {
+            display: inline-block; padding: 2px 8px; border-radius: 20px;
+            background: rgba(139,92,246,.25); color: var(--gojo-violet);
+            font-size: 10px; font-family: 'Orbitron',sans-serif;
+            letter-spacing: 1px; margin-left: 6px; vertical-align: middle;
+        }
+        .dl-active-bar {
+            margin-top: 8px; height: 4px; border-radius: 3px;
+            background: rgba(255,255,255,.08); overflow: hidden;
+        }
+        .dl-active-bar-fill {
+            height: 100%; border-radius: 3px;
+            background: linear-gradient(90deg,#7c3aed,#00d4ff);
+            transition: width .6s linear;
+        }
+        .dl-active-pct {
+            font-size: 10px; color: var(--gojo-violet); margin-top: 4px; font-weight: 700;
+        }
+        .dl-cancel-btn {
+            padding: 6px 14px; border-radius: 6px; font-size: 11px;
+            font-family: 'Rajdhani',sans-serif; font-weight: 700; letter-spacing: 1px;
+            cursor: pointer; background: rgba(255,0,110,.1); color: #ff006e;
+            border: 1px solid rgba(255,0,110,.25); transition: opacity .2s;
+        }
+        .dl-cancel-btn:hover { opacity: .8; }
+
+        /* =====================================================================
+           WATCHLIST HEART BUTTON (on streaming page)
+           ===================================================================== */
+        .wl-heart-btn {
+            display: inline-flex; align-items: center; gap: 7px;
+            padding: 8px 18px; border-radius: 50px; cursor: pointer;
+            background: rgba(255,255,255,.04); border: 1px solid rgba(139,92,246,.35);
+            color: var(--text-secondary); font-family: 'Rajdhani', sans-serif;
+            font-size: 13px; font-weight: 700; letter-spacing: .5px;
+            transition: all .2s; margin-top: 10px;
+        }
+        .wl-heart-btn .heart { font-size: 16px; transition: transform .25s; }
+        .wl-heart-btn:hover { border-color: #ff006e; color: #ff006e; }
+        .wl-heart-btn.in-wl { border-color: #ff006e; color: #ff006e; background: rgba(255,0,110,.08); }
+        .wl-heart-btn.in-wl .heart { transform: scale(1.2); }
+
+        /* =====================================================================
+           DOWNLOAD BUTTON + PROGRESS
+           ===================================================================== */
+        .dl-btn-wrap {
+            display: inline-flex; align-items: center; gap: 7px;
+            padding: 8px 18px; border-radius: 50px; cursor: pointer;
+            background: rgba(255,255,255,.04); border: 1px solid rgba(0,212,255,.3);
+            color: var(--text-secondary); font-family: 'Rajdhani', sans-serif;
+            font-size: 13px; font-weight: 700; letter-spacing: .5px;
+            transition: all .2s; margin-top: 10px;
+        }
+        .dl-btn-wrap:hover { border-color: var(--gojo-blue); color: var(--gojo-blue); }
+        .dl-btn-wrap.downloading { border-color: var(--gojo-purple); color: var(--gojo-violet); cursor: not-allowed; }
+        .dl-btn-wrap.done { border-color: #00cc66; color: #00cc66; background: rgba(0,204,102,.08); cursor: default; }
+        .dl-progress-bar {
+            height: 3px; border-radius: 2px; background: rgba(139,92,246,.25);
+            margin-top: 6px; overflow: hidden; display: none;
+        }
+        .dl-progress-bar.visible { display: block; }
+        .dl-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #7c3aed, #00d4ff); transition: width .3s; border-radius: 2px; }
+
     </style>
 </head>
 <body>
@@ -1262,6 +1975,9 @@
 
 <header>
     <div class="header-left">
+        <button class="hamburger-btn" aria-label="Menu">
+            <span></span><span></span><span></span>
+        </button>
         <div class="logo" onclick="goHome()">
             <div class="logo-gojo">
                 <img src="https://files.manuscdn.com/user_upload_by_module/session_file/310519663321093674/oWQUOlviOKwSQlpf.png" alt="Gojo" loading="lazy">
@@ -1270,12 +1986,69 @@
         </div>
     </div>
     <div class="search-container">
-        <input id="searchInput" type="text" placeholder="Search the infinite void..." autocomplete="off">
-        <button onclick="searchAnime()">SEARCH</button>
+        <input id="searchInput" type="text" placeholder="Search anime..." autocomplete="off">
+        <button onclick="searchAnime()">&#128269; SEARCH</button>
+    </div>
+    <!-- auth button slot (right side of header) -->
+    <div id="headerAuthSlot" style="flex-shrink:0; margin-left:12px;">
+        <button class="header-auth-btn" onclick="openAuthModal()">Sign In</button>
     </div>
 </header>
 
+<!-- ===== AUTH MODAL ===== -->
+<div class="auth-modal-bg" id="authModalBg" onclick="e => { if(e.target===this) closeAuthModal(); }">
+    <div class="auth-modal" onclick="event.stopPropagation()">
+        <button class="auth-close" onclick="closeAuthModal()">&#215;</button>
+        <div class="auth-modal-logo">RO-ANIME</div>
+        <div class="auth-tabs">
+            <button class="auth-tab active" id="authTabLogin" onclick="switchAuthTab('login')">LOGIN</button>
+            <button class="auth-tab" id="authTabRegister" onclick="switchAuthTab('register')">REGISTER</button>
+        </div>
+        <div class="auth-field">
+            <label>Username</label>
+            <input type="text" id="authUsername" placeholder="Enter username" autocomplete="username" spellcheck="false">
+        </div>
+        <div class="auth-field">
+            <label>Password</label>
+            <input type="password" id="authPassword" placeholder="Enter password" autocomplete="current-password">
+        </div>
+        <button class="auth-submit" id="authSubmitBtn" onclick="submitAuth()">LOGIN</button>
+        <div class="auth-error" id="authError"></div>
+    </div>
+</div>
+
 <main>
+    <!-- ====== PROFILE PAGE ====== -->
+    <div id="profileSection">
+        <button class="nav-btn prev-btn" style="width:auto;margin-bottom:20px;padding:8px 16px;font-size:10px;" onclick="goHome()">&#8592; BACK</button>
+        <div class="profile-header">
+            <div class="profile-avatar-lg" id="profileAvatarLg">?</div>
+            <div class="profile-name-block">
+                <div class="profile-username" id="profileUsername">—</div>
+                <div class="profile-sub">Member since forever &bull; Session never expires</div>
+            </div>
+            <button onclick="doLogout()" style="margin-left:auto;padding:8px 18px;border-radius:50px;background:rgba(255,0,110,.12);border:1px solid rgba(255,0,110,.4);color:#ff006e;font-family:'Rajdhani',sans-serif;font-weight:700;font-size:12px;letter-spacing:1px;cursor:pointer;">LOGOUT</button>
+        </div>
+        <div class="profile-tabs">
+            <button class="profile-tab active" onclick="switchProfileTab('history')">&#128221; HISTORY</button>
+            <button class="profile-tab" onclick="switchProfileTab('watchlist')">&#10084; WATCHLIST</button>
+            <button class="profile-tab" onclick="switchProfileTab('downloads')">&#11015; DOWNLOADS</button>
+        </div>
+        <!-- HISTORY -->
+        <div class="profile-tab-pane active" id="pane-history">
+            <button class="history-clear-btn" onclick="clearHistory()">&#128465; Clear All History</button>
+            <div id="historyList"></div>
+        </div>
+        <!-- WATCHLIST -->
+        <div class="profile-tab-pane" id="pane-watchlist">
+            <div class="watchlist-grid" id="watchlistGrid"></div>
+        </div>
+        <!-- DOWNLOADS -->
+        <div class="profile-tab-pane" id="pane-downloads">
+            <div id="downloadsList"></div>
+        </div>
+    </div>
+
     <div id="heroBanner">
         <div class="hero-slider-container" id="heroSliderContainer"></div>
         <div class="hero-controls">
@@ -1287,129 +2060,177 @@
     <!-- ====== STREAMING SECTION ====== -->
     <div id="streamingSection">
         <button class="nav-btn prev-btn" style="width:auto;margin-bottom:16px;padding:8px 16px;font-size:10px;" onclick="goHome()">&#8592; BACK</button>
-        <!-- ====== PLAYER ====== -->
-        <div id="videoContainer">
-            <div class="player-wrapper" id="playerWrapper">
-                <video id="roVideoEl" playsinline></video>
-                <div id="roIframeWrap"></div>
-                <div id="roSubtitleOverlay"></div>
-                <div class="ro-buffer" id="roBuffer">
-                    <div class="ro-buffer-overlay"></div>
-                    <div class="ro-topbar" id="roTopbar"></div>
-                    <div class="ro-spinner-wrap"><div class="ro-ring-outer"></div><div class="ro-ring-inner"></div><div class="ro-ring-inner2"></div></div>
-                    <div class="ro-buffer-label">Loading</div>
-                </div>
-                <div class="ro-center-play is-play visible" id="roCenterPlay">
-                    <svg id="roCenterIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                </div>
-                <div class="ro-skip left"  id="roFlashL">&#8722;10s</div>
-                <div class="ro-skip right" id="roFlashR">+10s</div>
-                <div class="ro-controls" id="roCtrl">
-                    <div class="ro-ctrl-label" id="roCtrlLabel">&#8212;</div>
-                    <div class="ro-progress" id="roProg">
-                        <div class="ro-prog-buf"   id="roProgBuf"></div>
-                        <div class="ro-prog-fill"  id="roProgFill"></div>
-                        <div class="ro-prog-thumb" id="roProgThumb"></div>
-                    </div>
-                    <div class="ro-row">
-                        <div class="ro-left">
-                            <button class="ro-btn lg" id="roPlayBtn" title="Play/Pause">
-                                <svg id="roPpIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                            </button>
-                            <button class="ro-btn" id="roRwdBtn" title="Rewind 10s">
-                                <svg viewBox="0 0 24 24">
-                                    <path d="M11.99 5V1l-5 5 5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
-                                    <text x="12" y="14.5" text-anchor="middle" font-size="5" fill="currentColor" font-weight="bold">10</text>
-                                </svg>
-                            </button>
-                            <button class="ro-btn" id="roFwdBtn" title="Forward 10s">
-                                <svg viewBox="0 0 24 24">
-                                    <path d="M12.01 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/>
-                                    <text x="12" y="14.5" text-anchor="middle" font-size="5" fill="currentColor" font-weight="bold">10</text>
-                                </svg>
-                            </button>
-                            <div class="ro-vol-group">
-                                <button class="ro-btn" id="roVolBtn" title="Mute/Unmute">
-                                    <svg id="roVolIcon" viewBox="0 0 24 24">
-                                        <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                                    </svg>
-                                </button>
-                                <input type="range" class="ro-vol-slider" id="roVolSlider" min="0" max="100" value="100">
+        <div class="stream-layout">
+            <!-- ====== MAIN COLUMN (player + info + episode grid) ====== -->
+            <div class="stream-main">
+                <!-- ====== PLAYER ====== -->
+                <div id="videoContainer">
+                    <div class="player-wrapper" id="playerWrapper">
+                        <video id="roVideoEl" playsinline></video>
+                        <div id="roIframeWrap"></div>
+                        <div id="roSubtitleOverlay"></div>
+                        <div class="ro-buffer" id="roBuffer">
+                            <div class="ro-buffer-overlay"></div>
+                            <div class="ro-topbar" id="roTopbar"></div>
+                            <div class="ro-spinner-wrap"><div class="ro-ring-outer"></div><div class="ro-ring-inner"></div><div class="ro-ring-inner2"></div></div>
+                            <div class="ro-buffer-label">Loading</div>
+                        </div>
+                        <div class="ro-center-play is-play visible" id="roCenterPlay">
+                            <svg id="roCenterIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                        </div>
+                        <div class="ro-skip left"  id="roFlashL">&#8722;10s</div>
+                        <div class="ro-skip right" id="roFlashR">+10s</div>
+                        <div class="ro-controls" id="roCtrl">
+                            <div class="ro-ctrl-label" id="roCtrlLabel">&#8212;</div>
+                            <div class="ro-progress" id="roProg">
+                                <div class="ro-prog-buf"   id="roProgBuf"></div>
+                                <div class="ro-prog-fill"  id="roProgFill"></div>
+                                <div class="ro-prog-thumb" id="roProgThumb"></div>
                             </div>
-                            <div class="ro-time">
-                                <span id="roCurTime">0:00</span> / <span id="roDur">0:00</span>
+                            <div class="ro-row">
+                                <div class="ro-left">
+                                    <button class="ro-btn lg" id="roPlayBtn" title="Play/Pause">
+                                        <svg id="roPpIcon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                    </button>
+                                    <button class="ro-btn" id="roRwdBtn" title="Rewind 10s">
+                                        <svg viewBox="0 0 24 24">
+                                            <path d="M11.99 5V1l-5 5 5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                                            <text x="12" y="14.5" text-anchor="middle" font-size="5" fill="currentColor" font-weight="bold">10</text>
+                                        </svg>
+                                    </button>
+                                    <button class="ro-btn" id="roFwdBtn" title="Forward 10s">
+                                        <svg viewBox="0 0 24 24">
+                                            <path d="M12.01 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/>
+                                            <text x="12" y="14.5" text-anchor="middle" font-size="5" fill="currentColor" font-weight="bold">10</text>
+                                        </svg>
+                                    </button>
+                                    <div class="ro-vol-group">
+                                        <button class="ro-btn" id="roVolBtn" title="Mute/Unmute">
+                                            <svg id="roVolIcon" viewBox="0 0 24 24">
+                                                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+                                            </svg>
+                                        </button>
+                                        <input type="range" class="ro-vol-slider" id="roVolSlider" min="0" max="100" value="100">
+                                    </div>
+                                    <div class="ro-time">
+                                        <span id="roCurTime">0:00</span> / <span id="roDur">0:00</span>
+                                    </div>
+                                </div>
+                                <div class="ro-right">
+                                    <div id="roSubMenuWrap">
+                                        <button class="ro-btn" id="roSubBtn" title="Subtitles / CC" style="display:none;">
+                                            <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>
+                                        </button>
+                                        <div id="roSubDropdown" class="ro-sub-dropdown"></div>
+                                    </div>
+                                    <button class="ro-btn" id="roFsBtn" title="Fullscreen (F)">
+                                        <svg id="roFsIcon" viewBox="0 0 24 24">
+                                            <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                                        </svg>
+                                    </button>
+                                </div>
                             </div>
                         </div>
-                        <div class="ro-right">
-                            <div id="roSubMenuWrap">
-                                <button class="ro-btn" id="roSubBtn" title="Subtitles / CC" style="display:none;">
-                                    <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6zm0 4h8v2H6zm10 0h2v2h-2zm-6-4h8v2h-8z"/></svg>
-                                </button>
-                                <div id="roSubDropdown" class="ro-sub-dropdown"></div>
-                            </div>
-                            <button class="ro-btn" id="roFsBtn" title="Fullscreen (F)">
-                                <svg id="roFsIcon" viewBox="0 0 24 24">
-                                    <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
-                                </svg>
-                            </button>
-                        </div>
                     </div>
                 </div>
-            </div>
-        </div>
-        <!-- ====== END PLAYER ====== -->
-        <div class="player-info">
-            <h1 id="displayTitle" class="anime-title">Loading...</h1>
-            <div id="displayEpisode" class="episode-label">Episode --</div>
-            <div class="server-pill-row" id="serverPillRow" style="display:none;">
-                <span class="server-pill-label">Servers</span>
-            </div>
-            <div class="server-row">
-                <span id="streamStatusBadge" class="stream-status"></span>
-            </div>
-            <div class="sub-dub-toggle">
-                <button id="subBtn" class="subdub-btn active">SUB</button>
-            </div>
-            <div class="navigation-controls">
-                <button id="prevBtn" class="nav-btn prev-btn" onclick="changeEpisode(-1)">&#8592; PREVIOUS</button>
-                <button id="nextBtn" class="nav-btn next-btn" onclick="changeEpisode(1)">NEXT &#8594;</button>
-            </div>
-        </div>
-        <div class="episodes-section active" id="episodesSection">
-            <div class="episodes-header">
-                <h3 class="episodes-title">Episodes</h3>
-                <button class="view-all-btn" onclick="toggleViewAllEpisodes()">VIEW ALL</button>
-            </div>
-            <div class="episodes-grid" id="episodesGrid"></div>
-        </div>
+                <!-- ====== END PLAYER ====== -->
+                <div class="player-info">
+                    <h1 id="displayTitle" class="anime-title">Loading...</h1>
+                    <div id="displayEpisode" class="episode-label">Episode --</div>
+                    <div class="server-pill-row" id="serverPillRow" style="display:none;">
+                        <span class="server-pill-label">Servers</span>
+                    </div>
+                    <div class="server-row">
+                        <span id="streamStatusBadge" class="stream-status"></span>
+                    </div>
+                    <div class="sub-dub-toggle">
+                        <button id="subBtn" class="subdub-btn active">SUB</button>
+                    </div>
+                    <div class="navigation-controls">
+                        <button id="prevBtn" class="nav-btn prev-btn" onclick="changeEpisode(-1)">&#8592; PREVIOUS</button>
+                        <button id="nextBtn" class="nav-btn next-btn" onclick="changeEpisode(1)">NEXT &#8594;</button>
+                    </div>
+                    <!-- watchlist + download row -->
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:4px;">
+                        <button class="wl-heart-btn" id="wlHeartBtn" onclick="toggleWatchlist()">
+                            <span class="heart" id="wlHeart">&#9825;</span>
+                            <span id="wlLabel">Add to Watchlist</span>
+                        </button>
+                        <button class="dl-btn-wrap" id="dlBtn" onclick="startDownload()">
+                            <span id="dlIcon">&#11015;</span>
+                            <span id="dlLabel">Download EP</span>
+                        </button>
+                    </div>
+                    <div class="dl-progress-bar" id="dlProgressBar">
+                        <div class="dl-progress-fill" id="dlProgressFill"></div>
+                    </div>
+                </div>
+                <div class="episodes-section active" id="episodesSection">
+                    <div class="episodes-header">
+                        <h3 class="episodes-title">Episodes</h3>
+                        <button class="view-all-btn" onclick="toggleViewAllEpisodes()">VIEW ALL</button>
+                    </div>
+                    <div class="episodes-grid" id="episodesGrid"></div>
+                </div>
+            </div><!-- end .stream-main -->
+
+            <!-- ====== RIGHT EPISODE SIDEBAR ====== -->
+            <aside class="stream-ep-sidebar">
+                <div class="ep-sidebar-header">
+                    <span style="font-weight:700;font-size:13px;letter-spacing:.5px;">Episodes</span>
+                    <span id="epSidebarCount" style="font-size:11px;opacity:0.55;"></span>
+                </div>
+                <div class="ep-sidebar-list" id="epSidebarList"></div>
+            </aside>
+        </div><!-- end .stream-layout -->
     </div>
 
-    <!-- Search Results -->
-    <div id="searchResultsSection" style="display:none;">
-        <h2 class="section-title">Search Results</h2>
-        <div id="grid"></div>
-    </div>
-
-    <!-- Home Section -->
-    <div id="homeSection">
-        <div id="recentlyAddedSection">
-            <div class="recently-added-header">
-                <div class="recently-added-title">Recently Added</div>
-                <div class="recently-added-badge">Live Feed</div>
+    <!-- Two-column wrapper (home + search use sidebar; player is full-width) -->
+    <div class="main-two-col">
+        <div class="main-content">
+            <!-- Search Results -->
+            <div id="searchResultsSection" style="display:none;">
+                <h2 class="section-title">
+                    <span class="title-left"><span class="title-bar"></span>Search Results</span>
+                </h2>
+                <div id="grid"></div>
             </div>
-            <div id="recentlyAddedGrid"></div>
-        </div>
 
-        <div id="dynamicSection" style="display:none;">
-            <h2 class="section-title">
-                <span class="live-badge">LIVE</span> Now on RO-Anime
-            </h2>
-            <div id="dynamicGrid"></div>
-        </div>
+            <!-- Home Section -->
+            <div id="homeSection">
+                <div id="recentlyAddedSection">
+                    <div class="recently-added-header">
+                        <div class="recently-added-title">
+                            <span class="title-left"><span class="title-bar"></span>Recently Added</span>
+                        </div>
+                        <div class="recently-added-badge">Live Feed</div>
+                    </div>
+                    <div id="recentlyAddedGrid"></div>
+                </div>
 
-        <h2 class="section-title">Top Rated Anime</h2>
-        <div id="famousGrid"></div>
-    </div>
+                <div id="dynamicSection" style="display:none;">
+                    <h2 class="section-title">
+                        <span class="title-left"><span class="title-bar"></span><span class="live-badge">LIVE</span>&nbsp;Now on RO-Anime</span>
+                    </h2>
+                    <div id="dynamicGrid"></div>
+                </div>
+
+                <h2 class="section-title">
+                    <span class="title-left"><span class="title-bar"></span>Top Rated Anime</span>
+                    <span class="view-all-link">View All &rsaquo;</span>
+                </h2>
+                <div id="famousGrid"></div>
+            </div>
+        </div><!-- /.main-content -->
+
+        <!-- Sidebar -->
+        <aside id="homeSidebar">
+            <div class="sidebar-box">
+                <div class="sidebar-box-title">Top Anime</div>
+                <div id="sidebarTopList"></div>
+            </div>
+        </aside>
+    </div><!-- /.main-two-col -->
 </main>
 
 <!-- Episode Overlay -->
@@ -1620,8 +2441,19 @@ document.addEventListener('mousemove', function(e) {
     let roIsFullscreen    = false;
 
     let currentStreamData = null;   // { mal_id, title, ep, episodes }
+    // Expose via window so auth/download module can read it
+    Object.defineProperty(window, 'currentStreamData', {
+        get: function() { return currentStreamData; },
+        set: function(v) { currentStreamData = v; },
+        configurable: true
+    });
     let streamIntro       = null;
     let streamOutro       = null;
+
+    // Moon / HD1 server state
+    let moonStreamData    = null;   // { url, subtitle_url } when ready
+    let hd1StreamData     = null;   // { url } when ready
+    let currentServer     = 'megaplay';  // 'megaplay' | 'moon' | 'hd1'
 
     let roSubtitleCues   = [];
     let roSubActive      = false;
@@ -1659,6 +2491,144 @@ document.addEventListener('mousemove', function(e) {
         document.getElementById('playerWrapper').appendChild(btn);
     })();
 
+    // =========================================================================
+    //  SERVER SWITCHER  (MegaPlay | Moon | HD1)  — lives in serverPillRow
+    // =========================================================================
+
+    // _updateServerBtns: highlight the active pill
+    function _updateServerBtns() {
+        ['megaplay', 'moon', 'hd1'].forEach(srv => {
+            const btn = document.getElementById(`roPill_${srv}`);
+            if (!btn) return;
+            btn.classList.toggle('active', currentServer === srv);
+        });
+    }
+
+    function _setMoonReady(ready) {
+        const pillRow = document.getElementById('serverPillRow');
+        if (!pillRow) return;
+        let btn = document.getElementById('roPill_moon');
+        if (ready) {
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.id        = 'roPill_moon';
+                btn.className = 'srv-pill';
+                btn.addEventListener('click', () => switchServer('moon'));
+                // Insert before HD1 if present, else append
+                const hd1 = document.getElementById('roPill_hd1');
+                if (hd1) pillRow.insertBefore(btn, hd1);
+                else     pillRow.appendChild(btn);
+            }
+            btn.textContent = '\u25CF Moon';
+            btn.disabled    = false;
+            btn.title       = 'Switch to Moon server';
+        } else {
+            if (btn) btn.remove();
+        }
+    }
+
+    function _setHD1Ready(url) {
+        const pillRow = document.getElementById('serverPillRow');
+        if (!pillRow) return;
+        let btn = document.getElementById('roPill_hd1');
+        if (url) {
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.id        = 'roPill_hd1';
+                btn.className = 'srv-pill';
+                btn.addEventListener('click', () => switchServer('hd1'));
+                pillRow.appendChild(btn);
+            }
+            btn.textContent = '\u25CF HD1';
+            btn.disabled    = false;
+            btn.title       = 'Switch to HD1 server';
+        } else {
+            if (btn) btn.remove();
+        }
+    }
+
+    function switchServer(server) {
+        if (server === currentServer) return;
+        const { title, ep } = currentStreamData;
+
+        function _stopHLS() {
+            if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        }
+        function _pauseSubs() {
+            roSubActive = false;
+            const _ov = document.getElementById('roSubOverlay');
+            if (_ov) _ov.innerHTML = '';
+        }
+
+        if (server === 'moon') {
+            if (!moonStreamData) return;
+            currentServer = 'moon';
+            _updateServerBtns();
+            _stopHLS(); _pauseSubs();
+            _attachHLS(moonStreamData.url, title, ep, 'Moon');
+
+        } else if (server === 'hd1') {
+            if (!hd1StreamData) return;
+            currentServer = 'hd1';
+            _updateServerBtns();
+            _stopHLS(); _pauseSubs();
+            // HD1 is a direct MP4 — load straight into <video>
+            const video = document.getElementById('roVideoEl');
+            const badge = document.getElementById('streamStatusBadge');
+            video.style.display = 'block';
+            video.removeEventListener('timeupdate', _onTimeUpdate);
+            video.addEventListener('timeupdate', _onTimeUpdate);
+            video.src = hd1StreamData.url;
+            video.load();
+            video.play().catch(() => {});
+            badge.textContent = '\u25cf HD1';
+            badge.className   = 'stream-status live';
+            roShowSpinner(false);
+            roShowControls();
+            document.getElementById('roCtrlLabel').textContent = `${title}  \u00b7  EP ${ep}`;
+
+        } else {
+            // switch back to megaplay
+            currentServer = 'megaplay';
+            _updateServerBtns();
+            loadStream();   // re-initialises subtitles from cached stream data
+        }
+    }
+
+    async function _fetchMoonBackground(mal_id, ep) {
+        moonStreamData = null;
+        _setMoonReady(false);
+        try {
+            const r = await fetch(`${API_BASE}/api/moon/${mal_id}/${ep}`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const data = await r.json();
+            if (!data.url) throw new Error('no url');
+            moonStreamData = data;
+            _setMoonReady(true);
+            console.log('[Moon] ready:', data.url.slice(0, 60));
+        } catch(e) {
+            console.warn('[Moon] background fetch failed:', e.message);
+            _setMoonReady(false);
+        }
+    }
+
+    async function _fetchHD1Background(mal_id, ep) {
+        hd1StreamData = null;
+        _setHD1Ready(null);   // remove pill if previously present
+        try {
+            const r = await fetch(`${API_BASE}/api/hd1/${mal_id}/${ep}`);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const data = await r.json();
+            if (!data.url) throw new Error('no url');
+            hd1StreamData = data;
+            _setHD1Ready(data.url);   // adds pill only if URL found
+            console.log('[HD1] ready:', data.url.slice(0, 80));
+        } catch(e) {
+            console.warn('[HD1] background fetch failed:', e.message);
+            _setHD1Ready(null);
+        }
+    }
+
     function _checkSkipBtn(ct) {
         const btn = document.getElementById('roSkipBtn');
         if (!btn) return;
@@ -1684,9 +2654,8 @@ document.addEventListener('mousemove', function(e) {
         document.getElementById('streamingSection').style.display     = 'none';
         document.getElementById('searchResultsSection').style.display = 'none';
         document.getElementById('homeSection').style.display          = 'block';
-        if (window.innerWidth >= 768) {
-            document.getElementById('heroBanner').style.display = 'block';
-        }
+        // heroBanner shown by initHeroSlider() once data is ready
+        document.getElementById('heroBanner').style.display = 'none';
 
         // --- load all home data in parallel ---
         fetchBanners();           // FIX 2: banners loaded here, not just in window.load
@@ -1696,16 +2665,23 @@ document.addEventListener('mousemove', function(e) {
     }
 
     // =========================================================================
-    //  BANNERS
+    //  BANNERS  (with retry on empty — AniList sometimes needs a second hit)
     // =========================================================================
-    async function fetchBanners() {
+    async function fetchBanners(attempt) {
+        attempt = attempt || 1;
         try {
             const resp = await fetch(`${API_BASE}/api/v1/banners`);
-            if (!resp.ok) return;
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
             const list = await resp.json();
-            if (Array.isArray(list) && list.length > 0) initHeroSlider(list);
+            if (Array.isArray(list) && list.length > 0) {
+                initHeroSlider(list);
+            } else if (attempt < 4) {
+                // AniList may still be warming up — retry with backoff
+                setTimeout(() => fetchBanners(attempt + 1), attempt * 1500);
+            }
         } catch(e) {
-            console.warn('Banner fetch failed:', e);
+            console.warn('Banner fetch failed (attempt ' + attempt + '):', e);
+            if (attempt < 4) setTimeout(() => fetchBanners(attempt + 1), attempt * 2000);
         }
     }
 
@@ -1724,6 +2700,7 @@ document.addEventListener('mousemove', function(e) {
             list.forEach(a => frag.appendChild(createCard(a)));
             grid.appendChild(frag);
             startAsyncImageLoading();
+            populateSidebar(list);   // ← fill sidebar ranked list
         } catch(e) {
             console.warn('Top-rated fetch failed:', e);
             grid.innerHTML = '';
@@ -1781,15 +2758,28 @@ document.addEventListener('mousemove', function(e) {
         }
     }
 
+    function _addCardBadges(imgWrapper, anime) {
+        // TV badge top-right
+        const bFmt = document.createElement('span');
+        bFmt.className = 'badge-format'; bFmt.textContent = 'TV';
+        imgWrapper.appendChild(bFmt);
+        // Sub/Dub badge bottom-right
+        const bSD = document.createElement('span');
+        bSD.className = 'badge-sub-dub'; bSD.textContent = 'Sub';
+        imgWrapper.appendChild(bSD);
+        // Episode badge bottom-left
+        const eps = anime.num_episodes > 0 ? anime.num_episodes : '?';
+        const bEp = document.createElement('span');
+        bEp.className = 'badge-ep'; bEp.textContent = `Ep ${eps}`;
+        imgWrapper.appendChild(bEp);
+    }
+
     function createRecentCard(anime, idx) {
         const card = document.createElement('div');
         card.className = 'card search-revealed';
         card.style.animationDelay = `${Math.min(idx * 40, 500)}ms`;
         const imgWrapper = document.createElement('div');
         imgWrapper.className = 'card-img-wrapper loading';
-        const badge = document.createElement('span');
-        badge.className = 'card-new-badge'; badge.textContent = 'NEW';
-        imgWrapper.appendChild(badge);
         const img = document.createElement('img');
         img.loading = 'lazy';
         img.onload  = () => { imgWrapper.classList.remove('loading'); img.classList.add('loaded'); };
@@ -1797,17 +2787,18 @@ document.addEventListener('mousemove', function(e) {
         const imageUrl = proxyImg(anime.poster || anime.image || anime.thumbnail || '');
         if (imageUrl) { img.dataset.src = imageUrl; observeNewImage(img); }
         imgWrapper.appendChild(img);
+        _addCardBadges(imgWrapper, anime);
         const overlay = document.createElement('div');
         overlay.className = 'card-overlay';
         const watchBtn = document.createElement('button');
-        watchBtn.className = 'card-watch-btn'; watchBtn.textContent = '\u25b6 WATCH NOW';
+        watchBtn.className = 'card-watch-btn'; watchBtn.textContent = '\u25b6 Watch Now';
         watchBtn.addEventListener('click', e => { e.stopPropagation(); fetchEpisodes(anime); });
         overlay.appendChild(watchBtn); imgWrapper.appendChild(overlay);
         const info = document.createElement('div'); info.className = 'card-info';
         const title = document.createElement('div'); title.className = 'card-title';
         title.textContent = anime.title;
         const meta = document.createElement('div'); meta.className = 'card-meta';
-        meta.textContent = `Series \u2022 ${anime.num_episodes > 0 ? anime.num_episodes + ' EP' : 'Airing'}`;
+        meta.textContent = anime.num_episodes > 0 ? `${anime.num_episodes} Episodes` : 'Airing';
         info.appendChild(title); info.appendChild(meta);
         card.appendChild(imgWrapper); card.appendChild(info);
         card.addEventListener('click', () => fetchEpisodes(anime));
@@ -1834,8 +2825,9 @@ document.addEventListener('mousemove', function(e) {
             const ov = document.createElement('div');
             ov.className = 'hero-slide-overlay';
             const safeTitle   = (slide.title || '').replace(/'/g, "\\'");
+            const safeCover   = (slide.cover || slide.img_url || '').replace(/'/g, "\\'");
             const watchAction = slide.anime_id
-                ? `startStreamingFromBanner('${slide.anime_id}','${safeTitle}')`
+                ? `startStreamingFromBanner('${slide.anime_id}','${safeTitle}','${safeCover}')`
                 : `quickOpenEpisodes('${safeTitle}')`;
             const epsLabel = slide.episode_count > 0 ? `${slide.episode_count} EPISODES` : 'AIRING';
             ov.innerHTML = `
@@ -1928,22 +2920,57 @@ document.addEventListener('mousemove', function(e) {
         const imageUrl = proxyImg(rawUrl);
         if (imageUrl) { img.dataset.src = imageUrl; observeNewImage(img); }
         imgWrapper.appendChild(img);
+        _addCardBadges(imgWrapper, element);
         const overlay = document.createElement('div');
         overlay.className = 'card-overlay';
         const watchBtn = document.createElement('button');
-        watchBtn.className = 'card-watch-btn'; watchBtn.textContent = '\u25b6 WATCH NOW';
+        watchBtn.className = 'card-watch-btn'; watchBtn.textContent = '\u25b6 Watch Now';
         watchBtn.addEventListener('click', e => { e.stopPropagation(); fetchEpisodes(element); });
         overlay.appendChild(watchBtn); imgWrapper.appendChild(overlay);
         const info = document.createElement('div'); info.className = 'card-info';
         const titleEl = document.createElement('div'); titleEl.className = 'card-title';
         titleEl.textContent = element.title;
         const meta = document.createElement('div'); meta.className = 'card-meta';
-        const eps = element.num_episodes > 0 ? `${element.num_episodes} EP` : 'Series';
-        meta.textContent = `${eps} \u2022 HD`;
+        const eps = element.num_episodes > 0 ? `${element.num_episodes} Episodes` : 'Airing';
+        meta.textContent = eps;
         info.appendChild(titleEl); info.appendChild(meta);
         card.appendChild(imgWrapper); card.appendChild(info);
         card.addEventListener('click', () => fetchEpisodes(element));
         return card;
+    }
+
+    // ── Sidebar top-anime list (populated alongside famousGrid) ──────────────
+    function populateSidebar(items) {
+        const list = document.getElementById('sidebarTopList');
+        if (!list || !items || !items.length) return;
+        list.innerHTML = '';
+        items.slice(0, 10).forEach((anime, i) => {
+            const item = document.createElement('div');
+            item.className = 'sidebar-top-item';
+            item.addEventListener('click', () => fetchEpisodes(anime));
+
+            const rank = document.createElement('div');
+            rank.className = `sidebar-rank${i < 3 ? ' top3' : ''}`;
+            rank.textContent = i + 1;
+
+            const thumb = document.createElement('img');
+            thumb.className = 'sidebar-thumb';
+            const rawThumb = anime.poster || anime.image || anime.thumbnail || '';
+            if (rawThumb) { thumb.src = proxyImg(rawThumb); }
+            thumb.alt = anime.title || '';
+            thumb.loading = 'lazy';
+
+            const info = document.createElement('div'); info.className = 'sidebar-info';
+            const t = document.createElement('div'); t.className = 'sidebar-anime-title';
+            t.textContent = anime.title || '';
+            const sc = document.createElement('div'); sc.className = 'sidebar-anime-score';
+            const score = anime.score ? parseFloat(anime.score).toFixed(2) : '';
+            sc.innerHTML = score ? `<span class="star">&#9733;</span> ${score}` : '';
+
+            info.appendChild(t); info.appendChild(sc);
+            item.appendChild(rank); item.appendChild(thumb); item.appendChild(info);
+            list.appendChild(item);
+        });
     }
 
     // =========================================================================
@@ -2047,7 +3074,7 @@ document.addEventListener('mousemove', function(e) {
     // =========================================================================
     //  START STREAMING FROM HERO BANNER
     // =========================================================================
-    async function startStreamingFromBanner(animeId, title) {
+    async function startStreamingFromBanner(animeId, title, coverUrl) {
         const overlay   = document.getElementById('episodeOverlay');
         const container = document.getElementById('episodesContainer');
         container.innerHTML = '<div class="episode-loading"><div class="episode-spinner"></div><div class="episode-loading-text">LOADING EPISODES...</div></div>';
@@ -2059,11 +3086,11 @@ document.addEventListener('mousemove', function(e) {
             const data = await r.json();
             const eps  = data.episodes || [];
             if (!eps.length) throw new Error('No episodes');
-            renderEpisodes({ anime_id: animeId, title }, eps);
+            renderEpisodes({ anime_id: animeId, title, image_url: coverUrl || '' }, eps);
         } catch(e) {
             container.innerHTML = `<div style="text-align:center;padding:30px;">
                 <p style="color:var(--accent-pink);margin-bottom:16px;">\u26a0 Could not load episodes.</p>
-                <button onclick="startStreamingFromBanner('${animeId}','${title.replace(/'/g,"\\'")}');"
+                <button onclick="startStreamingFromBanner('${animeId}','${title.replace(/'/g,"\\'")}','${(coverUrl||'').replace(/'/g,"\\'")}');"
                     style="padding:8px 20px;background:var(--accent-pink);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:700;">RETRY</button>
             </div>`;
         }
@@ -2132,6 +3159,9 @@ document.addEventListener('mousemove', function(e) {
     //  START STREAMING  (exposed on window so fusion animation can wrap it)
     // =========================================================================
     async function startStreaming(anime, episode, allEpisodes) {
+        // Always clear offline mode when a real stream is started
+        if (window._setOfflineMode) window._setOfflineMode(false);
+
         closeOverlay();
         document.getElementById('searchResultsSection').style.display = 'none';
         document.getElementById('homeSection').style.display          = 'none';
@@ -2139,10 +3169,21 @@ document.addEventListener('mousemove', function(e) {
         document.getElementById('streamingSection').style.display     = 'block';
 
         currentStreamData = {
-            mal_id:   anime.anime_id || anime.mal_id || '',
-            title:    anime.title,
-            ep:       parseInt(episode.episode_number),
-            episodes: allEpisodes,
+            mal_id:    anime.anime_id || anime.mal_id || '',
+            title:     anime.title,
+            ep:        parseInt(episode.episode_number),
+            episodes:  allEpisodes,
+            image_url: anime.image_url
+                    || anime.poster
+                    || anime.image
+                    || anime.thumbnail
+                    || anime.img
+                    || anime.main_picture?.large
+                    || anime.main_picture?.medium
+                    || anime.images?.jpg?.large_image_url
+                    || anime.images?.jpg?.image_url
+                    || (typeof currentStreamData !== 'undefined' && currentStreamData ? currentStreamData.image_url : '')
+                    || '',
         };
 
         roPlayerReset();
@@ -2150,16 +3191,70 @@ document.addEventListener('mousemove', function(e) {
         renderEpisodesList(true);
         window.scrollTo({ top: 0, behavior: 'smooth' });
         loadStream();
+        // Kick off Moon + HD1 server fetches in background — no await, player already running
+        _fetchMoonBackground(currentStreamData.mal_id, currentStreamData.ep);
+        _fetchHD1Background(currentStreamData.mal_id, currentStreamData.ep);
     }
     window.startStreaming = startStreaming;
+
+    // Expose HLS teardown so the offline player (different IIFE) can call it.
+    // Also cleans up any offline HLS instance + blob URLs left on the video element.
+    window._destroyHls = function() {
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        const vid = document.getElementById('roVideoEl');
+        if (!vid) return;
+        if (vid._offlineHls)        { vid._offlineHls.destroy(); vid._offlineHls = null; }
+        if (vid._offlineBlobUrl)    { URL.revokeObjectURL(vid._offlineBlobUrl);     vid._offlineBlobUrl     = null; }
+        if (vid._offlineManifestUrl){ URL.revokeObjectURL(vid._offlineManifestUrl); vid._offlineManifestUrl = null; }
+        if (vid._offlineSubUrl)     { URL.revokeObjectURL(vid._offlineSubUrl);      vid._offlineSubUrl      = null; }
+    };
+
+    // Expose offline-mode toggle — hides server pills + episode nav when playing local file
+    window._setOfflineMode = function(on) {
+        window._offlineMode = !!on;
+        // server pills
+        const pillRow = document.getElementById('serverPillRow');
+        if (pillRow) pillRow.style.display = on ? 'none' : '';
+        // prev / next episode buttons
+        ['prevBtn','nextBtn'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (!btn) return;
+            btn.disabled      = !!on;
+            btn.style.opacity = on ? '0.3' : '';
+            btn.style.cursor  = on ? 'not-allowed' : '';
+        });
+        // right episode sidebar — pointer-events off so clicks are blocked
+        const sidebar = document.getElementById('epSidebarList');
+        if (sidebar) {
+            sidebar.style.pointerEvents = on ? 'none' : '';
+            sidebar.style.opacity       = on ? '0.4' : '';
+        }
+        // OFFLINE badge on episode label
+        const epLabel = document.getElementById('displayEpisode');
+        if (epLabel) {
+            // strip old offline suffix first
+            epLabel.textContent = epLabel.textContent.replace(/\s*\(Offline\)$/, '');
+            if (on) epLabel.textContent += ' · OFFLINE';
+        }
+    };
 
     // =========================================================================
     //  PLAYER RESET
     // =========================================================================
     function roPlayerReset() {
         streamIntro = null; streamOutro = null;
+        moonStreamData = null; hd1StreamData = null; currentServer = 'megaplay';
         const skipBtn = document.getElementById('roSkipBtn');
         if (skipBtn) skipBtn.style.display = 'none';
+
+        // Rebuild serverPillRow — only MegaPlay on open.
+        // Moon + HD1 pills appear dynamically when their URLs are ready.
+        const pillRow = document.getElementById('serverPillRow');
+        pillRow.innerHTML =
+            '<span class="server-pill-label">Servers</span>' +
+            '<button id="roPill_megaplay" class="srv-pill active" title="MegaPlay">&#9679; MegaPlay</button>';
+        pillRow.style.display = 'flex';
+        document.getElementById('roPill_megaplay').addEventListener('click', () => switchServer('megaplay'));
 
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
         const video      = document.getElementById('roVideoEl');
@@ -2176,10 +3271,7 @@ document.addEventListener('mousemove', function(e) {
         document.getElementById('roProgBuf').style.width = '0%';
         roResetSubtitleState();
 
-        // Single MegaPlay source pill
-        const pillRow = document.getElementById('serverPillRow');
-        pillRow.innerHTML = '<span class="server-pill-label">Source</span><button class="srv-pill active">MegaPlay</button>';
-        pillRow.style.display = 'flex';
+        // serverPillRow is already rebuilt above with interactive server buttons
 
         // FIX 4: sync subBtn label with current audio track
         const subBtn = document.getElementById('subBtn');
@@ -2359,6 +3451,7 @@ document.addEventListener('mousemove', function(e) {
                   || subs.find(s => s.file);
         if (sub) {
             roEnglishSubFile = sub.file;
+            window._currentSubFile = sub.file;   // expose for downloader
             roRenderSubMenu();
             setTimeout(roAutoSelectDefaultSubtitle, 400);
         } else {
@@ -2371,7 +3464,7 @@ document.addEventListener('mousemove', function(e) {
     // =========================================================================
     //  HLS ATTACH
     // =========================================================================
-    function _attachHLS(m3u8Url, title, ep) {
+    function _attachHLS(m3u8Url, title, ep, serverLabel = 'MegaPlay') {
         const badge = document.getElementById('streamStatusBadge');
         const video = document.getElementById('roVideoEl');
         video.style.display = 'block';
@@ -2380,8 +3473,9 @@ document.addEventListener('mousemove', function(e) {
 
         const onReady = () => {
             video.play().catch(() => {});
-            badge.textContent = '\u25cf MegaPlay';
+            badge.textContent = `\u25cf ${serverLabel}`;
             badge.className   = 'stream-status live';
+            _updateServerBtns();
             roShowSpinner(false);
             roShowControls();
             document.getElementById('roCtrlLabel').textContent = `${title}  \u00b7  EP ${ep}`;
@@ -2395,6 +3489,7 @@ document.addEventListener('mousemove', function(e) {
                 fragLoadingTimeOut: 20000, manifestLoadingTimeOut: 20000,
                 fragLoadingMaxRetry: 4, manifestLoadingMaxRetry: 4,
             });
+            window._currentHlsUrl = m3u8Url;   // expose for downloader
             hlsInstance.loadSource(m3u8Url);
             hlsInstance.attachMedia(video);
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, onReady);
@@ -2408,6 +3503,7 @@ document.addEventListener('mousemove', function(e) {
                 }
             });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            window._currentHlsUrl = m3u8Url;
             video.src = m3u8Url;
             video.addEventListener('loadedmetadata', onReady, { once: true });
             video.addEventListener('error', () => {
@@ -2452,6 +3548,8 @@ document.addEventListener('mousemove', function(e) {
             grid.querySelectorAll('.episode-item').forEach(item => {
                 item.classList.toggle('current', parseInt(item.dataset.ep) === currentStreamData.ep);
             });
+            // also update sidebar highlights
+            _syncEpSidebarHighlight();
             return;
         }
         grid.innerHTML = ''; episodesListRendered = false;
@@ -2466,7 +3564,7 @@ document.addEventListener('mousemove', function(e) {
             box.textContent = `EP ${ep.episode_number}`;
             box.addEventListener('click', () =>
                 startStreaming(
-                    { anime_id: currentStreamData.mal_id, title: currentStreamData.title },
+                    { anime_id: currentStreamData.mal_id, title: currentStreamData.title, image_url: currentStreamData.image_url },
                     ep, currentStreamData.episodes
                 )
             );
@@ -2474,6 +3572,105 @@ document.addEventListener('mousemove', function(e) {
         });
         grid.appendChild(frag);
         episodesListRendered = true;
+
+        // Rebuild right-side thumbnail sidebar every time the grid rebuilds
+        _populateEpSidebar();
+    }
+
+    function _populateEpSidebar() {
+        const sidebar  = document.getElementById('epSidebarList');
+        const countEl  = document.getElementById('epSidebarCount');
+        if (!sidebar) return;
+        sidebar.innerHTML = '';
+
+        const eps       = currentStreamData.episodes || [];
+        const poster    = currentStreamData.image_url || '';
+        const currentEp = currentStreamData.ep;
+
+        if (countEl) countEl.textContent = eps.length + ' eps';
+
+        const frag = document.createDocumentFragment();
+        eps.forEach(ep => {
+            const num       = parseInt(ep.episode_number);
+            const isCurrent = num === currentEp;
+
+            const item = document.createElement('div');
+            item.className = 'ep-thumb-item' + (isCurrent ? ' ep-current' : '');
+            item.dataset.ep = num;
+
+            /* — thumbnail wrap — */
+            const wrap = document.createElement('div');
+            wrap.className = 'ep-thumb-wrap';
+
+            const img = document.createElement('img');
+            img.src     = poster;
+            img.alt     = 'EP ' + num;
+            img.loading = 'lazy';
+            img.onerror = () => { img.style.display = 'none'; };
+            wrap.appendChild(img);
+
+            /* — episode number / play overlay — */
+            const overlay = document.createElement('div');
+            overlay.className = 'ep-thumb-overlay';
+            overlay.textContent = num;
+            wrap.appendChild(overlay);
+
+            /* — text info column — */
+            const info  = document.createElement('div');
+            info.className = 'ep-thumb-info';
+
+            const title = document.createElement('div');
+            title.className = 'ep-thumb-title';
+            title.textContent = ep.title ? ep.title : 'Episode ' + num;
+
+            const sub = document.createElement('div');
+            sub.className = 'ep-thumb-sub';
+            sub.textContent = 'EP ' + num;
+
+            /* dot indicator for currently playing */
+            if (isCurrent) {
+                const dot = document.createElement('span');
+                dot.className = 'ep-now-dot';
+                info.appendChild(dot);
+            }
+
+            info.appendChild(title);
+            info.appendChild(sub);
+
+            item.appendChild(wrap);
+            item.appendChild(info);
+
+            item.addEventListener('click', () =>
+                startStreaming(
+                    { anime_id: currentStreamData.mal_id, title: currentStreamData.title, image_url: currentStreamData.image_url },
+                    ep, currentStreamData.episodes
+                )
+            );
+
+            frag.appendChild(item);
+        });
+
+        sidebar.appendChild(frag);
+
+        // Scroll current episode into view
+        requestAnimationFrame(() => {
+            const cur = sidebar.querySelector('.ep-current');
+            if (cur) cur.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        });
+    }
+
+    function _syncEpSidebarHighlight() {
+        const sidebar = document.getElementById('epSidebarList');
+        if (!sidebar) return;
+        const currentEp = currentStreamData.ep;
+        sidebar.querySelectorAll('.ep-thumb-item').forEach(item => {
+            const isCur = parseInt(item.dataset.ep) === currentEp;
+            item.classList.toggle('ep-current', isCur);
+        });
+        requestAnimationFrame(() => {
+            const cur = sidebar.querySelector('.ep-current');
+            if (cur) cur.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        });
     }
 
     function toggleViewAllEpisodes() {
@@ -2486,6 +3683,7 @@ document.addEventListener('mousemove', function(e) {
     }
 
     function changeEpisode(delta) {
+        if (window._offlineMode) return;   // locked in offline playback
         const nextEpNum = currentStreamData.ep + delta;
         const nextEp    = currentStreamData.episodes.find(e => parseInt(e.episode_number) === nextEpNum);
         if (nextEp) startStreaming(
@@ -2974,9 +4172,13 @@ document.addEventListener('mousemove', function(e) {
     window.startStreaming = async function(animeObj, episode, allEpisodes) {
         if (busy) return _origStartStreaming(animeObj, episode, allEpisodes);
         busy = true;
+        // Fire _origStartStreaming after 1 s (during orbit phase) so MegaPlay
+        // begins loading while the animation is still playing.
+        // The overlay covers everything — user sees animation, player loads underneath.
+        setTimeout(() => _origStartStreaming(animeObj, episode, allEpisodes), 1000);
         try { await runFusion(); } catch(e) { console.warn('Fusion err:', e); }
         busy = false;
-        return _origStartStreaming(animeObj, episode, allEpisodes);
+        // No second call needed — already started above
     };
 
     function runFusion() {
@@ -3075,43 +4277,86 @@ document.addEventListener('mousemove', function(e) {
                 cls.forEach(cl => { cl.geo.dispose(); cl.mat.dispose(); });
                 orbMat.dispose(); outerMat.dispose();
                 overlay.querySelectorAll('.hs-line').forEach(l => l.remove());
+                // reset canvas filter so subsequent renders are full-colour
+                renderer.domElement.style.filter = '';
+                overlay.style.filter = '';
                 overlay.style.display = 'none';
                 overlay.style.opacity = '1';
                 renderer.dispose();
             }
 
             function spawnHyperspace(onDone) {
-                const LN = 100;
+                // ── B&W "entering a black hole at warp speed" ──
+                // 1. Drain all colour from the overlay
+                overlay.style.filter = 'grayscale(1) contrast(1.6) brightness(0.92)';
+
+                // 2. Flash-white pulse (event horizon flash)
+                const flash = document.createElement('div');
+                flash.style.cssText =
+                    'position:absolute;inset:0;background:#fff;opacity:0;' +
+                    'pointer-events:none;z-index:2;';
+                overlay.appendChild(flash);
+
+                // 3. Speed lines – white/grey only, many more than before
+                const LN    = 200;
                 const lines = [];
-                const palette = ['#00d4ff','#8b5cf6','#ff0080','#a855f7','#ffffff','#00ffaa'];
+                const greys = ['#ffffff','#e0e0e0','#c0c0c0','#a0a0a0','#ffffff','#ffffff'];
                 for (let i = 0; i < LN; i++) {
-                    const el = document.createElement('div');
-                    el.className = 'hs-line';
-                    const angle = (i / LN) * 360;
-                    const col   = palette[i % palette.length];
+                    const el  = document.createElement('div');
+                    const ang = (i / LN) * 360;
+                    const col = greys[i % greys.length];
+                    const w   = 1 + Math.random() * 2.2;
                     el.style.cssText =
                         'position:absolute;top:50%;left:50%;width:0;' +
-                        'height:' + (1 + Math.random()*2.5) + 'px;' +
+                        'height:' + w + 'px;' +
                         'background:' + col + ';' +
-                        'box-shadow:0 0 8px 2px ' + col + ';' +
-                        'transform:rotate(' + angle + 'deg);' +
+                        'box-shadow:0 0 6px 1px ' + col + ';' +
+                        'transform:rotate(' + ang + 'deg);' +
                         'transform-origin:left center;' +
-                        'pointer-events:none;opacity:0.95;';
+                        'pointer-events:none;opacity:0.92;';
                     overlay.appendChild(el);
                     lines.push(el);
                 }
+
+                // 4. Radial vignette that tightens to black (event horizon)
+                const vignette = document.createElement('div');
+                vignette.style.cssText =
+                    'position:absolute;inset:0;pointer-events:none;z-index:3;' +
+                    'background:radial-gradient(ellipse 120% 120% at 50% 50%,' +
+                    'transparent 0%,rgba(0,0,0,0.0) 30%,rgba(0,0,0,0.85) 100%);' +
+                    'opacity:0;';
+                overlay.appendChild(vignette);
+
                 if (typeof anime !== 'undefined') {
+                    // flash white then dark
+                    anime({ targets: flash, opacity: [0, 0.85, 0],
+                            duration: 280, easing: 'easeOutQuad' });
+
+                    // lines rocket outward
                     anime({
                         targets: lines,
-                        width: function() { return (40 + Math.random()*90) + 'vw'; },
-                        opacity: [0.95, 0],
-                        duration: 650,
-                        delay: anime.stagger(2),
-                        easing: 'easeOutExpo',
-                        complete: onDone
+                        width: function() { return (50 + Math.random() * 80) + 'vw'; },
+                        opacity: [0.92, 0],
+                        duration: 700,
+                        delay: anime.stagger(1.5),
+                        easing: 'easeOutExpo'
+                    });
+
+                    // vignette closes in (black hole swallows the frame)
+                    anime({
+                        targets: vignette,
+                        opacity: [0, 1],
+                        duration: 680,
+                        easing: 'easeInQuart',
+                        complete: () => {
+                            // remove grayscale so the fade-out to next page is clean
+                            overlay.style.filter = '';
+                            onDone();
+                        }
                     });
                 } else {
-                    setTimeout(onDone, 700);
+                    overlay.style.filter = '';
+                    setTimeout(onDone, 720);
                 }
             }
 
@@ -3141,7 +4386,7 @@ document.addEventListener('mousemove', function(e) {
                         }
                         cl.geo.attributes.position.needsUpdate = true;
                     });
-                    if (phaseT >= 0.85) { phase = 1; phaseT = 0; }
+                    if (phaseT >= 1.85) { phase = 1; phaseT = 0; }
                 }
                 // Phase 1 – Converge (0.85s)
                 else if (phase === 1) {
@@ -3155,6 +4400,9 @@ document.addEventListener('mousemove', function(e) {
                     outerMat.opacity = ease * 0.3;
                     orbMesh.scale.setScalar(1 + ease * 0.5);
                     camera.position.z = 5.5 - ease * 2.0;
+                    // gradually drain colour during convergence
+                    renderer.domElement.style.filter =
+                        'grayscale(' + (ease * 0.7).toFixed(2) + ') contrast(' + (1 + ease * 0.4).toFixed(2) + ')';
                     if (pg > 0.5) shake(3 * ease);
                     if (pg >= 1) { phase = 2; phaseT = 0; }
                 }
@@ -3169,6 +4417,9 @@ document.addEventListener('mousemove', function(e) {
                     outerMat.opacity = pg * 1.5;
                     orbMesh.scale.setScalar(1.5 + pg * 5);
                     camera.position.z = 3.5 - pg * 1.5;
+                    // full grayscale + high contrast at peak of flash
+                    renderer.domElement.style.filter =
+                        'grayscale(1) contrast(' + (1.4 + pg * 0.8).toFixed(2) + ') brightness(' + (1 + pg * 0.5).toFixed(2) + ')';
                     shake(5 * (1 - pg * 0.4));
                     if (pg >= 1) {
                         phase = 3; phaseT = 0;
@@ -3199,6 +4450,957 @@ document.addEventListener('mousemove', function(e) {
         });
     }
 })();
+</script>
+
+<script>
+// =============================================================================
+//  RO-ANIME  —  AUTH · WATCHLIST · DOWNLOADS
+// =============================================================================
+(function() {
+'use strict';
+
+const API = '';   // same origin
+
+// ── tiny helpers ──────────────────────────────────────────────────────────────
+function qs(sel) { return document.querySelector(sel); }
+function fmtBytes(b) {
+    if (!b) return '';
+    if (b < 1024*1024) return (b/1024).toFixed(1)+' KB';
+    return (b/1024/1024).toFixed(1)+' MB';
+}
+function fmtDate(ts) {
+    if (!ts) return '';
+    return new Date(ts*1000).toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' });
+}
+function authHeader() {
+    const t = localStorage.getItem('ro_token');
+    return t ? { 'Authorization': 'Bearer '+t } : {};
+}
+async function apiPost(path, body) {
+    const r = await fetch(API+path, {
+        method:'POST', headers: { 'Content-Type':'application/json', ...authHeader() },
+        body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.detail || r.statusText); }
+    return r.json();
+}
+async function apiGet(path) {
+    const r = await fetch(API+path, { headers: authHeader() });
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+}
+async function apiDelete(path) {
+    const r = await fetch(API+path, { method:'DELETE', headers: authHeader() });
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+}
+
+// =============================================================================
+//  AUTH STATE
+// =============================================================================
+let _user = null;   // { username }
+
+function isLoggedIn() { return !!_user; }
+
+async function initAuth() {
+    const token = localStorage.getItem('ro_token');
+    if (!token) return;
+    try {
+        const me = await apiGet('/auth/me');
+        _user = me;
+        renderAuthHeader();
+    } catch(e) {
+        localStorage.removeItem('ro_token');
+        localStorage.removeItem('ro_username');
+    }
+}
+
+function renderAuthHeader() {
+    const slot = document.getElementById('headerAuthSlot');
+    if (!slot) return;
+    if (_user) {
+        const initial = (_user.username||'?')[0].toUpperCase();
+        slot.innerHTML = `
+            <div class="header-user-chip" onclick="goProfile()">
+                <div class="header-user-avatar">${initial}</div>
+                <span class="header-user-name">${_user.username}</span>
+            </div>`;
+    } else {
+        slot.innerHTML = `<button class="header-auth-btn" onclick="openAuthModal()">Sign In</button>`;
+    }
+}
+
+// =============================================================================
+//  AUTH MODAL
+// =============================================================================
+let _authMode = 'login';
+
+window.openAuthModal = function() {
+    document.getElementById('authModalBg').classList.add('open');
+    document.getElementById('authError').textContent = '';
+    document.getElementById('authUsername').value = '';
+    document.getElementById('authPassword').value = '';
+    switchAuthTab('login');
+    setTimeout(() => document.getElementById('authUsername').focus(), 80);
+};
+window.closeAuthModal = function() {
+    document.getElementById('authModalBg').classList.remove('open');
+};
+window.switchAuthTab = function(mode) {
+    _authMode = mode;
+    document.getElementById('authTabLogin').classList.toggle('active', mode==='login');
+    document.getElementById('authTabRegister').classList.toggle('active', mode==='register');
+    document.getElementById('authSubmitBtn').textContent = mode==='login' ? 'LOGIN' : 'CREATE ACCOUNT';
+    document.getElementById('authError').textContent = '';
+};
+window.submitAuth = async function() {
+    const username = document.getElementById('authUsername').value.trim();
+    const password = document.getElementById('authPassword').value.trim();
+    const errEl    = document.getElementById('authError');
+    const btn      = document.getElementById('authSubmitBtn');
+    errEl.textContent = '';
+    btn.disabled = true; btn.textContent = '...';
+    try {
+        const path = _authMode === 'login' ? '/auth/login' : '/auth/register';
+        const data = await apiPost(path, { username, password });
+        localStorage.setItem('ro_token', data.token);
+        localStorage.setItem('ro_username', data.username);
+        _user = { username: data.username };
+        renderAuthHeader();
+        closeAuthModal();
+        // reload watchlist state for current page
+        await loadUserState();
+    } catch(e) {
+        errEl.textContent = e.message || 'Something went wrong';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = _authMode === 'login' ? 'LOGIN' : 'CREATE ACCOUNT';
+    }
+};
+
+// enter key in auth fields
+['authUsername','authPassword'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('keydown', e => { if (e.key==='Enter') window.submitAuth(); });
+});
+
+// click outside to close
+document.getElementById('authModalBg').addEventListener('click', function(e) {
+    if (e.target === this) closeAuthModal();
+});
+
+window.doLogout = function() {
+    localStorage.removeItem('ro_token');
+    localStorage.removeItem('ro_username');
+    _user = null;
+    _watchlistSet.clear();
+    renderAuthHeader();
+    updateWatchlistBtn();
+    goHome();
+};
+
+// =============================================================================
+//  WATCHLIST STATE  (in-memory Set of mal_ids)
+// =============================================================================
+const _watchlistSet = new Set();
+
+async function loadUserState() {
+    if (!isLoggedIn()) return;
+    try {
+        const wl = await apiGet('/user/watchlist');
+        _watchlistSet.clear();
+        wl.forEach(w => _watchlistSet.add(String(w.mal_id)));
+        updateWatchlistBtn();
+    } catch(e) {}
+}
+
+function updateWatchlistBtn() {
+    const btn    = document.getElementById('wlHeartBtn');
+    const heart  = document.getElementById('wlHeart');
+    const label  = document.getElementById('wlLabel');
+    if (!btn) return;
+    if (!isLoggedIn()) {
+        btn.style.display = 'none'; return;
+    }
+    btn.style.display = '';
+    const malId  = window.currentStreamData?.mal_id || '';
+    const inWl   = malId && _watchlistSet.has(String(malId));
+    btn.classList.toggle('in-wl', inWl);
+    if (heart) heart.textContent = inWl ? '♥' : '♡';
+    if (label) label.textContent = inWl ? 'In Watchlist' : 'Add to Watchlist';
+}
+
+window.toggleWatchlist = async function() {
+    if (!isLoggedIn()) { openAuthModal(); return; }
+    const sd    = window.currentStreamData;
+    if (!sd || !sd.mal_id) return;
+    const malId = String(sd.mal_id);
+    const inWl  = _watchlistSet.has(malId);
+    try {
+        if (inWl) {
+            await apiDelete('/user/watchlist/'+malId);
+            _watchlistSet.delete(malId);
+        } else {
+            await apiPost('/user/watchlist', {
+                mal_id: malId, title: sd.title,
+                image_url: sd.image_url || '',
+                episodes: sd.episodes?.length || 0
+            });
+            _watchlistSet.add(malId);
+        }
+        updateWatchlistBtn();
+    } catch(e) { console.error('Watchlist toggle failed', e); }
+};
+
+// =============================================================================
+//  WATCH HISTORY  — saves every 10 s, deduplicates, stores playback position
+// =============================================================================
+let _histSavedKey     = '';   // last saved "malId_ep_N"
+let _histSavedPos     = 0;    // position at last save
+let _histInterval     = null;
+let _histSaveInFlight = false;
+
+async function _doSaveHistory(forcePos) {
+    if (!isLoggedIn() || _histSaveInFlight) return;
+    const sd  = window.currentStreamData;
+    if (!sd || !sd.mal_id) return;
+    const vid = document.getElementById('roVideoEl');
+    const pos = forcePos != null ? forcePos : (vid ? vid.currentTime : 0);
+
+    // dedup: skip if same episode AND position hasn't moved >5 s
+    const key = `${sd.mal_id}_ep_${sd.ep}`;
+    if (key === _histSavedKey && Math.abs(pos - _histSavedPos) < 5) return;
+
+    _histSaveInFlight = true;
+    try {
+        await apiPost('/user/history', {
+            mal_id: sd.mal_id, title: sd.title,
+            image_url: sd.image_url || '', episode: sd.ep,
+            playback_pos: Math.floor(pos)
+        });
+        _histSavedKey = key;
+        _histSavedPos = pos;
+    } catch(e) {
+        // silent
+    } finally {
+        _histSaveInFlight = false;
+    }
+}
+
+function _startHistoryTimer() {
+    _stopHistoryTimer();
+    _histInterval = setInterval(() => {
+        const vid = document.getElementById('roVideoEl');
+        if (vid && !vid.paused && vid.currentTime > 5) _doSaveHistory();
+    }, 10000);   // every 10 seconds
+}
+
+function _stopHistoryTimer() {
+    if (_histInterval) { clearInterval(_histInterval); _histInterval = null; }
+}
+
+// Save position when user leaves the page
+window.addEventListener('beforeunload', () => {
+    const vid = document.getElementById('roVideoEl');
+    if (vid && vid.currentTime > 2) _doSaveHistory(vid.currentTime);
+});
+
+// hook into the existing video element
+(function hookHistoryOnPlay() {
+    const check = () => {
+        const vid = document.getElementById('roVideoEl');
+        if (!vid) { setTimeout(check, 500); return; }
+        vid.addEventListener('playing', _startHistoryTimer);
+        vid.addEventListener('pause',   _stopHistoryTimer);
+        vid.addEventListener('ended',   _stopHistoryTimer);
+    };
+    check();
+})();
+
+// =============================================================================
+//  INDEXED DB  — offline video storage
+// =============================================================================
+const IDB_NAME    = 'ro-anime-dl';
+const IDB_VERSION = 1;
+const IDB_STORE   = 'episodes';
+
+function openIDB() {
+    return new Promise((res, rej) => {
+        const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+        req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
+        req.onsuccess = e => res(e.target.result);
+        req.onerror   = e => rej(e.target.error);
+    });
+}
+async function idbPut(key, value) {
+    const db = await openIDB();
+    return new Promise((res, rej) => {
+        const tx  = db.transaction(IDB_STORE, 'readwrite');
+        const req = tx.objectStore(IDB_STORE).put(value, key);
+        req.onsuccess = () => res();
+        req.onerror   = e => rej(e.target.error);
+        tx.oncomplete = () => db.close();
+    });
+}
+async function idbGet(key) {
+    const db = await openIDB();
+    return new Promise((res, rej) => {
+        const tx  = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).get(key);
+        req.onsuccess = e => { res(e.target.result); db.close(); };
+        req.onerror   = e => rej(e.target.error);
+    });
+}
+async function idbDelete(key) {
+    const db = await openIDB();
+    return new Promise((res, rej) => {
+        const tx  = db.transaction(IDB_STORE, 'readwrite');
+        const req = tx.objectStore(IDB_STORE).delete(key);
+        req.onsuccess = () => { res(); db.close(); };
+        req.onerror   = e => rej(e.target.error);
+    });
+}
+
+// =============================================================================
+//  DOWNLOAD MANAGER  — parallel backend download, multiple concurrent, live UI
+// =============================================================================
+
+// Map of taskId → task object (mirrored from backend status)
+const _dlTasks    = new Map();
+let   _dlPollTid  = null;   // setInterval handle
+
+// ── player download button helpers ──────────────────────────────────────────
+function setDlBtn(state, label) {
+    const btn  = document.getElementById('dlBtn');
+    const icon = document.getElementById('dlIcon');
+    const lbl  = document.getElementById('dlLabel');
+    if (!btn) return;
+    btn.className = 'dl-btn-wrap';
+    if (state === 'downloading') { btn.classList.add('downloading'); if(icon) icon.textContent='⏳'; }
+    else if (state === 'done')   { btn.classList.add('done');        if(icon) icon.textContent='✔'; }
+    else                          {                                   if(icon) icon.textContent='⬇'; }
+    if (lbl) lbl.textContent = label || 'Download EP';
+}
+function setDlProgress(pct) {
+    const bar  = document.getElementById('dlProgressBar');
+    const fill = document.getElementById('dlProgressFill');
+    if (!bar || !fill) return;
+    if (pct >= 100 || pct < 0) { bar.classList.remove('visible'); return; }
+    bar.classList.add('visible');
+    fill.style.width = pct + '%';
+}
+
+// ── start a download (no lock — multiple concurrent allowed) ─────────────────
+window.startDownload = async function() {
+    if (!isLoggedIn()) { openAuthModal(); return; }
+    const sd     = window.currentStreamData;
+    const hlsUrl = window._currentHlsUrl || '';
+    if (!sd || !sd.mal_id) return;
+    if (!hlsUrl) {
+        setDlBtn('idle', '⚠ No stream');
+        setTimeout(() => setDlBtn('idle','Download EP'), 3000);
+        return;
+    }
+
+    const idbKey = `${sd.mal_id}_ep_${sd.ep}`;
+
+    // Already downloaded locally?
+    const cached = await idbGet(idbKey).catch(()=>null);
+    if (cached && cached.videoBlob) { setDlBtn('done','✔ Downloaded'); return; }
+
+    try {
+        setDlBtn('downloading', 'Starting…');
+        const data = await apiPost('/api/dl/start', {
+            m3u8_url:     hlsUrl,
+            subtitle_url: window._currentSubFile || null,
+            mal_id:       sd.mal_id,
+            title:        sd.title,
+            episode:      sd.ep,
+            image_url:    sd.image_url || '',
+            idb_key:      idbKey,
+        });
+        const taskId = data.task_id;
+        // Optimistically add to local map so UI shows immediately
+        _dlTasks.set(taskId, {
+            task_id: taskId, status: 'queued', progress: 0,
+            done: 0, total: 0, bytes_done: 0, size_bytes: 0,
+            mal_id: sd.mal_id, title: sd.title, episode: sd.ep,
+            image_url: sd.image_url || '', idb_key: idbKey,
+            has_subs: false, _idb_saved: false,
+        });
+        _startDlPolling();
+        // Refresh downloads tab if visible
+        _refreshDlPaneIfOpen();
+    } catch(e) {
+        setDlBtn('idle', '⚠ Failed: ' + (e.message||''));
+        setTimeout(() => setDlBtn('idle','Download EP'), 4000);
+    }
+};
+
+// ── polling ───────────────────────────────────────────────────────────────────
+function _startDlPolling() {
+    if (_dlPollTid) return;
+    _dlPollTid = setInterval(_pollDlStatus, 1500);
+    _pollDlStatus();   // fire immediately
+}
+function _stopDlPolling() {
+    if (_dlPollTid) { clearInterval(_dlPollTid); _dlPollTid = null; }
+}
+
+async function _pollDlStatus() {
+    if (!isLoggedIn()) return;
+    let tasks;
+    try { tasks = await apiGet('/api/dl/status'); } catch(e) { return; }
+
+    let anyActive = false;
+    const sd = window.currentStreamData;
+
+    for (const t of tasks) {
+        _dlTasks.set(t.task_id, { ..._dlTasks.get(t.task_id), ...t });
+
+        // Update player button if this task matches current episode
+        if (sd && String(t.mal_id) === String(sd.mal_id) && t.episode === sd.ep) {
+            if (t.status === 'done') {
+                setDlBtn('done','✔ Downloaded'); setDlProgress(-1);
+            } else if (t.status === 'error') {
+                setDlBtn('idle','⚠ Failed'); setDlProgress(-1);
+            } else {
+                setDlBtn('downloading', t.progress + '%'); setDlProgress(t.progress);
+            }
+        }
+
+        if (t.status !== 'done' && t.status !== 'error') anyActive = true;
+
+        // When a task finishes, fetch its file and store in IndexedDB
+        const local = _dlTasks.get(t.task_id);
+        if (t.status === 'done' && local && !local._idb_saved) {
+            local._idb_saved = true;   // prevent double-fetch
+            _saveDlToIDB(t);
+        }
+    }
+
+    _refreshDlPaneIfOpen();
+
+    if (!anyActive && tasks.length > 0) _stopDlPolling();
+}
+
+async function _saveDlToIDB(task) {
+    try {
+        // Fetch merged video from backend
+        const vidResp = await fetch(`/api/dl/file/${task.task_id}`,
+            { headers: authHeader() });
+        if (!vidResp.ok) throw new Error('File fetch ' + vidResp.status);
+        const videoBlob = await vidResp.blob();
+
+        // Fetch subtitle if available
+        let subData = null;
+        if (task.has_subs) {
+            try {
+                const sr = await fetch(`/api/dl/subtitle/${task.task_id}`,
+                    { headers: authHeader() });
+                if (sr.ok) subData = await sr.text();
+            } catch(e) {}
+        }
+
+        // Save to IndexedDB
+        await idbPut(task.idb_key, { videoBlob, subData, meta: task });
+
+        // Save metadata to backend persistent store
+        await apiPost('/user/downloads', {
+            mal_id: task.mal_id, title: task.title, episode: task.episode,
+            image_url: task.image_url, idb_key: task.idb_key,
+            size_bytes: task.size_bytes, has_subs: !!subData
+        });
+
+        // Tell backend to free memory
+        await apiDelete(`/api/dl/task/${task.task_id}`).catch(()=>{});
+
+        // Remove from active map — now it lives in IndexedDB + /user/downloads
+        _dlTasks.delete(task.task_id);
+        _refreshDlPaneIfOpen();
+
+    } catch(e) {
+        console.error('[DL] IDB save failed:', e);
+    }
+}
+
+// Refresh the downloads tab — update active rows in-place, full rebuild only when needed
+function _refreshDlPaneIfOpen() {
+    const pane = document.getElementById('pane-downloads');
+    if (!pane || !pane.classList.contains('active')) return;
+
+    const list = document.getElementById('downloadsList');
+    if (!list) return;
+
+    // Check if active rows already exist in the DOM
+    const existingActive = list.querySelectorAll('.dl-item.dl-active');
+    const activeIds = new Set([..._dlTasks.keys()].filter(id => !_dlTasks.get(id)._idb_saved));
+
+    // If active count changed or there are new tasks not in DOM → full rebuild
+    let needsRebuild = existingActive.length !== activeIds.size;
+    if (!needsRebuild) {
+        existingActive.forEach(el => {
+            if (!activeIds.has(el.dataset.tid)) needsRebuild = true;
+        });
+    }
+
+    if (needsRebuild) {
+        renderDownloadsList();
+        return;
+    }
+
+    // Fast path: just update progress bars in-place
+    existingActive.forEach(el => {
+        const tid = el.dataset.tid;
+        const t   = _dlTasks.get(tid);
+        if (!t) return;
+        const pct = t.progress || 0;
+        const fill = el.querySelector('.dl-active-bar-fill');
+        const pctEl = el.querySelector('.dl-active-pct');
+        if (fill)  fill.style.width = pct + '%';
+        if (pctEl) {
+            const status = t.status || 'queued';
+            pctEl.textContent = status === 'probing'     ? 'Probing…'
+                              : status === 'downloading' ? `${pct}%`
+                              : status === 'merging'     ? 'Merging…'
+                              : status === 'error'       ? '⚠ Error'
+                              : 'Queued…';
+        }
+    });
+}
+
+// _currentHlsUrl is set directly inside the main script wherever HLS is loaded
+
+// =============================================================================
+//  PLAY DOWNLOADED VIDEO  (offline)
+// =============================================================================
+window.playDownloaded = async function(idbKey) {
+    const stored = await idbGet(idbKey).catch(()=>null);
+    if (!stored || !stored.videoBlob) {
+        alert('Download not found in this browser.\nTry re-downloading the episode.');
+        return;
+    }
+
+    // Navigate to the player section first
+    document.getElementById('profileSection').style.display        = 'none';
+    document.getElementById('homeSection').style.display           = 'none';
+    document.getElementById('searchResultsSection').style.display  = 'none';
+    document.getElementById('heroBanner').style.display            = 'none';
+    document.getElementById('streamingSection').style.display      = 'block';
+
+    // Tear down any live HLS session + previous offline session
+    if (window._destroyHls) window._destroyHls();
+
+    const vid = document.getElementById('roVideoEl');
+    if (!vid) return;
+
+    // Revoke previous blob URLs
+    if (vid._offlineBlobUrl)     { URL.revokeObjectURL(vid._offlineBlobUrl);     vid._offlineBlobUrl     = null; }
+    if (vid._offlineManifestUrl) { URL.revokeObjectURL(vid._offlineManifestUrl); vid._offlineManifestUrl = null; }
+
+    // Make sure the video element is visible (iframe may have taken over)
+    const iframeWrap = document.getElementById('roIframeWrap');
+    if (iframeWrap) iframeWrap.innerHTML = '';
+    vid.style.display = 'block';
+
+    // ── The downloaded file is a raw MPEG-TS blob (video/mp2t).
+    // Chrome cannot play mp2t directly in <video>; we use HLS.js which
+    // transmuxes TS→fMP4 on the fly. Trick: create a single-segment fake
+    // HLS manifest pointing at a blob: URL for the TS data.
+    const tsUrl = URL.createObjectURL(stored.videoBlob);
+    vid._offlineBlobUrl = tsUrl;
+
+    const manifest = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-TARGETDURATION:36000',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXTINF:36000.0,',
+        tsUrl,
+        '#EXT-X-ENDLIST'
+    ].join('\n');
+    const manifestBlob = new Blob([manifest], { type: 'application/vnd.apple.mpegurl' });
+    const manifestUrl  = URL.createObjectURL(manifestBlob);
+    vid._offlineManifestUrl = manifestUrl;
+
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+        const offlineHls = new Hls({
+            enableWorker:       false,  // avoids separate worker thread issues with blob URLs
+            maxBufferLength:    3600,
+            maxMaxBufferLength: 3600,
+        });
+        vid._offlineHls = offlineHls;
+        offlineHls.loadSource(manifestUrl);
+        offlineHls.attachMedia(vid);
+        offlineHls.on(Hls.Events.MANIFEST_PARSED, () => {
+            vid.play().catch(() => {});
+        });
+        offlineHls.on(Hls.Events.ERROR, (_evt, data) => {
+            if (data.fatal) console.error('[offline HLS] fatal error', data);
+        });
+    } else {
+        // Safari — native HLS can play the manifest directly
+        vid.src = manifestUrl;
+        vid.load();
+        vid.addEventListener('canplay', () => vid.play().catch(() => {}), { once: true });
+    }
+
+    // Attach subtitle track if present
+    [...vid.querySelectorAll('track')].forEach(t => t.remove());
+    if (stored.subData) {
+        const subBlob = new Blob([stored.subData], { type: 'text/vtt' });
+        const subUrl  = URL.createObjectURL(subBlob);
+        vid._offlineSubUrl = subUrl;
+        const track   = document.createElement('track');
+        track.kind    = 'subtitles';
+        track.label   = 'Subtitles';
+        track.srclang = 'en';
+        track.src     = subUrl;
+        track.default = true;
+        vid.appendChild(track);
+        vid.addEventListener('loadedmetadata', () => {
+            if (vid.textTracks[0]) vid.textTracks[0].mode = 'showing';
+        }, { once: true });
+    }
+
+    // Lock UI to offline mode — no server switching, no episode nav
+    if (window._setOfflineMode) window._setOfflineMode(true);
+
+    // Update status badge
+    const badge = document.getElementById('streamStatusBadge');
+    if (badge) { badge.textContent = '⬇ OFFLINE'; badge.className = 'stream-status live'; }
+};
+
+// =============================================================================
+//  PROFILE PAGE
+// =============================================================================
+window.goProfile = async function() {
+    if (!isLoggedIn()) { openAuthModal(); return; }
+    // hide everything
+    document.getElementById('streamingSection').style.display     = 'none';
+    document.getElementById('searchResultsSection').style.display = 'none';
+    document.getElementById('homeSection').style.display          = 'none';
+    document.getElementById('heroBanner').style.display           = 'none';
+    const ps = document.getElementById('profileSection');
+    ps.style.display = 'block';
+
+    // fill header
+    document.getElementById('profileAvatarLg').textContent = (_user.username||'?')[0].toUpperCase();
+    document.getElementById('profileUsername').textContent  = _user.username;
+
+    // load all data
+    await Promise.all([renderHistory(), renderWatchlist(), renderDownloadsList()]);
+    switchProfileTab('history');
+};
+
+window.switchProfileTab = function(tab) {
+    document.querySelectorAll('.profile-tab').forEach((btn, i) => {
+        const names = ['history','watchlist','downloads'];
+        btn.classList.toggle('active', names[i] === tab);
+    });
+    document.querySelectorAll('.profile-tab-pane').forEach(p => p.classList.remove('active'));
+    const pane = document.getElementById('pane-'+tab);
+    if (pane) pane.classList.add('active');
+};
+
+// ── History ───────────────────────────────────────────────────────────────────
+async function renderHistory() {
+    const list = document.getElementById('historyList');
+    if (!list) return;
+    list.innerHTML = '<div style="color:var(--text-tertiary);padding:20px 0;">Loading…</div>';
+    try {
+        const rows = await apiGet('/user/history');
+        if (!rows.length) {
+            list.innerHTML = '<div class="profile-empty"><div class="empty-icon">🎬</div>No watch history yet</div>'; return;
+        }
+        list.innerHTML = '';
+        rows.forEach(r => {
+            const pos     = r.playback_pos || 0;
+            const posStr  = pos > 5 ? ` · ▶ ${fmtSeconds(pos)}` : '';
+            const item    = document.createElement('div');
+            item.className = 'history-item';
+            item.innerHTML = `
+                <img class="history-thumb" src="${r.image_url||''}" alt="" onerror="this.style.display='none'">
+                <div class="history-info">
+                    <div class="history-title">${r.title}</div>
+                    <div class="history-ep">Episode ${r.episode}${posStr}</div>
+                    <div class="history-date">${fmtDate(r.watched_at)}</div>
+                </div>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--text-tertiary);flex-shrink:0;"><polyline points="9 18 15 12 9 6"/></svg>`;
+
+            item.addEventListener('click', () => resumeFromHistory(r));
+            list.appendChild(item);
+        });
+    } catch(e) {
+        list.innerHTML = '<div class="profile-empty"><div class="empty-icon">⚠</div>Could not load history</div>';
+    }
+}
+
+function fmtSeconds(s) {
+    s = Math.floor(s);
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+    return `${m}:${String(sec).padStart(2,'0')}`;
+}
+
+async function resumeFromHistory(r) {
+    document.getElementById('profileSection').style.display = 'none';
+
+    // Show streaming section right away with a loading state
+    document.getElementById('streamingSection').style.display = 'block';
+    document.getElementById('heroBanner').style.display       = 'none';
+    document.getElementById('homeSection').style.display      = 'none';
+    document.getElementById('searchResultsSection').style.display = 'none';
+
+    const titleEl = document.getElementById('displayTitle');
+    const epEl    = document.getElementById('displayEpisode');
+    if (titleEl) titleEl.textContent = r.title;
+    if (epEl)    epEl.textContent    = `Episode ${r.episode} — loading…`;
+
+    try {
+        // Fetch episode list silently
+        const resp = await fetch(`/anime/episode/${r.mal_id}`);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        const eps  = data.episodes || [];
+        const ep   = eps.find(e => parseInt(e.episode_number) === r.episode)
+                  || eps[0];
+        if (!ep) throw new Error('Episode not found');
+
+        const animeObj = { anime_id: r.mal_id, title: r.title, image_url: r.image_url };
+        await window.startStreaming(animeObj, ep, eps);
+
+        // Seek to saved position after stream starts
+        if (r.playback_pos > 5) {
+            const vid = document.getElementById('roVideoEl');
+            if (vid) {
+                const seekWhenReady = () => {
+                    vid.currentTime = r.playback_pos;
+                    vid.removeEventListener('canplay', seekWhenReady);
+                };
+                if (vid.readyState >= 3) {
+                    vid.currentTime = r.playback_pos;
+                } else {
+                    vid.addEventListener('canplay', seekWhenReady, { once: true });
+                }
+            }
+        }
+    } catch(err) {
+        if (epEl) epEl.textContent = '⚠ Could not resume — ' + err.message;
+    }
+}
+
+window.clearHistory = async function() {
+    if (!confirm('Clear all watch history?')) return;
+    try {
+        await apiDelete('/user/history');
+        await renderHistory();
+    } catch(e) {}
+};
+
+// ── Watchlist ─────────────────────────────────────────────────────────────────
+async function renderWatchlist() {
+    const grid = document.getElementById('watchlistGrid');
+    if (!grid) return;
+    grid.innerHTML = '<div style="color:var(--text-tertiary);padding:20px 0;">Loading…</div>';
+    try {
+        const rows = await apiGet('/user/watchlist');
+        if (!rows.length) {
+            grid.innerHTML = '<div class="profile-empty" style="grid-column:1/-1"><div class="empty-icon">♡</div>Watchlist is empty</div>'; return;
+        }
+        grid.innerHTML = '';
+        rows.forEach(r => {
+            const card = document.createElement('div');
+            card.className = 'wl-card';
+            card.innerHTML = `
+                <img src="${r.image_url||''}" alt="${r.title}" onerror="this.style.display='none'">
+                <div class="wl-card-info">
+                    <div class="wl-card-title">${r.title}</div>
+                    <div class="wl-card-eps">${r.episodes ? r.episodes+' eps' : ''}</div>
+                </div>
+                <button class="wl-remove-btn" title="Remove" data-id="${r.mal_id}">×</button>`;
+            card.querySelector('img').addEventListener('click', () => {
+                const anime = { anime_id: r.mal_id, title: r.title, image_url: r.image_url };
+                document.getElementById('profileSection').style.display = 'none';
+                if (typeof fetchEpisodes === 'function') fetchEpisodes(anime);
+            });
+            card.querySelector('.wl-remove-btn').addEventListener('click', async e => {
+                e.stopPropagation();
+                const id = e.currentTarget.dataset.id;
+                try {
+                    await apiDelete('/user/watchlist/'+id);
+                    _watchlistSet.delete(id);
+                    updateWatchlistBtn();
+                    card.remove();
+                    if (!grid.querySelector('.wl-card'))
+                        grid.innerHTML = '<div class="profile-empty" style="grid-column:1/-1"><div class="empty-icon">♡</div>Watchlist is empty</div>';
+                } catch(e) {}
+            });
+            grid.appendChild(card);
+        });
+    } catch(e) {
+        grid.innerHTML = '<div class="profile-empty">⚠ Could not load watchlist</div>';
+    }
+}
+
+// ── Downloads ─────────────────────────────────────────────────────────────────
+async function renderDownloadsList() {
+    const list = document.getElementById('downloadsList');
+    if (!list) return;
+
+    list.innerHTML = '<div style="color:var(--text-tertiary);padding:20px 0;">Loading…</div>';
+
+    // ── fetch completed downloads from backend ──────────────────────────────
+    let completed = [];
+    try { completed = await apiGet('/user/downloads'); } catch(e) {}
+
+    list.innerHTML = '';
+    let hasAny = false;
+
+    // ── 1. active / in-progress tasks from _dlTasks map (show first) ────────
+    for (const [taskId, t] of _dlTasks) {
+        if (t._idb_saved) continue;  // already moved to completed
+
+        hasAny = true;
+        const pct     = t.progress || 0;
+        const status  = t.status   || 'queued';
+        const label   = status === 'probing'     ? 'Probing…'
+                      : status === 'downloading' ? `${pct}%`
+                      : status === 'merging'     ? 'Merging…'
+                      : status === 'error'       ? '⚠ Error'
+                      : 'Queued…';
+
+        const item = document.createElement('div');
+        item.className  = 'dl-item dl-active';
+        item.dataset.tid = taskId;
+        item.innerHTML  = `
+            <img class="dl-thumb" src="${t.image_url||''}" alt="" onerror="this.style.display='none'">
+            <div class="dl-info" style="flex:1;min-width:0;">
+                <div class="dl-title">
+                    ${t.title||''}
+                    <span class="dl-active-badge">DOWNLOADING</span>
+                </div>
+                <div class="dl-meta">Episode ${t.episode||'?'}</div>
+                <div class="dl-active-bar">
+                    <div class="dl-active-bar-fill" style="width:${pct}%"></div>
+                </div>
+                <div class="dl-active-pct">${label}</div>
+            </div>
+            <div class="dl-actions">
+                <button class="dl-cancel-btn" data-tid="${taskId}">Cancel</button>
+            </div>`;
+
+        item.querySelector('.dl-cancel-btn').addEventListener('click', async function() {
+            const tid = this.dataset.tid;
+            _dlTasks.delete(tid);
+            await apiDelete(`/api/dl/task/${tid}`).catch(()=>{});
+            item.remove();
+            if (!list.querySelector('.dl-item'))
+                list.innerHTML = '<div class="profile-empty"><div class="empty-icon">⬇</div>No downloads yet<br><small style="opacity:.5">Hit Download EP while watching</small></div>';
+        });
+
+        list.appendChild(item);
+    }
+
+    // ── 2. completed downloads from backend ──────────────────────────────────
+    for (const r of completed) {
+        hasAny = true;
+        const item = document.createElement('div');
+        item.className = 'dl-item';
+        item.innerHTML = `
+            <img class="dl-thumb" src="${r.image_url||''}" alt="" onerror="this.style.display='none'">
+            <div class="dl-info">
+                <div class="dl-title">${r.title}</div>
+                <div class="dl-meta">Episode ${r.episode}${r.has_subs ? ' · SUB' : ''}</div>
+                <div class="dl-size">${fmtBytes(r.size_bytes)} · ${fmtDate(r.downloaded_at)}</div>
+            </div>
+            <div class="dl-actions">
+                <button class="dl-play-btn">▶ Play</button>
+                <button class="dl-del-btn">Delete</button>
+            </div>`;
+
+        item.querySelector('.dl-play-btn').addEventListener('click', () => {
+            document.getElementById('profileSection').style.display  = 'none';
+            document.getElementById('streamingSection').style.display = 'block';
+            window.currentStreamData = {
+                mal_id: r.mal_id, title: r.title,
+                ep: r.episode, episodes: [], image_url: r.image_url
+            };
+            const titleEl = document.getElementById('displayTitle');
+            const epEl    = document.getElementById('displayEpisode');
+            if (titleEl) titleEl.textContent = r.title;
+            if (epEl)    epEl.textContent    = 'Episode ' + r.episode + ' (Offline)';
+            window.playDownloaded(r.idb_key);
+            setDlBtn('done','✔ Downloaded');
+            updateWatchlistBtn();
+        });
+
+        item.querySelector('.dl-del-btn').addEventListener('click', async () => {
+            if (!confirm('Delete this download?')) return;
+            try {
+                await idbDelete(r.idb_key);
+                await apiDelete(`/user/downloads/${r.mal_id}/${r.episode}`);
+                item.remove();
+                if (!list.querySelector('.dl-item'))
+                    list.innerHTML = '<div class="profile-empty"><div class="empty-icon">⬇</div>No downloads yet</div>';
+            } catch(e) { alert('Delete failed'); }
+        });
+
+        list.appendChild(item);
+    }
+
+    if (!hasAny) {
+        list.innerHTML = '<div class="profile-empty"><div class="empty-icon">⬇</div>No downloads yet<br><small style="opacity:.5">Hit Download EP while watching</small></div>';
+    }
+}
+
+// =============================================================================
+//  HOOK INTO startStreaming  — update UI after page changes
+// =============================================================================
+const _origInitForAuth = window.startStreaming;
+window.startStreaming = async function(anime, episode, allEpisodes) {
+    if (typeof _origInitForAuth === 'function') {
+        await _origInitForAuth(anime, episode, allEpisodes);
+    }
+    // After the page switches, update auth-aware buttons
+    setTimeout(() => {
+        updateWatchlistBtn();
+        // reset download button
+        const sd = window.currentStreamData;
+        if (sd) {
+            const idbKey = `${sd.mal_id}_ep_${sd.ep}`;
+            idbGet(idbKey).then(stored => {
+                if (stored && stored.videoBlob) setDlBtn('done','✔ Downloaded');
+                else                            setDlBtn('idle','⬇ Download EP');
+            }).catch(()=> setDlBtn('idle','⬇ Download EP'));
+        }
+        setDlProgress(101);  // hide bar
+        // save current sub file reference
+        window._currentSubFile = window.roEnglishSubFile || null;
+    }, 400);
+
+    // reset history state for the new episode
+    _histSavedKey = '';
+    _histSavedPos = 0;
+    _startHistoryTimer();
+};
+
+// expose goHome augment to hide profileSection
+const _origGoHome = window.goHome;
+window.goHome = function() {
+    const ps = document.getElementById('profileSection');
+    if (ps) ps.style.display = 'none';
+    if (typeof _origGoHome === 'function') _origGoHome();
+};
+
+// =============================================================================
+//  BOOT
+// =============================================================================
+initAuth().then(() => {
+    loadUserState();
+});
+
+})(); // end IIFE
 </script>
 
 <footer style="text-align:center;padding:20px;color:var(--text-tertiary);font-size:11px;border-top:1px solid rgba(45,31,74,0.5);margin-top:40px;font-family:'Orbitron',sans-serif;letter-spacing:2px;text-transform:uppercase;position:relative;z-index:1;">
