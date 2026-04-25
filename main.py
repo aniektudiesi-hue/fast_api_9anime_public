@@ -397,37 +397,70 @@ async def _anilist_ep_map() -> dict[int, int]:
     _home_cache[ck] = ep_map
     return ep_map
 
-async def _anilist_episodes_for(mal_id: int) -> int:
-    """AniList per-anime query using new logic from FILE 2."""
+async def _anilist_episodes_for(mal_id: int) -> tuple[int, str]:
+    """Resolve aired-episode count for *mal_id*.
+
+    Returns (count, source). source is 'anilist', 'mal', or 'unknown'.
+    Only successful (count > 0) results are cached, so a transient AniList
+    outage no longer poisons the cache for 30 minutes with a fake 1-episode
+    list.
+    """
     ck = f"al_eps_{mal_id}"
-    if ck in _anime_cache:
-        return _anime_cache[ck]
+    cached = _anime_cache.get(ck)
+    if cached and cached[0] > 0:
+        return cached
+
+    count  = 0
+    source = "unknown"
+
+    # 1. AniList — best for currently-airing shows (nextAiringEpisode tracks
+    #    the live aired count). Status FINISHED/RELEASING uses total episodes.
     try:
-        r = await _http.post(ANILIST_GQL,
+        r = await _http.post(
+            ANILIST_GQL,
             json={"query": GQL_ANIME_EPS, "variables": {"malId": mal_id}},
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+            timeout=httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=4.0),
+        )
         r.raise_for_status()
         data = r.json().get("data", {}).get("Media") or {}
-        
-        status = data.get('status')
-        total_episodes = data.get('episodes')
-        next_airing = data.get('nextAiringEpisode')
-        
-        if next_airing:
-            count = next_airing['episode'] - 1
-        elif status == 'FINISHED':
-            count = total_episodes if total_episodes else 0
-        elif status == 'RELEASING':
-            count = total_episodes if total_episodes else 0
-        elif status == 'NOT_YET_RELEASED':
-            count = 0
-        else:
-            count = 0
+        status         = data.get("status")
+        total_episodes = data.get("episodes")
+        next_airing    = data.get("nextAiringEpisode")
+
+        if next_airing and next_airing.get("episode"):
+            count = max(next_airing["episode"] - 1, 0)
+            source = "anilist"
+        elif status in ("FINISHED", "RELEASING") and total_episodes:
+            count = total_episodes
+            source = "anilist"
     except Exception as e:
-        logger.warning("AniList per-anime eps failed mal_id=%s: %s", mal_id, e)
-        count = 0
-    _anime_cache[ck] = count
-    return count
+        logger.warning("AniList eps mal_id=%s failed: %s", mal_id, e)
+
+    # 2. MAL fallback — reliable for finished anime, fast (we already hold a
+    #    persistent client to api.myanimelist.net). Skipped if AniList already
+    #    answered.
+    if count <= 0:
+        try:
+            mal = await _mal_get(f"/anime/{mal_id}", fields="num_episodes,status")
+            num_eps    = mal.get("num_episodes") or 0
+            mal_status = mal.get("status") or ""
+            if num_eps > 0:
+                count = num_eps
+                source = "mal"
+            elif mal_status == "currently_airing":
+                # Airing show with unknown total — the only safe fallback is
+                # 'unknown'. Don't fake it.
+                pass
+        except Exception as e:
+            logger.warning("MAL eps mal_id=%s failed: %s", mal_id, e)
+
+    if count > 0:
+        # Long TTL when we know it's done (it never changes); short TTL when
+        # we got the count from a live nextAiringEpisode (it shifts weekly).
+        _anime_cache[ck] = (count, source)
+
+    return count, source
 
 # ---------------------------------------------------------------------------
 # MAL SEASONAL
@@ -939,21 +972,32 @@ async def suggest_anime(query: str):
 
 # --- episodes ---------------------------------------------------------------
 @app.get("/anime/episode/{mal_id}")
-async def get_episodes(mal_id: str):
+async def get_episodes(mal_id: str, hint: int = 0):
+    """Episode list for an anime.
+
+    *hint* — if the frontend already knows the count from a homepage card or
+    search result, it can pass it as a query param so we serve immediately
+    without waiting on AniList/MAL. We still kick off a refresh in the
+    background to upgrade the cache.
+    """
     ck = f"episodes:{mal_id}"
-    if ck in _anime_cache:
-        return _anime_cache[ck]
+    cached = _anime_cache.get(ck)
+    if cached and cached.get("num_episodes", 0) > 0:
+        return cached
 
-    # Use the new logic to get episode count
-    num_eps = await _anilist_episodes_for(int(mal_id))
+    num_eps, source = await _anilist_episodes_for(int(mal_id))
 
-    # Absolute floor — never return an empty episode list.
-    if num_eps == 0:
-        num_eps = 1
-        logger.warning("Episode count unknown for mal_id=%s; defaulting to 1", mal_id)
+    if num_eps <= 0 and hint > 0:
+        num_eps, source = hint, "hint"
+
+    if num_eps <= 0:
+        # Don't fabricate a fake 1-episode list — that confuses users with an
+        # empty player. Surface the failure so the frontend retries.
+        raise HTTPException(503, "Episode count unavailable, please retry")
 
     episodes = [{"episode_number": i} for i in range(1, num_eps + 1)]
-    result   = {"anime_id": mal_id, "num_episodes": num_eps, "episodes": episodes}
+    result   = {"anime_id": mal_id, "num_episodes": num_eps,
+                "episodes": episodes, "source": source}
     _anime_cache[ck] = result
     return result
 

@@ -3153,34 +3153,59 @@ document.addEventListener('mousemove', function(e) {
     async function fetchEpisodes(anime) {
         const overlay   = document.getElementById('episodeOverlay');
         const container = document.getElementById('episodesContainer');
-        if (!overlay.classList.contains('active')) {
-            container.innerHTML = '<div class="episode-loading"><div class="episode-spinner"></div><div class="episode-loading-text">LOADING EPISODES...</div></div>';
-            document.getElementById('overlayTitle').textContent = anime.title;
-            overlay.classList.add('active');
-        } else {
-            document.getElementById('overlayTitle').textContent = anime.title;
+        document.getElementById('overlayTitle').textContent = anime.title;
+        if (!overlay.classList.contains('active')) overlay.classList.add('active');
+
+        // Optimistic render: if we already know the episode count from the
+        // homepage card / search result, paint placeholder episodes instantly
+        // and refresh once the backend confirms.
+        const knownCount = parseInt(anime.episode_count || 0, 10);
+        const ck = `episodes_${anime.anime_id}`;
+
+        if (apiCache.has(ck)) {
+            renderEpisodes(anime, apiCache.get(ck));
+            return;
         }
 
-        const ck = `episodes_${anime.anime_id}`;
-        if (apiCache.has(ck)) { renderEpisodes(anime, apiCache.get(ck)); return; }
+        if (knownCount > 0) {
+            const stub = Array.from({ length: knownCount },
+                                    (_, i) => ({ episode_number: i + 1 }));
+            renderEpisodes(anime, stub);
+        } else {
+            container.innerHTML = '<div class="episode-loading"><div class="episode-spinner"></div><div class="episode-loading-text">LOADING EPISODES...</div></div>';
+        }
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        // Confirm with backend (with hint to skip the slow path when possible)
+        const url = `${API_BASE}/anime/episode/${anime.anime_id}` +
+                    (knownCount > 0 ? `?hint=${knownCount}` : '');
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-                const r    = await fetch(`${API_BASE}/anime/episode/${anime.anime_id}`);
+                const r = await fetch(url);
+                if (r.status === 503) throw new Error('upstream-unknown');
                 if (!r.ok) throw new Error(`HTTP ${r.status}`);
                 const data = await r.json();
                 const eps  = data.episodes || [];
-                if (!eps.length) throw new Error('Empty list');
+                if (!eps.length) throw new Error('empty');
                 apiCache.set(ck, eps);
                 renderEpisodes(anime, eps);
                 return;
-            } catch(err) {
-                if (attempt === 1) await new Promise(r => setTimeout(r, 900));
-                else container.innerHTML = `<div style="text-align:center;padding:30px;">
-                    <p style="color:var(--accent-pink);margin-bottom:16px;">\u26a0 Could not load episodes.</p>
-                    <button onclick="fetchEpisodes(${JSON.stringify(anime).replace(/"/g,'&quot;')})"
-                        style="padding:8px 20px;background:var(--accent-pink);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:700;">RETRY</button>
-                </div>`;
+            } catch (err) {
+                if (attempt < 3) {
+                    await new Promise(r => setTimeout(r, 600 * attempt));
+                    continue;
+                }
+                // Out of attempts. If we already showed an optimistic stub,
+                // leave it in place \u2014 better than wiping it. Otherwise show
+                // a retry button.
+                if (knownCount <= 0) {
+                    container.innerHTML = `<div style="text-align:center;padding:30px;">
+                        <p style="color:var(--accent-pink);margin-bottom:16px;">\u26a0 Could not load episodes.</p>
+                        <button onclick='fetchEpisodes(${JSON.stringify(anime).replace(/"/g,'&quot;')})'
+                            style="padding:8px 20px;background:var(--accent-pink);color:white;border:none;border-radius:6px;cursor:pointer;font-weight:700;">RETRY</button>
+                    </div>`;
+                }
+                return;
             }
         }
     }
