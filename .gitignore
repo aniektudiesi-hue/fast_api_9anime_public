@@ -7,3 +7,5 @@ __pycache__/
 *.txt.bak
 New Text Document.txt
 .env
+.venv/
+venv/
