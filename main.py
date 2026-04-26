@@ -122,6 +122,63 @@ PROXY_HEADERS = {
     "Referer": f"{MEGAPLAY_BASE}/",
 }
 
+# Per-upstream policy. Several CDNs reject requests that carry the wrong
+# Referer OR the wrong User-Agent. The Moon CDN (sprintcdn / r66nv9ed.com)
+# specifically returns 404 to:
+#   - the Android-Chrome UA we use globally for megaplay
+#   - any request with Referer megaplay.buzz
+# Map upstream host -> (referer, desktop_ua_or_none, curl_cffi_impersonate).
+#
+# Verified empirically against r66nv9ed.com:
+#   Android UA + chrome131_android impersonate -> 404
+#   Desktop UA + chrome120 impersonate         -> 200  (any Referer including none)
+#
+# Anything not matched falls back to the megaplay defaults.
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# host substring -> (referer, user_agent, impersonate_profile)
+_UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
+    # Moon stack — DESKTOP UA mandatory
+    ("r66nv9ed.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
+    ("sprintcdn",         "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
+    ("bysesayeveum.com",  "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
+    ("398fitus.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
+    # HD / workers stack
+    ("workers.dev",       "https://9animetv.org.lv/", DESKTOP_UA, "chrome120"),
+    ("owocdn.top",        "https://9animetv.org.lv/", DESKTOP_UA, "chrome120"),
+    ("gogoanime.me.uk",   "https://9animetv.org.lv/", DESKTOP_UA, "chrome120"),
+)
+
+
+def _proxy_call_for(url: str) -> tuple[dict, str]:
+    """Return (headers, impersonate_profile) tuned for *url*.
+
+    The Origin/Referer/UA must match what the upstream's hotlink filter
+    expects. Falls back to the megaplay defaults for anything we don't
+    recognise.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    for needle, ref, ua, imp in _UPSTREAM_POLICY:
+        if needle in host:
+            origin = ref.rstrip("/")
+            return {
+                "User-Agent":      ua,
+                "Accept":          "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin":          origin,
+                "Referer":         ref,
+            }, imp
+    return PROXY_HEADERS, IMPERSONATE
+
+
+# Backward-compat shim — older internal callers still use this name.
+def _proxy_headers_for(url: str) -> dict:
+    return _proxy_call_for(url)[0]
+
 # ---------------------------------------------------------------------------
 # CACHES
 # ---------------------------------------------------------------------------
@@ -1051,9 +1108,10 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     loop = asyncio.get_running_loop()
+    headers, impersonate = _proxy_call_for(url)
     try:
         r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=PROXY_HEADERS, impersonate=IMPERSONATE, timeout=15))
+            url, headers=headers, impersonate=impersonate, timeout=15))
     except Exception as e:
         raise HTTPException(502, f"Upstream fetch failed: {e}")
     if r.status_code != 200:
@@ -1068,9 +1126,10 @@ async def proxy_chunk(src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     loop = asyncio.get_running_loop()
+    headers, impersonate = _proxy_call_for(url)
     try:
         r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=PROXY_HEADERS, impersonate=IMPERSONATE, timeout=30))
+            url, headers=headers, impersonate=impersonate, timeout=30))
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
     if r.status_code != 200:
