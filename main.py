@@ -925,13 +925,30 @@ async def search_anime(query: str):
     ck = f"search:{query.lower()}"
     if ck in _search_cache:
         return {"results": _search_cache[ck]}
+
+    async def _try(q: str):
+        return await _mal_get("/anime", q=q, limit=25, fields=_SEARCH_FIELDS)
+
     try:
-        data = await _mal_get("/anime", q=query, limit=25, fields=_SEARCH_FIELDS)
+        data = await _try(query)
+        nodes = [e["node"] for e in data.get("data", [])]
+
+        # MAL silently returns 0 results for queries longer than ~70 chars.
+        # If we got nothing AND the query is suspiciously long, retry with a
+        # shortened version (first 4-5 alphabetic words) so users who clicked
+        # a suggestion (which inserts the full English title) still get hits.
+        if not nodes and len(query) > 50:
+            words = re.findall(r"[A-Za-z0-9']+", query)
+            if len(words) > 4:
+                short = " ".join(words[:5])
+                logger.info("Search retry: '%s' -> '%s'", query, short)
+                data  = await _try(short)
+                nodes = [e["node"] for e in data.get("data", [])]
+
     except httpx.HTTPStatusError as e:
         raise HTTPException(e.response.status_code, f"MAL {e.response.status_code}")
     except Exception as e:
         raise HTTPException(502, f"Search failed: {str(e)[:120]}")
-    nodes = [e["node"] for e in data.get("data", [])]
     q_lo  = query.lower()
     def _rank(n):
         alt = n.get("alternative_titles") or {}
@@ -1969,7 +1986,7 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
 
 # --- moon stream endpoint ---------------------------------------------------
 @app.get("/api/moon/{mal_id}/{episode_num}")
-async def get_moon_stream(mal_id: str, episode_num: str):
+async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     ck = f"moon:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
@@ -1993,8 +2010,16 @@ async def get_moon_stream(mal_id: str, episode_num: str):
     if not result:
         raise HTTPException(502, "Moon: playback decryption failed")
 
+    # The CDN behind Moon is locked down with strict CORS / Referer checks,
+    # so we cannot let the browser fetch master.m3u8 directly. Wrap it in
+    # /proxy/m3u8 — same path the megaplay endpoint uses — so the proxy can
+    # add the right upstream headers and serve our origin to the browser.
+    backend = _backend_base(request)
     response = {
-        "url":          result["url"],
+        "url":          _proxy_url(backend, result["url"], "/proxy/m3u8"),
+        # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
+        # already CORS-friendly for the browser; proxying it through /proxy/vtt
+        # would break the JSON-vs-VTT content type assumption.
         "subtitle_url": result["subtitle_url"],
         "video_id":     result["video_id"],
         "server":       "moon",

@@ -3819,9 +3819,23 @@ document.addEventListener('mousemove', function(e) {
             item.onmouseover = () => item.classList.add('hovered');
             item.onmouseout  = () => item.classList.remove('hovered');
             item.onclick = () => {
-                document.getElementById('searchInput').value = s.title || s;
                 dd.style.display = 'none';
-                searchAnime();
+                // If we have an anime_id, skip a re-search by title (which
+                // can fail when the suggestion title is very long — MAL
+                // silently returns 0 results for queries over ~70 chars)
+                // and jump straight into the episode list.
+                if (s && s.anime_id) {
+                    document.getElementById('searchInput').value = s.title || '';
+                    fetchEpisodes({
+                        anime_id:    s.anime_id,
+                        title:       s.title || '',
+                        image_url:   s.image_url || '',
+                        episode_count: s.episode_count || 0,
+                    });
+                } else {
+                    document.getElementById('searchInput').value = s.title || s;
+                    searchAnime();
+                }
             };
             dd.appendChild(item);
         });
