@@ -4860,6 +4860,7 @@ function setDlProgress(pct) {
 // is held in server RAM and nothing is double-streamed. ───────────────────────
 const _DL_CLIENT_PARALLEL = 16;   // segments in flight per download
 const _DL_MAX_BANDWIDTH   = 1_800_000;  // prefer <=720p-ish variants for smaller files
+let taskDownloadVariant = null;
 
 function _dlParseSegments(m3u8Text) {
     return m3u8Text.split('\n').map(l => l.trim())
@@ -4869,7 +4870,17 @@ function _dlParseSegments(m3u8Text) {
 async function _dlResolveSegments(originalM3u8Url) {
     // Fetch through /proxy/m3u8 — it returns the manifest with all internal
     // URLs rewritten to point at /proxy/m3u8 and /proxy/chunk on our origin.
-    const proxied = `${API}/proxy/m3u8?src=${encodeURIComponent(originalM3u8Url)}`;
+    const alreadyProxied = (() => {
+        try {
+            const u = new URL(originalM3u8Url, location.origin);
+            return u.origin === location.origin && u.pathname === '/proxy/m3u8';
+        } catch(e) {
+            return false;
+        }
+    })();
+    const proxied = alreadyProxied
+        ? originalM3u8Url
+        : `${API}/proxy/m3u8?src=${encodeURIComponent(originalM3u8Url)}`;
     let r = await fetch(proxied);
     if (!r.ok) throw new Error('manifest fetch ' + r.status);
     let text = await r.text();
@@ -4910,8 +4921,6 @@ async function _dlResolveSegments(originalM3u8Url) {
     if (!segments.length) throw new Error('playlist has no segments');
     return segments;
 }
-
-let taskDownloadVariant = null;
 
 function _dlDirectUrlFromProxy(url) {
     try {
@@ -5044,6 +5053,14 @@ window.startDownload = async function() {
     // Already downloaded locally?
     const cached = await idbGet(idbKey).catch(()=>null);
     if (cached && cached.videoBlob) { setDlBtn('done','✔ Downloaded'); return; }
+
+    for (const t of _dlTasks.values()) {
+        if (t.idb_key === idbKey && !t._idb_saved && t.status !== 'error') {
+            setDlBtn('downloading', (t.progress || 0) + '%');
+            setDlProgress(t.progress || 0);
+            return;
+        }
+    }
 
     // Build a local task record (no backend task_id needed anymore)
     const task_id = `cli_${sd.mal_id}_${sd.ep}_${Date.now()}`;
