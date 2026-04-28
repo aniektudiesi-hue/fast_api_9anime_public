@@ -921,7 +921,6 @@
             box-shadow: 0 0 15px rgba(0, 212, 255, 0.25);
         }
         .srv-pill:hover:not(.active) { border-color: var(--gojo-blue); color: var(--gojo-blue); }
-        .srv-pill.failed  { border-color: #ff5252; color: #ff5252; opacity: 0.5; }
         .srv-pill.loading { border-color: var(--gojo-blue); color: var(--gojo-blue); animation: pilPulse 1s infinite; }
         @keyframes pilPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
@@ -2503,28 +2502,46 @@ document.addEventListener('mousemove', function(e) {
             if (!btn) return;
             btn.classList.toggle('active', currentServer === srv);
         });
+        _syncServerPillRow();
     }
 
-    // Generic pill state machine: 'loading' | 'ready' | 'failed' | 'hidden'
+    function _syncServerPillRow() {
+        const pillRow = document.getElementById('serverPillRow');
+        if (!pillRow) return;
+        const hasReadyPill = !!pillRow.querySelector('.srv-pill');
+        pillRow.style.display = hasReadyPill ? 'flex' : 'none';
+    }
+
+    function _serverFromPillId(id) {
+        if (id === 'roPill_megaplay') return 'megaplay';
+        if (id === 'roPill_moon') return 'moon';
+        return 'hd1';
+    }
+
+    // Generic pill state machine: only ready servers are shown.
     function _setPillState(id, state, label) {
         const pillRow = document.getElementById('serverPillRow');
         if (!pillRow) return;
         let btn = document.getElementById(id);
 
-        if (state === 'hidden') { if (btn) btn.remove(); return; }
+        if (state !== 'ready') {
+            if (btn) btn.remove();
+            _syncServerPillRow();
+            return;
+        }
 
         if (!btn) {
             btn = document.createElement('button');
             btn.id        = id;
             btn.className = 'srv-pill';
             btn.addEventListener('click', () => {
-                if (btn.classList.contains('loading')) return;
-                if (btn.classList.contains('failed'))  return;
-                const srv = id === 'roPill_moon' ? 'moon' : 'hd1';
-                switchServer(srv);
+                switchServer(_serverFromPillId(id));
             });
-            // Stable order: Moon before HD1
-            if (id === 'roPill_moon') {
+            if (id === 'roPill_megaplay') {
+                const firstServer = pillRow.querySelector('.srv-pill');
+                if (firstServer) pillRow.insertBefore(btn, firstServer);
+                else             pillRow.appendChild(btn);
+            } else if (id === 'roPill_moon') {
                 const hd1 = document.getElementById('roPill_hd1');
                 if (hd1) pillRow.insertBefore(btn, hd1);
                 else     pillRow.appendChild(btn);
@@ -2533,69 +2550,23 @@ document.addEventListener('mousemove', function(e) {
             }
         }
 
-        btn.classList.remove('loading', 'failed');
-        if (state === 'loading') {
-            btn.classList.add('loading');
-            btn.disabled    = true;
-            btn.textContent = label + '…';
-            btn.title       = label + ' loading…';
-        } else if (state === 'ready') {
-            btn.disabled    = false;
-            btn.textContent = '● ' + label;
-            btn.title       = 'Switch to ' + label + ' server';
-        } else if (state === 'failed') {
-            btn.classList.add('failed');
-            btn.disabled    = true;
-            btn.textContent = label + ' ✕';
-            btn.title       = label + ' is unavailable for this episode';
-        }
+        btn.disabled    = false;
+        btn.textContent = '● ' + label;
+        btn.title       = 'Switch to ' + label + ' server';
+        _updateServerBtns();
     }
 
+    function _setMegaPlayState(state) { _setPillState('roPill_megaplay', state, 'MegaPlay'); }
     function _setMoonState(state) { _setPillState('roPill_moon', state, 'Moon'); }
     function _setHD1State(state)  { _setPillState('roPill_hd1',  state, 'HD1');  }
 
     // Legacy boolean wrappers — kept so old call sites still compile
     function _setMoonReady(ready) {
-        const pillRow = document.getElementById('serverPillRow');
-        if (!pillRow) return;
-        let btn = document.getElementById('roPill_moon');
-        if (ready) {
-            if (!btn) {
-                btn = document.createElement('button');
-                btn.id        = 'roPill_moon';
-                btn.className = 'srv-pill';
-                btn.addEventListener('click', () => switchServer('moon'));
-                // Insert before HD1 if present, else append
-                const hd1 = document.getElementById('roPill_hd1');
-                if (hd1) pillRow.insertBefore(btn, hd1);
-                else     pillRow.appendChild(btn);
-            }
-            btn.textContent = '\u25CF Moon';
-            btn.disabled    = false;
-            btn.title       = 'Switch to Moon server';
-        } else {
-            if (btn) btn.remove();
-        }
+        _setMoonState(ready ? 'ready' : 'hidden');
     }
 
     function _setHD1Ready(url) {
-        const pillRow = document.getElementById('serverPillRow');
-        if (!pillRow) return;
-        let btn = document.getElementById('roPill_hd1');
-        if (url) {
-            if (!btn) {
-                btn = document.createElement('button');
-                btn.id        = 'roPill_hd1';
-                btn.className = 'srv-pill';
-                btn.addEventListener('click', () => switchServer('hd1'));
-                pillRow.appendChild(btn);
-            }
-            btn.textContent = '\u25CF HD1';
-            btn.disabled    = false;
-            btn.title       = 'Switch to HD1 server';
-        } else {
-            if (btn) btn.remove();
-        }
+        _setHD1State(url ? 'ready' : 'hidden');
     }
 
     function switchServer(server) {
@@ -3323,14 +3294,10 @@ document.addEventListener('mousemove', function(e) {
         const skipBtn = document.getElementById('roSkipBtn');
         if (skipBtn) skipBtn.style.display = 'none';
 
-        // Rebuild serverPillRow — only MegaPlay on open.
-        // Moon + HD1 pills appear dynamically when their URLs are ready.
+        // Rebuild serverPillRow. Server pills appear only after a stream is ready.
         const pillRow = document.getElementById('serverPillRow');
-        pillRow.innerHTML =
-            '<span class="server-pill-label">Servers</span>' +
-            '<button id="roPill_megaplay" class="srv-pill active" title="MegaPlay">&#9679; MegaPlay</button>';
-        pillRow.style.display = 'flex';
-        document.getElementById('roPill_megaplay').addEventListener('click', () => switchServer('megaplay'));
+        pillRow.innerHTML = '<span class="server-pill-label">Servers</span>';
+        pillRow.style.display = 'none';
 
         if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
         const video      = document.getElementById('roVideoEl');
@@ -3347,7 +3314,7 @@ document.addEventListener('mousemove', function(e) {
         document.getElementById('roProgBuf').style.width = '0%';
         roResetSubtitleState();
 
-        // serverPillRow is already rebuilt above with interactive server buttons
+        _syncServerPillRow();
 
         // FIX 4: sync subBtn label with current audio track
         const subBtn = document.getElementById('subBtn');
@@ -3513,6 +3480,7 @@ document.addEventListener('mousemove', function(e) {
             } catch(err) {
                 badge.textContent = `\u26a0 Stream failed: ${err.message}`;
                 badge.className   = 'stream-status error';
+                _setMegaPlayState('hidden');
                 roShowSpinner(false);
                 return;
             }
@@ -3548,6 +3516,7 @@ document.addEventListener('mousemove', function(e) {
         video.addEventListener('timeupdate', _onTimeUpdate);
 
         const onReady = () => {
+            if (serverLabel === 'MegaPlay') _setMegaPlayState('ready');
             video.play().catch(() => {});
             badge.textContent = `\u25cf ${serverLabel}`;
             badge.className   = 'stream-status live';
@@ -3573,6 +3542,7 @@ document.addEventListener('mousemove', function(e) {
                 if (d.fatal) {
                     badge.textContent = '\u26a0 Stream error — try another episode';
                     badge.className   = 'stream-status error';
+                    if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
                     roShowSpinner(false);
                     if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
                     else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
@@ -3585,11 +3555,13 @@ document.addEventListener('mousemove', function(e) {
             video.addEventListener('error', () => {
                 badge.textContent = '\u26a0 Stream error';
                 badge.className   = 'stream-status error';
+                if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
                 roShowSpinner(false);
             }, { once: true });
         } else {
             badge.textContent = '\u26a0 HLS not supported in this browser';
             badge.className   = 'stream-status error';
+            if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
             roShowSpinner(false);
         }
     }
@@ -4887,6 +4859,7 @@ function setDlProgress(pct) {
 // and assembles them locally. Server is a stateless byte pass-through; nothing
 // is held in server RAM and nothing is double-streamed. ───────────────────────
 const _DL_CLIENT_PARALLEL = 16;   // segments in flight per download
+const _DL_MAX_BANDWIDTH   = 1_800_000;  // prefer <=720p-ish variants for smaller files
 
 function _dlParseSegments(m3u8Text) {
     return m3u8Text.split('\n').map(l => l.trim())
@@ -4901,25 +4874,34 @@ async function _dlResolveSegments(originalM3u8Url) {
     if (!r.ok) throw new Error('manifest fetch ' + r.status);
     let text = await r.text();
 
-    // Master playlist? Pick the highest-bandwidth variant.
+    // Master playlist? Prefer a compact watchable variant instead of the max.
     if (text.includes('#EXT-X-STREAM-INF')) {
         const lines = text.split('\n');
-        let bestBw = -1, bestUri = '';
+        const variants = [];
         for (let i = 0; i < lines.length; i++) {
             const ln = lines[i].trim();
             if (!ln.startsWith('#EXT-X-STREAM-INF')) continue;
-            const m = /BANDWIDTH=(\d+)/.exec(ln);
-            const bw = m ? parseInt(m[1], 10) : 0;
+            const bwMatch = /BANDWIDTH=(\d+)/.exec(ln);
+            const resMatch = /RESOLUTION=\d+x(\d+)/.exec(ln);
+            const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+            const height = resMatch ? parseInt(resMatch[1], 10) : 0;
             for (let j = i + 1; j < lines.length; j++) {
                 const nx = lines[j].trim();
                 if (!nx || nx.startsWith('#')) continue;
-                if (bw >= bestBw) { bestBw = bw; bestUri = nx; }
+                variants.push({ bw, height, uri: nx });
                 break;
             }
         }
-        if (!bestUri) throw new Error('no variant in master playlist');
-        // bestUri is already a /proxy/m3u8?src=... URL on our origin
-        r = await fetch(bestUri);
+        if (!variants.length) throw new Error('no variant in master playlist');
+        variants.sort((a, b) => a.bw - b.bw);
+        const compact = variants
+            .filter(v => (!v.height || v.height <= 720) && (!v.bw || v.bw <= _DL_MAX_BANDWIDTH))
+            .sort((a, b) => b.bw - a.bw)[0];
+        const fallback = variants.find(v => v.bw >= 900_000) || variants[0];
+        const selected = compact || fallback;
+        taskDownloadVariant = selected;
+        // selected.uri is already a /proxy/m3u8?src=... URL on our origin
+        r = await fetch(selected.uri);
         if (!r.ok) throw new Error('variant fetch ' + r.status);
         text = await r.text();
     }
@@ -4929,11 +4911,26 @@ async function _dlResolveSegments(originalM3u8Url) {
     return segments;
 }
 
+let taskDownloadVariant = null;
+
+function _dlDirectUrlFromProxy(url) {
+    try {
+        const u = new URL(url, location.origin);
+        if (u.origin === location.origin && u.pathname === '/proxy/chunk') {
+            const src = u.searchParams.get('src');
+            if (src && /^https?:\/\//i.test(src)) return src;
+        }
+    } catch(e) {}
+    return '';
+}
+
 async function _dlFetchOne(url, attempts = 3) {
     let lastErr;
     for (let i = 0; i < attempts; i++) {
         try {
-            const r = await fetch(url);
+            const directUrl = _dlDirectUrlFromProxy(url);
+            let r = directUrl ? await fetch(directUrl).catch(() => null) : null;
+            if (!r || !r.ok) r = await fetch(url);
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return await r.arrayBuffer();
         } catch (e) {

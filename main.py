@@ -363,6 +363,80 @@ def _is_valid_url(url):
         return p.scheme in ("http", "https") and bool(p.hostname)
     except: return False
 
+def _response_content_length(resp) -> int | None:
+    try:
+        val = resp.headers.get("content-length")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+def _parse_single_range(range_header: str, total_size: int | None = None) -> tuple[int, int | None] | None:
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (range_header or "").strip())
+    if not m:
+        return None
+    start_s, end_s = m.groups()
+    if not start_s and not end_s:
+        return None
+    if start_s:
+        start = int(start_s)
+        end = int(end_s) if end_s else None
+    else:
+        if total_size is None:
+            return None
+        suffix_len = int(end_s)
+        if suffix_len <= 0:
+            return None
+        start = max(total_size - suffix_len, 0)
+        end = total_size - 1
+    if end is not None and end < start:
+        return None
+    return start, end
+
+def _range_response_headers(*, content_len: int, total_size: int | None,
+                            requested: tuple[int, int | None] | None,
+                            upstream_content_range: str | None = None) -> tuple[int, dict]:
+    headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(content_len),
+    }
+    if upstream_content_range:
+        headers["Content-Range"] = upstream_content_range
+        return 206, headers
+    if requested:
+        start, end = requested
+        if end is None:
+            end = start + max(content_len - 1, 0)
+        total = "*" if total_size is None else str(total_size)
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return 206, headers
+    return 200, headers
+
+def _apply_local_range(body: bytes, range_header: str | None,
+                       cache_control: str) -> tuple[bytes, int, dict]:
+    headers = {
+        "Cache-Control": cache_control,
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+    }
+    total_size = len(body)
+    if not range_header:
+        headers["Content-Length"] = str(total_size)
+        return body, 200, headers
+    parsed = _parse_single_range(range_header, total_size)
+    if not parsed:
+        raise HTTPException(416, "Invalid Range")
+    start, end = parsed
+    if start >= total_size:
+        raise HTTPException(416, "Range not satisfiable")
+    if end is None or end >= total_size:
+        end = total_size - 1
+    sliced = body[start:end + 1]
+    headers["Content-Length"] = str(len(sliced))
+    headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+    return sliced, 206, headers
+
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
@@ -1117,33 +1191,136 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
     rewritten = rewrite_m3u8(r.text, url, _backend_base(request))
-    return Response(content=rewritten, media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"})
+    body, status_code, out_headers = _apply_local_range(
+        rewritten.encode("utf-8"),
+        request.headers.get("range"),
+        "no-cache",
+    )
+    return Response(content=body, media_type="application/vnd.apple.mpegurl",
+                    status_code=status_code, headers=out_headers)
 
-# --- chunk proxy ------------------------------------------------------------
-@app.get("/proxy/chunk")
-async def proxy_chunk(src: str = Query(...)):
+@app.head("/proxy/m3u8")
+async def proxy_m3u8_head(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     loop = asyncio.get_running_loop()
     headers, impersonate = _proxy_call_for(url)
     try:
         r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=headers, impersonate=impersonate, timeout=30))
+            url, headers=headers, impersonate=impersonate, timeout=15))
+    except Exception as e:
+        raise HTTPException(502, f"Upstream fetch failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    rewritten = rewrite_m3u8(r.text, url, _backend_base(request))
+    _, status_code, out_headers = _apply_local_range(
+        rewritten.encode("utf-8"),
+        request.headers.get("range"),
+        "no-cache",
+    )
+    return Response(content=b"", media_type="application/vnd.apple.mpegurl",
+                    status_code=status_code, headers=out_headers)
+
+# --- chunk proxy ------------------------------------------------------------
+@app.get("/proxy/chunk")
+async def proxy_chunk(request: Request, src: str = Query(...)):
+    url = unquote(src)
+    if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
+    loop = asyncio.get_running_loop()
+    headers, impersonate = _proxy_call_for(url)
+    req_range = request.headers.get("range", "").strip()
+    requested = _parse_single_range(req_range) if req_range else None
+    fetch_headers = {**headers}
+    if requested:
+        fetch_headers["Range"] = req_range
+    try:
+        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
+            url, headers=fetch_headers, impersonate=impersonate, timeout=30))
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
-    if r.status_code != 200:
+    if r.status_code not in (200, 206):
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
     body = r.content
     if not body: raise HTTPException(502, "Empty body from upstream")
+    total_size = _response_content_length(r)
+    content_range = r.headers.get("content-range")
+    if r.status_code == 206 and content_range:
+        m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", content_range)
+        if m and m.group(1).isdigit():
+            total_size = int(m.group(1))
+    elif requested and r.status_code == 200:
+        total_size = len(body)
+        parsed = _parse_single_range(req_range, total_size)
+        if not parsed:
+            raise HTTPException(416, "Invalid Range")
+        start, end = parsed
+        if start >= total_size:
+            raise HTTPException(416, "Range not satisfiable")
+        if end is None or end >= total_size:
+            end = total_size - 1
+        body = body[start:end + 1]
+        requested = (start, end)
+    status_code, out_headers = _range_response_headers(
+        content_len=len(body),
+        total_size=total_size,
+        requested=requested if req_range else None,
+        upstream_content_range=content_range if r.status_code == 206 else None,
+    )
     return Response(content=body, media_type=_detect_mime(url, body),
-                    headers={"Cache-Control": "public, max-age=3600",
-                             "Access-Control-Allow-Origin": "*",
-                             "Accept-Ranges": "bytes"})
+                    status_code=status_code, headers=out_headers)
+
+@app.head("/proxy/chunk")
+async def proxy_chunk_head(request: Request, src: str = Query(...)):
+    url = unquote(src)
+    if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
+    loop = asyncio.get_running_loop()
+    headers, impersonate = _proxy_call_for(url)
+    req_range = request.headers.get("range", "").strip()
+    fetch_headers = {**headers, "Range": req_range or "bytes=0-0"}
+    try:
+        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
+            url, headers=fetch_headers, impersonate=impersonate, timeout=30))
+    except Exception as e:
+        raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
+    if r.status_code not in (200, 206):
+        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    total_size = _response_content_length(r)
+    content_range = r.headers.get("content-range")
+    if content_range:
+        m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", content_range)
+        if m and m.group(1).isdigit():
+            total_size = int(m.group(1))
+    requested = _parse_single_range(req_range, total_size) if req_range else None
+    status_code = 200
+    out_headers = {
+        "Cache-Control": "public, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+    }
+    if req_range:
+        if r.status_code == 206 and content_range:
+            status_code = 206
+            out_headers["Content-Range"] = content_range
+            out_headers["Content-Length"] = str(len(r.content))
+        elif requested:
+            start, end = requested
+            if total_size is not None:
+                if start >= total_size:
+                    raise HTTPException(416, "Range not satisfiable")
+                if end is None or end >= total_size:
+                    end = total_size - 1
+                out_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+                out_headers["Content-Length"] = str(end - start + 1)
+                status_code = 206
+    elif total_size is not None:
+        out_headers["Content-Length"] = str(total_size)
+    content_type = _detect_mime(url, r.content)
+    return Response(content=b"", media_type=content_type,
+                    status_code=status_code, headers=out_headers)
 
 # --- vtt proxy --------------------------------------------------------------
 @app.get("/proxy/vtt")
-async def proxy_vtt(src: str = Query(...)):
+async def proxy_vtt(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     loop = asyncio.get_running_loop()
@@ -1154,9 +1331,33 @@ async def proxy_vtt(src: str = Query(...)):
         raise HTTPException(502, f"Upstream failed: {e}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    return Response(content=r.text, media_type="text/vtt; charset=utf-8",
-                    headers={"Cache-Control": "public, max-age=3600",
-                             "Access-Control-Allow-Origin": "*"})
+    body, status_code, out_headers = _apply_local_range(
+        r.text.encode("utf-8"),
+        request.headers.get("range"),
+        "public, max-age=3600",
+    )
+    return Response(content=body, media_type="text/vtt; charset=utf-8",
+                    status_code=status_code, headers=out_headers)
+
+@app.head("/proxy/vtt")
+async def proxy_vtt_head(request: Request, src: str = Query(...)):
+    url = unquote(src)
+    if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
+    loop = asyncio.get_running_loop()
+    try:
+        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
+            url, headers=PROXY_HEADERS, impersonate=IMPERSONATE, timeout=15))
+    except Exception as e:
+        raise HTTPException(502, f"Upstream failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    _, status_code, out_headers = _apply_local_range(
+        r.text.encode("utf-8"),
+        request.headers.get("range"),
+        "public, max-age=3600",
+    )
+    return Response(content=b"", media_type="text/vtt; charset=utf-8",
+                    status_code=status_code, headers=out_headers)
 
 # --- image proxy ------------------------------------------------------------
 @app.get("/proxy/img")
