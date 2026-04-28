@@ -528,21 +528,6 @@ async def _anilist_ep_map() -> dict[int, int]:
     _home_cache[ck] = ep_map
     return ep_map
 
-async def _seasonal_ep_map() -> dict[int, int]:
-    ep_map = await _anilist_ep_map()
-    if ep_map:
-        return ep_map
-
-    entries = await _mal_seasonal()
-    fallback: dict[int, int] = {}
-    for e in entries:
-        node = e.get("node") or {}
-        mid = node.get("id")
-        eps = node.get("num_episodes") or 0
-        if mid and eps:
-            fallback[int(mid)] = eps
-    return fallback
-
 async def _anilist_episodes_for(mal_id: int) -> tuple[int, str]:
     """Resolve aired-episode count for *mal_id*.
 
@@ -1050,46 +1035,26 @@ async def get_banners():
         return _home_cache[ck]
     media = await _anilist_spring2026()
     result = []
-    if media:
-        for m in media:
-            banner = m.get("bannerImage") or ""
-            cover  = (m.get("coverImage") or {}).get("extraLarge") or ""
-            img    = banner or cover
-            if not img:
-                continue
-            titles = m.get("title") or {}
-            title  = (titles.get("english") or titles.get("romaji") or "").strip()
-            total  = m.get("episodes") or 0
-            nxt    = (m.get("nextAiringEpisode") or {}).get("episode", 0)
-            aired  = max(nxt - 1, 0) if nxt else 0
-            result.append({
-                "anime_id":      str(m.get("idMal", m["id"])),
-                "title":         title,
-                "img_url":       img,
-                "banner":        banner,
-                "cover":         cover,
-                "episode_count": total or aired,
-                "score":         round((m.get("averageScore") or 0) / 10, 1),
-            })
-    else:
-        entries = await _mal_seasonal()
-        ep_map = await _seasonal_ep_map()
-        for e in entries[:12]:
-            node = e.get("node") or {}
-            pic = node.get("main_picture") or {}
-            img = pic.get("large") or pic.get("medium") or ""
-            if not img:
-                continue
-            mid = int(node.get("id") or 0)
-            result.append({
-                "anime_id":      str(mid),
-                "title":         node.get("title", ""),
-                "img_url":       img,
-                "banner":        "",
-                "cover":         img,
-                "episode_count": ep_map.get(mid, node.get("num_episodes") or 0),
-                "score":         node.get("mean") or 0,
-            })
+    for m in media:
+        banner = m.get("bannerImage") or ""
+        cover  = (m.get("coverImage") or {}).get("extraLarge") or ""
+        img    = banner or cover
+        if not img:
+            continue
+        titles = m.get("title") or {}
+        title  = (titles.get("english") or titles.get("romaji") or "").strip()
+        total  = m.get("episodes") or 0
+        nxt    = (m.get("nextAiringEpisode") or {}).get("episode", 0)
+        aired  = max(nxt - 1, 0) if nxt else 0
+        result.append({
+            "anime_id":      str(m.get("idMal", m["id"])),
+            "title":         title,
+            "img_url":       img,
+            "banner":        banner,
+            "cover":         cover,
+            "episode_count": total or aired,
+            "score":         round((m.get("averageScore") or 0) / 10, 1),
+        })
     result = result[:10]
     if result:  # only cache when we actually got banners
         _home_cache[ck] = result
@@ -1103,7 +1068,7 @@ async def home_thumbnails():
         return _home_cache[ck]
     try:
         entries = await _mal_seasonal()
-        ep_map  = await _seasonal_ep_map()
+        ep_map  = await _anilist_ep_map()
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
     result = [_fmt_card(e["node"], ep_override=ep_map.get(int(e["node"].get("id", 0)), 0))
@@ -1119,7 +1084,7 @@ async def recently_added():
         return _home_cache[ck]
     try:
         entries = await _mal_seasonal()
-        ep_map  = await _seasonal_ep_map()
+        ep_map  = await _anilist_ep_map()
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
     airing = [e for e in entries
