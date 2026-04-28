@@ -249,102 +249,21 @@
         /* ===== SPLASH SCREEN - GOJO DOMAIN EXPANSION ===== */
         #splashScreen {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: var(--gojo-void);
+            background: #000;
             display: flex; align-items: center; justify-content: center;
             z-index: 9999; opacity: 1;
-            transition: opacity 0.8s ease-out;
+            transition: opacity 0.8s ease-out, visibility 0s linear 0.8s;
             overflow: hidden;
         }
-        #splashScreen::before {
-            content: '';
-            position: absolute;
-            width: 600px; height: 600px;
-            border-radius: 50%;
-            background: radial-gradient(circle, rgba(0, 212, 255, 0.06) 0%, rgba(124, 58, 237, 0.08) 40%, transparent 70%);
-            animation: splashDomain 3s ease-in-out infinite;
+        #splashVideo {
+            position: absolute; inset: 0;
+            width: 100%; height: 100%;
+            object-fit: contain;
+            background: #000;
+            pointer-events: none;
+            z-index: 1;
         }
-        #splashScreen::after {
-            content: '';
-            position: absolute;
-            width: 300px; height: 300px;
-            border-radius: 50%;
-            border: 1px solid rgba(0, 212, 255, 0.2);
-            box-shadow: 0 0 60px rgba(0, 212, 255, 0.15), inset 0 0 60px rgba(124, 58, 237, 0.1);
-            animation: splashDomainRing 3s ease-in-out infinite reverse;
-        }
-        @keyframes splashDomain {
-            0%, 100% { transform: scale(0.8); opacity: 0.5; }
-            50% { transform: scale(1.2); opacity: 1; }
-        }
-        @keyframes splashDomainRing {
-            0%, 100% { transform: scale(1) rotate(0deg); border-color: rgba(0, 212, 255, 0.3); }
-            50% { transform: scale(1.3) rotate(180deg); border-color: rgba(168, 85, 247, 0.5); }
-        }
-        #splashScreen.hidden { opacity: 0; pointer-events: none; }
-        .splash-content { text-align: center; position: relative; z-index: 10; }
-        .splash-logo {
-            width: 90px; height: 90px; margin: 0 auto 20px;
-            border-radius: 50%;
-            border: 2px solid transparent;
-            background: linear-gradient(var(--gojo-void), var(--gojo-void)) padding-box,
-                        linear-gradient(135deg, var(--gojo-blue), var(--hollow-purple), var(--accent-pink)) border-box;
-            display: flex; align-items: center; justify-content: center;
-            box-shadow: 0 0 40px rgba(0, 212, 255, 0.4), 0 0 80px rgba(124, 58, 237, 0.2);
-            animation: splashGlow 2s ease-in-out infinite;
-            position: relative;
-        }
-        .splash-logo::before {
-            content: '';
-            position: absolute;
-            inset: -8px;
-            border-radius: 50%;
-            border: 1px solid rgba(0, 212, 255, 0.15);
-            animation: splashDomainRing 4s linear infinite;
-        }
-        .splash-logo::after {
-            content: '';
-            position: absolute;
-            inset: -16px;
-            border-radius: 50%;
-            border: 1px solid rgba(168, 85, 247, 0.1);
-            animation: splashDomainRing 6s linear infinite reverse;
-        }
-        @keyframes splashGlow {
-            0%, 100% { box-shadow: 0 0 40px rgba(0, 212, 255, 0.4), 0 0 80px rgba(124, 58, 237, 0.2); }
-            50% { box-shadow: 0 0 70px rgba(0, 212, 255, 0.7), 0 0 140px rgba(124, 58, 237, 0.4), 0 0 200px rgba(168, 85, 247, 0.2); }
-        }
-        .splash-logo img { width: 88%; height: 88%; border-radius: 50%; object-fit: cover; filter: brightness(1.1) contrast(1.05); }
-        .splash-text {
-            font-size: 28px; font-weight: 900;
-            font-family: 'Orbitron', sans-serif;
-            background: linear-gradient(135deg, var(--gojo-blue) 0%, var(--gojo-white) 50%, var(--hollow-purple) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            letter-spacing: 6px; text-transform: uppercase; margin-bottom: 8px;
-            animation: splashText 2s ease-in-out infinite;
-        }
-        .splash-sub {
-            font-size: 10px;
-            color: rgba(0, 212, 255, 0.5);
-            letter-spacing: 4px;
-            text-transform: uppercase;
-            font-family: 'Orbitron', sans-serif;
-            margin-bottom: 20px;
-        }
-        @keyframes splashText {
-            0%, 100% { opacity: 1; text-shadow: 0 0 20px rgba(0, 212, 255, 0.5); }
-            50% { opacity: 0.8; text-shadow: 0 0 40px rgba(0, 212, 255, 0.9), 0 0 60px rgba(168, 85, 247, 0.4); }
-        }
-        .splash-dots { display: flex; justify-content: center; gap: 10px; }
-        .splash-dot { width: 8px; height: 8px; border-radius: 50%; animation: splashDot 1.2s ease-in-out infinite; }
-        .splash-dot:nth-child(1) { background: var(--gojo-blue); animation-delay: 0s; }
-        .splash-dot:nth-child(2) { background: var(--hollow-purple); animation-delay: 0.2s; }
-        .splash-dot:nth-child(3) { background: var(--accent-pink); animation-delay: 0.4s; }
-        @keyframes splashDot {
-            0%, 100% { opacity: 0.3; transform: scale(0.8); box-shadow: none; }
-            50% { opacity: 1; transform: scale(1.3); box-shadow: 0 0 10px currentColor; }
-        }
+        #splashScreen.hidden { opacity: 0; pointer-events: none; visibility: hidden; }
 
         /* ===== HEADER ===== */
         header {
@@ -1186,9 +1105,16 @@
             background: #000; overflow: hidden; pointer-events: all;
         }
         #cinematicIntro.gone { display: none; }
+        #introVideo {
+            position: absolute; inset: 0;
+            width: 100%; height: 100%;
+            display: block; object-fit: cover;
+            background: #000;
+            pointer-events: none;
+        }
         #voidCanvas {
             position: absolute; inset: 0;
-            width: 100% !important; height: 100% !important; display: block;
+            width: 100% !important; height: 100% !important; display: none;
         }
         #voidGlitch1, #voidGlitch2 {
             position: absolute; left: 0; right: 0; height: 2px;
@@ -1210,7 +1136,7 @@
             font-family: 'Orbitron', monospace; font-size: clamp(9px,1.5vw,13px);
             letter-spacing: 3px; color: rgba(0,212,255,0);
             text-transform: uppercase; white-space: nowrap;
-            pointer-events: none; z-index: 10003;
+            pointer-events: none; z-index: 10003; display: none;
         }
 
         /* ===== EPISODE VIDEO TRANSITION OVERLAY ===== */
@@ -1948,11 +1874,7 @@
 
 <!-- ===== CINEMATIC VOID INTRO ===== -->
 <div id="cinematicIntro">
-    <canvas id="voidCanvas"></canvas>
-    <div id="voidGlitch1"></div>
-    <div id="voidGlitch2"></div>
-    <div id="voidRgbSplit"></div>
-    <div id="voidInfoText">PROCESSING INFINITE DATA STREAM...</div>
+    <video id="introVideo" src="/assets/opening_transition.mp4" preload="auto" muted playsinline autoplay></video>
 </div>
 
 <!-- ===== EPISODE VIDEO TRANSITION OVERLAY ===== -->
@@ -1967,19 +1889,8 @@
 <div id="searchTopBar"></div>
 
 <!-- SPLASH SCREEN -->
-<div id="splashScreen">
-    <div class="splash-content">
-        <div class="splash-logo">
-            <img src="https://files.manuscdn.com/user_upload_by_module/session_file/310519663321093674/oWQUOlviOKwSQlpf.png" alt="Gojo">
-        </div>
-        <div class="splash-text">RO-ANIME</div>
-        <div class="splash-sub">Infinity · Unlimited</div>
-        <div class="splash-dots">
-            <div class="splash-dot"></div>
-            <div class="splash-dot"></div>
-            <div class="splash-dot"></div>
-        </div>
-    </div>
+<div id="splashScreen" class="hidden">
+    <video id="splashVideo" src="/assets/opening_transition.mp4" preload="auto" muted playsinline autoplay></video>
 </div>
 
 <header>
@@ -2718,14 +2629,44 @@ document.addEventListener('mousemove', function(e) {
     }
 
     // =========================================================================
-    //  SPLASH SCREEN — hide after 2.5 s regardless
+    //  SPLASH SCREEN — play opening MP4, then reveal app
     // =========================================================================
-    window.addEventListener('load', () => {
-        setTimeout(() => {
-            const s = document.getElementById('splashScreen');
-            if (s) s.classList.add('hidden');
-        }, 2500);
-    });
+    function initSplashVideo() {
+        const splash = document.getElementById('splashScreen');
+        const video = document.getElementById('splashVideo');
+        if (!splash || !video) return;
+        if (splash.dataset.ready === '1') return;
+        splash.dataset.ready = '1';
+
+        let closed = false;
+        const closeSplash = () => {
+            if (closed) return;
+            closed = true;
+            video.pause();
+            splash.classList.add('hidden');
+        };
+
+        video.removeAttribute('controls');
+        video.controls = false;
+        video.muted = true;
+        video.playsInline = true;
+        video.playbackRate = 1;
+        video.addEventListener('ended', closeSplash, { once: true });
+        video.addEventListener('error', closeSplash, { once: true });
+        setTimeout(closeSplash, 6500);
+
+        const playPromise = video.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => setTimeout(closeSplash, 1800));
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initSplashVideo, { once: true });
+    } else {
+        initSplashVideo();
+    }
+    window.addEventListener('load', initSplashVideo, { once: true });
 
     // =========================================================================
     //  HOME INIT  — FIX: sets correct display states + loads banners directly
@@ -4136,9 +4077,31 @@ document.addEventListener('mousemove', function(e) {
      ============================================================ -->
 <script>
 (function() {
-    if (typeof THREE === 'undefined') return;
     const intro = document.getElementById('cinematicIntro');
     if (!intro) return;
+    const introVideo = document.getElementById('introVideo');
+    if (introVideo) {
+        let done = false;
+        const closeIntro = () => {
+            if (done) return;
+            done = true;
+            introVideo.pause();
+            intro.classList.add('gone');
+        };
+        introVideo.removeAttribute('controls');
+        introVideo.controls = false;
+        introVideo.muted = true;
+        introVideo.playsInline = true;
+        introVideo.addEventListener('ended', closeIntro, { once: true });
+        introVideo.addEventListener('error', closeIntro, { once: true });
+        setTimeout(closeIntro, 6500);
+        const playPromise = introVideo.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(() => setTimeout(closeIntro, 1800));
+        }
+        return;
+    }
+    if (typeof THREE === 'undefined') return;
 
     const W0 = window.innerWidth, H0 = window.innerHeight;
     const scene    = new THREE.Scene();

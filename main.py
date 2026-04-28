@@ -965,11 +965,17 @@ def _backend_base(req: Request) -> str:
 async def root():
     return HTMLResponse(content=_HTML_PATH.read_text(encoding="utf-8"), media_type="text/html")
 
-def _cosmic_void_animation_path() -> Path:
-    video_path = Path(__file__).parent / "assets" / "cosmic_void_animation.mp4"
+def _asset_video_path(filename: str) -> Path:
+    video_path = Path(__file__).parent / "assets" / filename
     if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Animation not found")
+        raise HTTPException(status_code=404, detail="Video asset not found")
     return video_path
+
+def _cosmic_void_animation_path() -> Path:
+    return _asset_video_path("cosmic_void_animation.mp4")
+
+def _opening_transition_path() -> Path:
+    return _asset_video_path("opening_transition.mp4")
 
 @app.head("/assets/cosmic_void_animation.mp4")
 async def cosmic_void_animation_head():
@@ -987,6 +993,31 @@ async def cosmic_void_animation_head():
 @app.get("/assets/cosmic_void_animation.mp4")
 async def cosmic_void_animation():
     video_path = _cosmic_void_animation_path()
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
+
+@app.head("/assets/opening_transition.mp4")
+async def opening_transition_head():
+    video_path = _opening_transition_path()
+    return Response(
+        status_code=200,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": str(video_path.stat().st_size),
+        },
+    )
+
+@app.get("/assets/opening_transition.mp4")
+async def opening_transition():
+    video_path = _opening_transition_path()
     return FileResponse(
         video_path,
         media_type="video/mp4",
