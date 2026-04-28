@@ -13,7 +13,7 @@ from cachetools import TTLCache
 from curl_cffi import requests as cffi_requests
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s %(message)s", datefmt="%H:%M:%S")
@@ -964,6 +964,37 @@ def _backend_base(req: Request) -> str:
 @app.get("/")
 async def root():
     return HTMLResponse(content=_HTML_PATH.read_text(encoding="utf-8"), media_type="text/html")
+
+def _cosmic_void_animation_path() -> Path:
+    video_path = Path(__file__).parent / "assets" / "cosmic_void_animation.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Animation not found")
+    return video_path
+
+@app.head("/assets/cosmic_void_animation.mp4")
+async def cosmic_void_animation_head():
+    video_path = _cosmic_void_animation_path()
+    return Response(
+        status_code=200,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": str(video_path.stat().st_size),
+        },
+    )
+
+@app.get("/assets/cosmic_void_animation.mp4")
+async def cosmic_void_animation():
+    video_path = _cosmic_void_animation_path()
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+        },
+    )
 
 # --- banners ----------------------------------------------------------------
 @app.get("/api/v1/banners")

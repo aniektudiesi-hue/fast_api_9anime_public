@@ -1213,14 +1213,20 @@
             pointer-events: none; z-index: 10003;
         }
 
-        /* ===== FUSION ANIMATION OVERLAY ===== */
+        /* ===== EPISODE VIDEO TRANSITION OVERLAY ===== */
         #fusionOverlay {
             position: fixed; inset: 0; z-index: 9998;
             display: none; pointer-events: none; overflow: hidden; background: #000;
         }
+        #fusionVideo {
+            position: absolute; inset: 0;
+            width: 100%; height: 100%;
+            display: block; object-fit: cover;
+            background: #000; pointer-events: none;
+        }
         #fusionCanvas {
             position: absolute; inset: 0;
-            width: 100% !important; height: 100% !important; display: block;
+            width: 100% !important; height: 100% !important; display: none;
         }
 
         /* =====================================================================
@@ -1949,8 +1955,11 @@
     <div id="voidInfoText">PROCESSING INFINITE DATA STREAM...</div>
 </div>
 
-<!-- ===== FUSION ANIMATION OVERLAY ===== -->
-<div id="fusionOverlay"><canvas id="fusionCanvas"></canvas></div>
+<!-- ===== EPISODE VIDEO TRANSITION OVERLAY ===== -->
+<div id="fusionOverlay">
+    <video id="fusionVideo" src="/assets/cosmic_void_animation.mp4" preload="auto" muted playsinline></video>
+    <canvas id="fusionCanvas"></canvas>
+</div>
 
 <!-- ===== GOJO INFINITY CANVAS ===== -->
 <canvas id="gojoCanvas"></canvas>
@@ -2454,6 +2463,10 @@ document.addEventListener('mousemove', function(e) {
     let moonStreamData    = null;   // { url, subtitle_url } when ready
     let hd1StreamData     = null;   // { url } when ready
     let currentServer     = 'megaplay';  // 'megaplay' | 'moon' | 'hd1'
+    let roUserSelectedServer = false;
+    let megaPlayReady = false;
+    let megaPlayFailed = false;
+    let roStreamToken = 0;
 
     let roSubtitleCues   = [];
     let roSubActive      = false;
@@ -2518,6 +2531,15 @@ document.addEventListener('mousemove', function(e) {
         return 'hd1';
     }
 
+    function _sortServerPills() {
+        const pillRow = document.getElementById('serverPillRow');
+        if (!pillRow) return;
+        ['roPill_hd1', 'roPill_megaplay', 'roPill_moon'].forEach(id => {
+            const btn = document.getElementById(id);
+            if (btn) pillRow.appendChild(btn);
+        });
+    }
+
     // Generic pill state machine: only ready servers are shown.
     function _setPillState(id, state, label) {
         const pillRow = document.getElementById('serverPillRow');
@@ -2553,6 +2575,7 @@ document.addEventListener('mousemove', function(e) {
         btn.disabled    = false;
         btn.textContent = '● ' + label;
         btn.title       = 'Switch to ' + label + ' server';
+        _sortServerPills();
         _updateServerBtns();
     }
 
@@ -2569,8 +2592,36 @@ document.addEventListener('mousemove', function(e) {
         _setHD1State(url ? 'ready' : 'hidden');
     }
 
-    function switchServer(server) {
+    function _sameActiveStream(mal_id, ep) {
+        return currentStreamData
+            && String(currentStreamData.mal_id) === String(mal_id)
+            && parseInt(currentStreamData.ep) === parseInt(ep);
+    }
+
+    function _autoApplyServerPriority() {
+        if (roUserSelectedServer || !currentStreamData) return;
+
+        if (hd1StreamData && currentServer !== 'hd1') {
+            switchServer('hd1', false);
+            return;
+        }
+
+        if (megaPlayReady) {
+            if (currentServer !== 'megaplay' && currentServer !== 'hd1') {
+                switchServer('megaplay', false);
+            }
+            return;
+        }
+
+        if (megaPlayFailed && moonStreamData && currentServer !== 'moon') {
+            switchServer('moon', false);
+        }
+    }
+
+    function switchServer(server, userInitiated = true) {
+        if (userInitiated) roUserSelectedServer = true;
         if (server === currentServer) return;
+        if (!currentStreamData) return;
         const { title, ep } = currentStreamData;
 
         function _stopHLS() {
@@ -2618,6 +2669,7 @@ document.addEventListener('mousemove', function(e) {
     }
 
     async function _fetchMoonBackground(mal_id, ep) {
+        const token = roStreamToken;
         moonStreamData = null;
         _setMoonState('loading');
         try {
@@ -2625,16 +2677,20 @@ document.addEventListener('mousemove', function(e) {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
             if (!data.url) throw new Error('no url');
+            if (token !== roStreamToken || !_sameActiveStream(mal_id, ep)) return;
             moonStreamData = data;
             _setMoonState('ready');
+            _autoApplyServerPriority();
             console.log('[Moon] ready:', data.url.slice(0, 60));
         } catch(e) {
+            if (token !== roStreamToken || !_sameActiveStream(mal_id, ep)) return;
             console.warn('[Moon] background fetch failed:', e.message);
             _setMoonState('failed');
         }
     }
 
     async function _fetchHD1Background(mal_id, ep) {
+        const token = roStreamToken;
         hd1StreamData = null;
         _setHD1State('loading');
         try {
@@ -2642,10 +2698,13 @@ document.addEventListener('mousemove', function(e) {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const data = await r.json();
             if (!data.url) throw new Error('no url');
+            if (token !== roStreamToken || !_sameActiveStream(mal_id, ep)) return;
             hd1StreamData = data;
             _setHD1State('ready');
+            _autoApplyServerPriority();
             console.log('[HD1] ready:', data.url.slice(0, 80));
         } catch(e) {
+            if (token !== roStreamToken || !_sameActiveStream(mal_id, ep)) return;
             console.warn('[HD1] background fetch failed:', e.message);
             _setHD1State('failed');
         }
@@ -3291,6 +3350,10 @@ document.addEventListener('mousemove', function(e) {
     function roPlayerReset() {
         streamIntro = null; streamOutro = null;
         moonStreamData = null; hd1StreamData = null; currentServer = 'megaplay';
+        roUserSelectedServer = false;
+        megaPlayReady = false;
+        megaPlayFailed = false;
+        roStreamToken++;
         const skipBtn = document.getElementById('roSkipBtn');
         if (skipBtn) skipBtn.style.display = 'none';
 
@@ -3454,6 +3517,8 @@ document.addEventListener('mousemove', function(e) {
         const badge = document.getElementById('streamStatusBadge');
         const video = document.getElementById('roVideoEl');
 
+        megaPlayReady = false;
+        megaPlayFailed = false;
         badge.textContent = 'Connecting to MegaPlay...';
         badge.className   = 'stream-status loading';
         roShowSpinner(true);
@@ -3480,8 +3545,10 @@ document.addEventListener('mousemove', function(e) {
             } catch(err) {
                 badge.textContent = `\u26a0 Stream failed: ${err.message}`;
                 badge.className   = 'stream-status error';
+                megaPlayFailed = true;
                 _setMegaPlayState('hidden');
                 roShowSpinner(false);
+                _autoApplyServerPriority();
                 return;
             }
         }
@@ -3511,12 +3578,18 @@ document.addEventListener('mousemove', function(e) {
     function _attachHLS(m3u8Url, title, ep, serverLabel = 'MegaPlay') {
         const badge = document.getElementById('streamStatusBadge');
         const video = document.getElementById('roVideoEl');
+        const serverKey = serverLabel === 'Moon' ? 'moon' : 'megaplay';
         video.style.display = 'block';
         video.removeEventListener('timeupdate', _onTimeUpdate);
         video.addEventListener('timeupdate', _onTimeUpdate);
 
         const onReady = () => {
-            if (serverLabel === 'MegaPlay') _setMegaPlayState('ready');
+            if (currentServer !== serverKey) return;
+            if (serverLabel === 'MegaPlay') {
+                megaPlayReady = true;
+                megaPlayFailed = false;
+                _setMegaPlayState('ready');
+            }
             video.play().catch(() => {});
             badge.textContent = `\u25cf ${serverLabel}`;
             badge.className   = 'stream-status live';
@@ -3524,6 +3597,7 @@ document.addEventListener('mousemove', function(e) {
             roShowSpinner(false);
             roShowControls();
             document.getElementById('roCtrlLabel').textContent = `${title}  \u00b7  EP ${ep}`;
+            if (serverLabel === 'MegaPlay') _autoApplyServerPriority();
         };
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -3540,12 +3614,19 @@ document.addEventListener('mousemove', function(e) {
             hlsInstance.on(Hls.Events.MANIFEST_PARSED, onReady);
             hlsInstance.on(Hls.Events.ERROR, (_, d) => {
                 if (d.fatal) {
+                    if (currentServer !== serverKey) return;
+                    const failedHls = hlsInstance;
                     badge.textContent = '\u26a0 Stream error — try another episode';
                     badge.className   = 'stream-status error';
-                    if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
+                    if (serverLabel === 'MegaPlay') {
+                        megaPlayReady = false;
+                        megaPlayFailed = true;
+                        _setMegaPlayState('hidden');
+                    }
                     roShowSpinner(false);
-                    if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hlsInstance.startLoad();
-                    else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hlsInstance.recoverMediaError();
+                    if (d.type === Hls.ErrorTypes.NETWORK_ERROR && failedHls === hlsInstance) hlsInstance.startLoad();
+                    else if (d.type === Hls.ErrorTypes.MEDIA_ERROR && failedHls === hlsInstance) hlsInstance.recoverMediaError();
+                    _autoApplyServerPriority();
                 }
             });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -3555,14 +3636,24 @@ document.addEventListener('mousemove', function(e) {
             video.addEventListener('error', () => {
                 badge.textContent = '\u26a0 Stream error';
                 badge.className   = 'stream-status error';
-                if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
+                if (serverLabel === 'MegaPlay') {
+                    megaPlayReady = false;
+                    megaPlayFailed = true;
+                    _setMegaPlayState('hidden');
+                }
                 roShowSpinner(false);
+                _autoApplyServerPriority();
             }, { once: true });
         } else {
             badge.textContent = '\u26a0 HLS not supported in this browser';
             badge.className   = 'stream-status error';
-            if (serverLabel === 'MegaPlay') _setMegaPlayState('hidden');
+            if (serverLabel === 'MegaPlay') {
+                megaPlayReady = false;
+                megaPlayFailed = true;
+                _setMegaPlayState('hidden');
+            }
             roShowSpinner(false);
+            _autoApplyServerPriority();
         }
     }
 
@@ -4221,11 +4312,10 @@ document.addEventListener('mousemove', function(e) {
 </script>
 
 <!-- ============================================================
-     FUSION ANIMATION — Watch Now → Hollow Purple Burst → Player
+     EPISODE VIDEO TRANSITION — fullscreen MP4 while player loads
      ============================================================ -->
 <script>
 (function() {
-    if (typeof THREE === 'undefined') return;
     if (typeof window.startStreaming !== 'function') return;
 
     const _origStartStreaming = window.startStreaming;
@@ -4234,14 +4324,62 @@ document.addEventListener('mousemove', function(e) {
     window.startStreaming = async function(animeObj, episode, allEpisodes) {
         if (busy) return _origStartStreaming(animeObj, episode, allEpisodes);
         busy = true;
-        // Fire _origStartStreaming after 1 s (during orbit phase) so MegaPlay
-        // begins loading while the animation is still playing.
-        // The overlay covers everything — user sees animation, player loads underneath.
-        setTimeout(() => _origStartStreaming(animeObj, episode, allEpisodes), 1000);
-        try { await runFusion(); } catch(e) { console.warn('Fusion err:', e); }
+        // Start the real stream underneath the fullscreen transition.
+        setTimeout(() => _origStartStreaming(animeObj, episode, allEpisodes), 250);
+        try { await runEpisodeVideoTransition(); } catch(e) { console.warn('Transition err:', e); }
         busy = false;
-        // No second call needed — already started above
     };
+
+    function runEpisodeVideoTransition() {
+        return new Promise(resolve => {
+            const overlay = document.getElementById('fusionOverlay');
+            const video = document.getElementById('fusionVideo');
+            const canvas = document.getElementById('fusionCanvas');
+            if (!overlay || !video) { resolve(); return; }
+
+            let done = false;
+            let fallbackTimer = null;
+
+            function finish() {
+                if (done) return;
+                done = true;
+                clearTimeout(fallbackTimer);
+                video.pause();
+                video.removeEventListener('ended', finish);
+                video.removeEventListener('error', finish);
+                overlay.style.opacity = '0';
+                setTimeout(() => {
+                    overlay.style.display = 'none';
+                    overlay.style.opacity = '1';
+                    video.removeAttribute('controls');
+                    if (canvas) canvas.style.display = 'none';
+                    resolve();
+                }, 260);
+            }
+
+            overlay.style.display = 'block';
+            overlay.style.opacity = '1';
+            if (canvas) canvas.style.display = 'none';
+            video.removeAttribute('controls');
+            video.controls = false;
+            video.muted = true;
+            video.playsInline = true;
+            video.currentTime = 0;
+            if (Number.isFinite(video.duration) && video.duration > 0.6) {
+                video.playbackRate = Math.min(1.35, video.duration / (video.duration - 0.5));
+            } else {
+                video.playbackRate = 1.12;
+            }
+            video.addEventListener('ended', finish, { once: true });
+            video.addEventListener('error', finish, { once: true });
+            fallbackTimer = setTimeout(finish, 4700);
+
+            const playPromise = video.play();
+            if (playPromise && typeof playPromise.catch === 'function') {
+                playPromise.catch(() => setTimeout(finish, 1200));
+            }
+        });
+    }
 
     function runFusion() {
         return new Promise(resolve => {
