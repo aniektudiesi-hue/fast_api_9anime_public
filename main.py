@@ -252,25 +252,8 @@ class MegaPlayScraper:
     def _fetch_player_page(self, mal_id, ep_num, stype):
         url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep_num}/{stype}"
         logger.info("player page -> %s", url)
-        text = self._get_player_html(url, NAV_HEADERS)
-        attrs = self._extract_player_attrs(text)
-        if "id" in attrs:
-            return attrs
-
-        iframe_url = self._extract_iframe_src(text, url)
-        if iframe_url:
-            logger.info("player wrapper iframe -> %s", iframe_url)
-            iframe_headers = {**NAV_HEADERS, "Referer": url}
-            iframe_text = self._get_player_html(iframe_url, iframe_headers)
-            attrs = self._extract_player_attrs(iframe_text)
-            if "id" in attrs:
-                return attrs
-
-        raise PlayerPageError(f"data-id missing ({len(text)} bytes)")
-
-    def _get_player_html(self, url, headers):
         try:
-            r = self.session.get(url, headers=headers,
+            r = self.session.get(url, headers=NAV_HEADERS,
                 impersonate=IMPERSONATE, timeout=self.timeout)
         except Exception as e:
             raise PlayerPageError(f"fetch failed: {e}")
@@ -278,22 +261,10 @@ class MegaPlayScraper:
             raise EpisodeNotFound(f"MAL={mal_id} ep={ep_num} type={stype}")
         if r.status_code != 200:
             raise PlayerPageError(f"HTTP {r.status_code}")
-        return r.text
-
-    @staticmethod
-    def _extract_player_attrs(text):
-        return dict(re.findall(r'\bdata-([\w-]+)\s*=\s*["\']([^"\']+)["\']', text))
-
-    @staticmethod
-    def _extract_iframe_src(text, base_url):
-        m = re.search(r'<iframe\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', text, re.IGNORECASE)
-        if not m:
-            return ""
-        src = urljoin(base_url, m.group(1).strip())
-        host = urlparse(src).netloc.lower()
-        if not (host.endswith("vidwish.live") or host.endswith("megaplay.buzz")):
-            return ""
-        return src
+        attrs = dict(re.findall(r'\bdata-([\w-]+)\s*=\s*["\']([^"\']+)["\']', r.text))
+        if "id" not in attrs:
+            raise PlayerPageError(f"data-id missing ({len(r.text)} bytes)")
+        return attrs
 
     def _fetch_sources(self, internal_id, stype):
         last_err = None
