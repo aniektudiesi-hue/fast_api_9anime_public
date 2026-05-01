@@ -8,4 +8,6 @@ __pycache__/
 New Text Document.txt
 .env
 .venv/
+.venv*/
 venv/
+uvicorn-*.log

@@ -4,6 +4,7 @@ RO-ANIME Backend v3
 from __future__ import annotations
 import asyncio, base64, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid
 from dataclasses import asdict, dataclass, field
+from html import unescape
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
@@ -28,6 +29,8 @@ MAL_HEADERS   = {"X-MAL-CLIENT-ID": MAL_CLIENT_ID}
 ANILIST_GQL   = "https://graphql.anilist.co"
 MEGAPLAY_BASE = "https://megaplay.buzz"
 SOURCES_EP    = f"{MEGAPLAY_BASE}/stream/getSources"
+VIDWISH_BASE  = "https://vidwish.live"
+VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
 IMPERSONATE   = "chrome131_android"
 ANDROID_UA    = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
@@ -114,6 +117,18 @@ API_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Referer": f"{MEGAPLAY_BASE}/",
 }
+VIDWISH_NAV_HEADERS = {
+    **NAV_HEADERS,
+    "Referer": f"{MEGAPLAY_BASE}/",
+    "Sec-Fetch-Dest": "iframe",
+    "Sec-Fetch-Site": "cross-site",
+}
+VIDWISH_API_HEADERS = {
+    **API_HEADERS,
+    "Origin": VIDWISH_BASE,
+    "Referer": f"{VIDWISH_BASE}/",
+    "Sec-Fetch-Site": "same-origin",
+}
 PROXY_HEADERS = {
     "User-Agent": ANDROID_UA,
     "Accept": "*/*",
@@ -142,6 +157,9 @@ DESKTOP_UA = (
 
 # host substring -> (referer, user_agent, impersonate_profile)
 _UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
+    ("watching.onl",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
+    ("cinewave",          f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
+    ("vidwish.live",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
     # Moon stack — DESKTOP UA mandatory
     ("r66nv9ed.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
     ("sprintcdn",         "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
@@ -207,6 +225,7 @@ class StreamData:
     intro:  Optional[TimeRange] = None
     outro:  Optional[TimeRange] = None
     server_id: Optional[int] = None
+    iframe_url: str = ""
     mal_id: str = ""; episode_num: str = ""
     internal_id: str = ""; real_id: str = ""; media_id: str = ""
 
@@ -217,6 +236,7 @@ class StreamData:
             "intro":  asdict(self.intro)  if self.intro  else None,
             "outro":  asdict(self.outro)  if self.outro  else None,
             "server_id": self.server_id,
+            "iframe_url": self.iframe_url,
             "mal_id": self.mal_id, "episode_num": self.episode_num,
             "internal_id": self.internal_id,
             "real_id": self.real_id, "media_id": self.media_id,
@@ -234,6 +254,40 @@ class PlayerPageError(MegaPlayError): pass
 # ---------------------------------------------------------------------------
 # MEGAPLAY SCRAPER
 # ---------------------------------------------------------------------------
+def extract_player_data_attrs(page_html: str) -> dict[str, str]:
+    return {
+        key.lower(): unescape(value).replace("\\/", "/")
+        for key, value in re.findall(
+            r'\bdata-([\w-]+)\s*=\s*["\']([^"\']*)["\']',
+            page_html or "",
+            flags=re.IGNORECASE,
+        )
+    }
+
+
+def extract_megaplay_iframe_url(page_html: str, page_url: str) -> str:
+    for match in re.finditer(
+        r'<iframe\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']',
+        page_html or "",
+        flags=re.IGNORECASE,
+    ):
+        candidate = unescape(match.group(1)).replace("\\/", "/")
+        if candidate.startswith("//"):
+            candidate = f"https:{candidate}"
+        iframe_url = urljoin(page_url, candidate)
+        parsed = urlparse(iframe_url)
+        if (parsed.hostname or "").lower().endswith("vidwish.live") and "/stream/" in parsed.path:
+            return iframe_url
+
+    raw = (page_html or "").replace("\\/", "/")
+    match = re.search(r'https?://(?:www\.)?vidwish\.live/stream/[^"\'<\s]+', raw, re.IGNORECASE)
+    return unescape(match.group(0)) if match else ""
+
+
+def extract_vidwish_source_id(page_html: str) -> str:
+    return extract_player_data_attrs(page_html).get("id", "")
+
+
 class MegaPlayScraper:
     def __init__(self, timeout=15, max_retries=3):
         self.timeout = timeout
@@ -261,18 +315,59 @@ class MegaPlayScraper:
             raise EpisodeNotFound(f"MAL={mal_id} ep={ep_num} type={stype}")
         if r.status_code != 200:
             raise PlayerPageError(f"HTTP {r.status_code}")
-        attrs = dict(re.findall(r'\bdata-([\w-]+)\s*=\s*["\']([^"\']+)["\']', r.text))
+        attrs = extract_player_data_attrs(r.text)
+        if "id" in attrs:
+            attrs["_source"] = "megaplay"
+            attrs["_player_url"] = url
+            attrs["_fallback_url"] = url
+            return attrs
+
+        vidwish_url = extract_megaplay_iframe_url(r.text, url)
+        if not vidwish_url:
+            logger.warning("Megaplay data-id missing; using iframe fallback for %s", url)
+            return {"_source": "iframe", "_player_url": url, "_fallback_url": url}
+
+        logger.info("vidwish layer -> %s", vidwish_url)
+        try:
+            vr = self.session.get(vidwish_url,
+                headers={**VIDWISH_NAV_HEADERS, "Referer": url},
+                impersonate=IMPERSONATE, timeout=self.timeout)
+        except Exception as e:
+            raise PlayerPageError(f"Vidwish fetch failed: {e}")
+        if vr.status_code == 404:
+            raise EpisodeNotFound(f"MAL={mal_id} ep={ep_num} type={stype}")
+        if vr.status_code != 200:
+            raise PlayerPageError(f"Vidwish HTTP {vr.status_code}")
+
+        attrs = extract_player_data_attrs(vr.text)
         if "id" not in attrs:
-            raise PlayerPageError(f"data-id missing ({len(r.text)} bytes)")
+            logger.warning("Vidwish data-id missing; using iframe fallback for %s", vidwish_url)
+            return {"_source": "iframe", "_player_url": vidwish_url, "_fallback_url": url}
+        attrs["_source"] = "vidwish"
+        attrs["_player_url"] = vidwish_url
+        attrs["_fallback_url"] = url
         return attrs
 
-    def _fetch_sources(self, internal_id, stype):
+    def _fetch_sources(self, attrs, stype):
+        internal_id = attrs.get("id", "")
+        if not internal_id:
+            raise PlayerPageError("data-id missing")
+        is_vidwish = attrs.get("_source") == "vidwish"
+        source_url = (
+            f"{VIDWISH_SOURCES_EP}?id={quote(internal_id, safe='')}&id={quote(internal_id, safe='')}"
+            if is_vidwish else SOURCES_EP
+        )
+        source_params = None if is_vidwish else {"id": internal_id, "type": stype}
+        source_headers = (
+            {**VIDWISH_API_HEADERS, "Referer": attrs.get("_player_url") or f"{VIDWISH_BASE}/"}
+            if is_vidwish else API_HEADERS
+        )
         last_err = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = self.session.get(SOURCES_EP,
-                    params={"id": internal_id, "type": stype},
-                    headers=API_HEADERS, impersonate=IMPERSONATE, timeout=self.timeout)
+                r = self.session.get(source_url,
+                    params=source_params,
+                    headers=source_headers, impersonate=IMPERSONATE, timeout=self.timeout)
                 if r.status_code == 200:  return r.json()
                 if r.status_code == 400:  raise InvalidRequest(r.text[:200])
                 if r.status_code == 403:  raise StreamBlocked(r.text[:200])
@@ -288,14 +383,27 @@ class MegaPlayScraper:
 
     def get_stream(self, mal_id, episode_num, stream_type="sub"):
         attrs = self._fetch_player_page(mal_id, episode_num, stream_type)
-        data  = self._fetch_sources(attrs["id"], stream_type)
-        return self._parse(data, mal_id, episode_num,
-                           internal_id=attrs["id"],
-                           real_id=attrs.get("realid", ""),
-                           media_id=attrs.get("mediaid", ""))
+        fallback_url = attrs.get("_fallback_url") or attrs.get("_player_url") or ""
+        try:
+            data  = self._fetch_sources(attrs, stream_type)
+            return self._parse(data, mal_id, episode_num,
+                               internal_id=attrs.get("id", ""),
+                               real_id=attrs.get("realid", ""),
+                               media_id=attrs.get("mediaid", ""),
+                               fallback_url=fallback_url)
+        except EpisodeNotFound:
+            if not fallback_url:
+                raise
+            logger.warning("Source endpoint returned 404, using iframe fallback")
+        except (InvalidRequest, StreamBlocked, PlayerPageError, MegaPlayError) as e:
+            logger.warning("HLS extraction failed, returning Megaplay iframe fallback: %s", e)
+        return StreamData(m3u8_url="", iframe_url=fallback_url,
+            mal_id=mal_id, episode_num=episode_num,
+            internal_id=attrs.get("id", ""), real_id=attrs.get("realid", ""),
+            media_id=attrs.get("mediaid", ""))
 
     @staticmethod
-    def _parse(data, mal_id, ep_num, internal_id, real_id, media_id):
+    def _parse(data, mal_id, ep_num, internal_id, real_id, media_id, fallback_url=""):
         sources  = data.get("sources") or {}
         m3u8_url = sources.get("file") if isinstance(sources, dict) else None
         if not m3u8_url and isinstance(data.get("sources"), list) and data["sources"]:
@@ -314,6 +422,7 @@ class MegaPlayScraper:
         return StreamData(m3u8_url=m3u8_url, subtitles=subs,
             intro=_tr(data.get("intro")), outro=_tr(data.get("outro")),
             server_id=data.get("server"), mal_id=mal_id, episode_num=ep_num,
+            iframe_url=fallback_url,
             internal_id=internal_id, real_id=real_id, media_id=media_id)
 
     def close(self):
@@ -1214,25 +1323,42 @@ async def get_episodes(mal_id: str, hint: int = 0):
 # --- stream -----------------------------------------------------------------
 @app.get("/api/stream/{mal_id}/{episode_num}")
 async def get_stream(request: Request, mal_id: str, episode_num: str,
-                     type: Literal["sub", "dub"] = "sub"):
+                     type: Literal["sub", "dub"] = "sub",
+                     embed: bool = False):
     loop = asyncio.get_running_loop()
-    try:
-        data: StreamData = await loop.run_in_executor(
-            None, scraper.get_stream, mal_id, episode_num, type)
-    except EpisodeNotFound:
-        raise HTTPException(404, "Episode not found on MegaPlay")
-    except InvalidRequest as e:
-        raise HTTPException(400, str(e))
-    except StreamBlocked as e:
-        raise HTTPException(503, f"Upstream blocked: {e}")
-    except PlayerPageError as e:
-        raise HTTPException(502, f"Player page error: {e}")
-    except MegaPlayError as e:
-        raise HTTPException(500, str(e))
+    if embed:
+        data = StreamData(
+            m3u8_url="",
+            iframe_url=(
+                f"{MEGAPLAY_BASE}/stream/mal/"
+                f"{quote(str(mal_id), safe='')}/{quote(str(episode_num), safe='')}/{type}"
+            ),
+            mal_id=mal_id,
+            episode_num=episode_num,
+        )
+    else:
+        ck = f"megaplay:{mal_id}:{episode_num}:{type}"
+        data: StreamData | None = _anime_cache.get(ck)
+        if data is None:
+            try:
+                data = await loop.run_in_executor(
+                    None, scraper.get_stream, mal_id, episode_num, type)
+                _anime_cache[ck] = data
+            except EpisodeNotFound:
+                raise HTTPException(404, "Episode not found on MegaPlay")
+            except InvalidRequest as e:
+                raise HTTPException(400, str(e))
+            except StreamBlocked as e:
+                raise HTTPException(503, f"Upstream blocked: {e}")
+            except PlayerPageError as e:
+                raise HTTPException(502, f"Player page error: {e}")
+            except MegaPlayError as e:
+                raise HTTPException(500, str(e))
 
     backend = _backend_base(request)
     result  = data.to_dict()
-    result["m3u8_url"] = _proxy_url(backend, data.m3u8_url, "/proxy/m3u8")
+    if data.m3u8_url:
+        result["m3u8_url"] = _proxy_url(backend, data.m3u8_url, "/proxy/m3u8")
     for sub in result["subtitles"]:
         if sub.get("file"):
             sub["file"] = _proxy_url(backend, sub["file"], "/proxy/vtt")
@@ -1917,6 +2043,7 @@ async def _search_9anime_slug(title: str) -> str | None:
     return best["slug"]
 
 _SLUG_OVERRIDES: dict[str, str] = {
+    "21": "one-piece",
     "59708": "classroom-of-the-elite-iv",   # Classroom of the Elite Season 4
 }
 
@@ -2154,7 +2281,7 @@ async def _fetch_watch_servers(slug_with_ep: str) -> dict[str, str]:
 
     for opt in _OPTION_RE.finditer(m.group(1)):
         val   = opt.group(1)
-        label = opt.group(2).strip().lower()
+        label = re.sub(r'<[^>]+>', '', opt.group(2)).strip().lower()
         if not val:
             continue
         iframe = _decode_iframe_from_option_value(val)
@@ -2275,7 +2402,18 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
         "sec-ch-ua-platform":   '"Windows"',
     }
     try:
-        resp = cffi_requests.post(url, headers=headers, json={}, impersonate="chrome136")
+        fingerprint = {
+            "token": secrets.token_urlsafe(24),
+            "viewer_id": uuid.uuid4().hex,
+            "device_id": uuid.uuid4().hex,
+            "confidence": 1,
+        }
+        resp = cffi_requests.post(
+            url,
+            headers=headers,
+            json={"fingerprint": fingerprint},
+            impersonate="chrome136",
+        )
         if resp.status_code != 200:
             logger.warning("Moon playback HTTP %s", resp.status_code)
             return None
