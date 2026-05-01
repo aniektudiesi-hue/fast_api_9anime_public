@@ -3245,6 +3245,10 @@ document.addEventListener('mousemove', function(e) {
     //  FETCH EPISODES
     // =========================================================================
     async function fetchEpisodes(anime) {
+        anime = {
+            ...anime,
+            anime_id: anime.anime_id || anime.mal_id || anime.id || '',
+        };
         const overlay   = document.getElementById('episodeOverlay');
         const container = document.getElementById('episodesContainer');
         document.getElementById('overlayTitle').textContent = anime.title;
@@ -3253,7 +3257,14 @@ document.addEventListener('mousemove', function(e) {
         // Optimistic render: if we already know the episode count from the
         // homepage card / search result, paint placeholder episodes instantly
         // and refresh once the backend confirms.
-        const knownCount = parseInt(anime.episode_count || 0, 10);
+        const knownCount = parseInt(
+            anime.episode_count ||
+            anime.num_episodes ||
+            anime.episodes_count ||
+            anime.total_episodes ||
+            0,
+            10
+        );
         const ck = `episodes_${anime.anime_id}`;
 
         if (apiCache.has(ck)) {

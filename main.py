@@ -581,6 +581,23 @@ async def _mal_get(path, **params):
     r.raise_for_status()
     return r.json()
 
+def _aired_count_from_anilist_media(media: dict) -> int:
+    """AniList aired-count rule: next airing episode minus one."""
+    next_ep = ((media or {}).get("nextAiringEpisode") or {}).get("episode")
+    if next_ep:
+        try:
+            return max(int(next_ep) - 1, 0)
+        except (TypeError, ValueError):
+            return 0
+
+    total = (media or {}).get("episodes") or 0
+    if (media or {}).get("status") == "FINISHED" and total:
+        try:
+            return max(int(total), 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
 # ---------------------------------------------------------------------------
 # ANILIST SEASONAL
 # ---------------------------------------------------------------------------
@@ -619,21 +636,7 @@ async def _anilist_ep_map() -> dict[int, int]:
         if not mid:
             continue
         
-        status = m.get('status')
-        total_episodes = m.get('episodes')
-        next_airing = m.get('nextAiringEpisode')
-        
-        if next_airing:
-            count = next_airing['episode'] - 1
-        elif status == 'FINISHED':
-            count = total_episodes if total_episodes else 0
-        elif status == 'RELEASING':
-            count = total_episodes if total_episodes else 0
-        elif status == 'NOT_YET_RELEASED':
-            count = 0
-        else:
-            count = 0
-        ep_map[int(mid)] = count
+        ep_map[int(mid)] = _aired_count_from_anilist_media(m)
     _home_cache[ck] = ep_map
     return ep_map
 
@@ -660,19 +663,12 @@ async def _anilist_episodes_for(mal_id: int) -> tuple[int, str]:
             ANILIST_GQL,
             json={"query": GQL_ANIME_EPS, "variables": {"malId": mal_id}},
             headers={"Content-Type": "application/json"},
-            timeout=httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=4.0),
+            timeout=httpx.Timeout(connect=8.0, read=16.0, write=8.0, pool=8.0),
         )
         r.raise_for_status()
         data = r.json().get("data", {}).get("Media") or {}
-        status         = data.get("status")
-        total_episodes = data.get("episodes")
-        next_airing    = data.get("nextAiringEpisode")
-
-        if next_airing and next_airing.get("episode"):
-            count = max(next_airing["episode"] - 1, 0)
-            source = "anilist"
-        elif status in ("FINISHED", "RELEASING") and total_episodes:
-            count = total_episodes
+        count = _aired_count_from_anilist_media(data)
+        if count > 0:
             source = "anilist"
     except Exception as e:
         logger.warning("AniList eps mal_id=%s failed: %s", mal_id, e)
@@ -701,6 +697,35 @@ async def _anilist_episodes_for(mal_id: int) -> tuple[int, str]:
         _anime_cache[ck] = (count, source)
 
     return count, source
+
+async def _episode_overrides_for_cards(nodes: list[dict]) -> dict[int, int]:
+    """Use AniList live aired counts for MAL cards that need current counts."""
+    candidates: list[int] = []
+    for n in nodes:
+        try:
+            mid = int(n.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not mid:
+            continue
+        status = n.get("status") or ""
+        mal_count = n.get("num_episodes") or 0
+        if status in ("currently_airing", "not_yet_aired") or not mal_count:
+            candidates.append(mid)
+
+    sem = asyncio.Semaphore(6)
+
+    async def _one(mid: int) -> tuple[int, int]:
+        async with sem:
+            try:
+                count, source = await _anilist_episodes_for(mid)
+                return mid, count if source == "anilist" else 0
+            except Exception as e:
+                logger.warning("AniList card eps mal_id=%s failed: %s", mid, e)
+                return mid, 0
+
+    pairs = await asyncio.gather(*(_one(mid) for mid in sorted(set(candidates))))
+    return {mid: count for mid, count in pairs if count > 0}
 
 # ---------------------------------------------------------------------------
 # MAL SEASONAL
@@ -1152,16 +1177,14 @@ async def get_banners():
             continue
         titles = m.get("title") or {}
         title  = (titles.get("english") or titles.get("romaji") or "").strip()
-        total  = m.get("episodes") or 0
-        nxt    = (m.get("nextAiringEpisode") or {}).get("episode", 0)
-        aired  = max(nxt - 1, 0) if nxt else 0
+        aired  = _aired_count_from_anilist_media(m)
         result.append({
             "anime_id":      str(m.get("idMal", m["id"])),
             "title":         title,
             "img_url":       img,
             "banner":        banner,
             "cover":         cover,
-            "episode_count": total or aired,
+            "episode_count": aired,
             "score":         round((m.get("averageScore") or 0) / 10, 1),
         })
     result = result[:10]
@@ -1214,10 +1237,12 @@ async def home_top_rated():
             return _home_cache[ck]
         try:
             data = await _mal_get("/anime/ranking", ranking_type="all", limit=50,
-                                  fields="id,title,main_picture,num_episodes,mean,alternative_titles")
+                                  fields="id,title,main_picture,num_episodes,mean,alternative_titles,status")
         except Exception as e:
             raise HTTPException(502, f"MAL ranking failed: {e}")
-        result = [_fmt_card(e["node"]) for e in data.get("data", [])]
+        nodes = [e["node"] for e in data.get("data", [])]
+        ep_map = await _episode_overrides_for_cards(nodes)
+        result = [_fmt_card(n, ep_override=ep_map.get(int(n.get("id", 0)), 0)) for n in nodes]
         _home_cache[ck] = result
         return result
 
@@ -1263,7 +1288,8 @@ async def search_anime(query: str):
         if q_lo in jp:               return 4
         return 5
     nodes.sort(key=_rank)
-    result = [_fmt_card(n) for n in nodes]
+    ep_map = await _episode_overrides_for_cards(nodes)
+    result = [_fmt_card(n, ep_override=ep_map.get(int(n.get("id", 0)), 0)) for n in nodes]
     _search_cache[ck] = result
     return {"results": result}
 
