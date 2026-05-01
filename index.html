@@ -2471,6 +2471,11 @@ document.addEventListener('mousemove', function(e) {
     // =========================================================================
     const API_BASE        = '';
     const MEGAPLAY_EMBED_ONLY = false; // HLS/proxy only; do not render embeds.
+    const RO_STREAM_CACHE_MS = 10 * 60 * 1000;
+    const RO_PREFETCH_AFTER_SECONDS = 10;
+    const RO_NEXT_PREFETCH_PARALLEL = 6;
+    const RO_PREFETCH_MAX_BANDWIDTH = 3_500_000;
+    const RO_FORWARD_BUFFER_SECONDS = 180;
     const apiCache        = new Map();
     const suggestionCache = new Map();
 
@@ -2503,6 +2508,8 @@ document.addEventListener('mousemove', function(e) {
     let megaPlayReady = false;
     let megaPlayFailed = false;
     let roStreamToken = 0;
+    let roNextPrefetchedFor = '';
+    const roStreamPrefetches = new Set();
 
     let roSubtitleCues   = [];
     let roSubActive      = false;
@@ -2903,6 +2910,18 @@ document.addEventListener('mousemove', function(e) {
         }
     }
 
+    function _episodeCountOf(anime) {
+        const n = parseInt(
+            anime?.episode_count ||
+            anime?.num_episodes ||
+            anime?.episodes_count ||
+            anime?.total_episodes ||
+            0,
+            10
+        );
+        return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
     function _addCardBadges(imgWrapper, anime) {
         // TV badge top-right
         const bFmt = document.createElement('span');
@@ -2913,10 +2932,12 @@ document.addEventListener('mousemove', function(e) {
         bSD.className = 'badge-sub-dub'; bSD.textContent = 'Sub';
         imgWrapper.appendChild(bSD);
         // Episode badge bottom-left
-        const eps = anime.num_episodes > 0 ? anime.num_episodes : '?';
-        const bEp = document.createElement('span');
-        bEp.className = 'badge-ep'; bEp.textContent = `Ep ${eps}`;
-        imgWrapper.appendChild(bEp);
+        const eps = _episodeCountOf(anime);
+        if (eps > 0) {
+            const bEp = document.createElement('span');
+            bEp.className = 'badge-ep'; bEp.textContent = `Ep ${eps}`;
+            imgWrapper.appendChild(bEp);
+        }
     }
 
     function createRecentCard(anime, idx) {
@@ -2943,7 +2964,8 @@ document.addEventListener('mousemove', function(e) {
         const title = document.createElement('div'); title.className = 'card-title';
         title.textContent = anime.title;
         const meta = document.createElement('div'); meta.className = 'card-meta';
-        meta.textContent = anime.num_episodes > 0 ? `${anime.num_episodes} Episodes` : 'Airing';
+        const eps = _episodeCountOf(anime);
+        meta.textContent = eps > 0 ? `${eps} Episodes` : 'Airing';
         info.appendChild(title); info.appendChild(meta);
         card.appendChild(imgWrapper); card.appendChild(info);
         card.addEventListener('click', () => fetchEpisodes(anime));
@@ -3076,8 +3098,8 @@ document.addEventListener('mousemove', function(e) {
         const titleEl = document.createElement('div'); titleEl.className = 'card-title';
         titleEl.textContent = element.title;
         const meta = document.createElement('div'); meta.className = 'card-meta';
-        const eps = element.num_episodes > 0 ? `${element.num_episodes} Episodes` : 'Airing';
-        meta.textContent = eps;
+        const eps = _episodeCountOf(element);
+        meta.textContent = eps > 0 ? `${eps} Episodes` : 'Airing';
         info.appendChild(titleEl); info.appendChild(meta);
         card.appendChild(imgWrapper); card.appendChild(info);
         card.addEventListener('click', () => fetchEpisodes(element));
@@ -3257,14 +3279,7 @@ document.addEventListener('mousemove', function(e) {
         // Optimistic render: if we already know the episode count from the
         // homepage card / search result, paint placeholder episodes instantly
         // and refresh once the backend confirms.
-        const knownCount = parseInt(
-            anime.episode_count ||
-            anime.num_episodes ||
-            anime.episodes_count ||
-            anime.total_episodes ||
-            0,
-            10
-        );
+        const knownCount = _episodeCountOf(anime);
         const ck = `episodes_${anime.anime_id}`;
 
         if (apiCache.has(ck)) {
@@ -3429,6 +3444,7 @@ document.addEventListener('mousemove', function(e) {
         megaPlayReady = false;
         megaPlayFailed = false;
         roStreamToken++;
+        roNextPrefetchedFor = '';
         const skipBtn = document.getElementById('roSkipBtn');
         if (skipBtn) skipBtn.style.display = 'none';
 
@@ -3592,6 +3608,203 @@ document.addEventListener('mousemove', function(e) {
         const ct = document.getElementById('roVideoEl').currentTime;
         roRenderSubtitle(ct);
         _checkSkipBtn(ct);
+        _maybePrefetchNextEpisode(ct);
+    }
+
+    function _streamCacheKey(malId, ep, track = currentAudioTrack) {
+        return `stream_${malId}_${ep}_${track}_${MEGAPLAY_EMBED_ONLY ? 'embed' : 'hls'}`;
+    }
+
+    function _cacheStreamData(key, data, ttl = RO_STREAM_CACHE_MS) {
+        apiCache.set(key, data);
+        setTimeout(() => {
+            if (apiCache.get(key) === data) apiCache.delete(key);
+        }, ttl);
+    }
+
+    function _nextEpisodeEntry() {
+        if (!currentStreamData || !Array.isArray(currentStreamData.episodes)) return null;
+        const nextNum = parseInt(currentStreamData.ep, 10) + 1;
+        return currentStreamData.episodes.find(e => parseInt(e.episode_number, 10) === nextNum) || null;
+    }
+
+    function _resolveManifestUrl(line, baseUrl) {
+        const clean = (line || '').trim();
+        if (!clean || clean.startsWith('#')) return '';
+        try { return new URL(clean, baseUrl).href; } catch(e) { return ''; }
+    }
+
+    function _firstPlaylistUrl(text, baseUrl) {
+        const lines = (text || '').split(/\r?\n/);
+        for (const line of lines) {
+            const url = _resolveManifestUrl(line, baseUrl);
+            if (url && (url.includes('/proxy/m3u8') || url.endsWith('.m3u8'))) return url;
+        }
+        return '';
+    }
+
+    function _masterPlaylistVariants(text, baseUrl) {
+        const variants = [];
+        const lines = (text || '').split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+
+            const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+            const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+            for (let j = i + 1; j < lines.length; j++) {
+                const uri = _resolveManifestUrl(lines[j], baseUrl);
+                if (uri) {
+                    variants.push({ uri, bandwidth });
+                    break;
+                }
+                if (lines[j].trim() && !lines[j].trim().startsWith('#')) break;
+            }
+        }
+        return variants;
+    }
+
+    function _selectPrefetchVariant(variants) {
+        if (!variants.length) return null;
+        const sorted = [...variants].sort((a, b) => (a.bandwidth || 0) - (b.bandwidth || 0));
+        const compact = sorted.filter(v => v.bandwidth && v.bandwidth <= RO_PREFETCH_MAX_BANDWIDTH).pop();
+        return compact || sorted.find(v => v.bandwidth) || sorted[0];
+    }
+
+    function _segmentUrlsFromManifest(text, baseUrl) {
+        const urls = [];
+        const lines = (text || '').split(/\r?\n/);
+        for (const raw of lines) {
+            const line = raw.trim();
+            if (!line) continue;
+            if (line.startsWith('#EXT-X-KEY')) {
+                const match = line.match(/URI="([^"]+)"/);
+                if (match) {
+                    try { urls.push(new URL(match[1], baseUrl).href); } catch(e) {}
+                }
+                continue;
+            }
+            if (line.startsWith('#EXT-X-MAP')) {
+                const match = line.match(/URI="([^"]+)"/);
+                if (match) {
+                    try { urls.push(new URL(match[1], baseUrl).href); } catch(e) {}
+                }
+                continue;
+            }
+            const url = _resolveManifestUrl(line, baseUrl);
+            if (url && !url.includes('/proxy/m3u8') && !url.endsWith('.m3u8')) urls.push(url);
+        }
+        return urls;
+    }
+
+    async function _prefetchResourceUrls(urls, key, token) {
+        let cursor = 0;
+        let done = 0;
+        let failures = 0;
+        let bytes = 0;
+
+        const setState = (status) => {
+            window.__roPrefetchState = { key, status, done, total: urls.length, failures, bytes };
+        };
+        setState('fetching');
+
+        const worker = async () => {
+            while (cursor < urls.length) {
+                if (token !== roStreamToken) return;
+                const i = cursor++;
+                try {
+                    const r = await fetch(urls[i], { cache: 'force-cache' });
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    const buf = await r.arrayBuffer();
+                    bytes += buf.byteLength;
+                } catch(e) {
+                    failures++;
+                    console.debug('[Prefetch] resource skipped:', e.message);
+                } finally {
+                    done++;
+                    if (done === urls.length || done % 25 === 0) setState('fetching');
+                }
+            }
+        };
+
+        const workers = Array.from(
+            { length: Math.min(RO_NEXT_PREFETCH_PARALLEL, Math.max(urls.length, 1)) },
+            () => worker()
+        );
+        await Promise.all(workers);
+        if (token !== roStreamToken) throw new Error('cancelled');
+        setState(failures ? 'partial' : 'done');
+        return { total: urls.length, done, failures, bytes };
+    }
+
+    async function _prefetchFullHls(m3u8Url, key, token) {
+        if (!m3u8Url) return null;
+        const fetchText = async (url) => {
+            const r = await fetch(url, { cache: 'force-cache' });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            return { url, text: await r.text() };
+        };
+
+        let manifest = await fetchText(m3u8Url);
+        let playlistUrl = manifest.url;
+        const variants = _masterPlaylistVariants(manifest.text, manifest.url);
+        const selected = _selectPrefetchVariant(variants);
+        if (selected?.uri) {
+            manifest = await fetchText(selected.uri);
+            playlistUrl = selected.uri;
+        }
+
+        const resourceUrls = _segmentUrlsFromManifest(manifest.text, manifest.url);
+        if (!resourceUrls.length) throw new Error('playlist has no segments');
+        const result = await _prefetchResourceUrls(resourceUrls, key, token);
+        return { ...result, playlistUrl };
+    }
+
+    async function _prefetchNextEpisodeStream(nextEp, token) {
+        if (!currentStreamData || !nextEp || window._offlineMode) return;
+        const malId = currentStreamData.mal_id;
+        const nextNum = parseInt(nextEp.episode_number, 10);
+        if (!malId || !Number.isFinite(nextNum)) return;
+
+        const key = _streamCacheKey(malId, nextNum);
+        if (apiCache.has(key) || roStreamPrefetches.has(key)) return;
+
+        roStreamPrefetches.add(key);
+        try {
+            const streamUrl = `${API_BASE}/api/stream/${malId}/${nextNum}?type=${currentAudioTrack}` +
+                (MEGAPLAY_EMBED_ONLY ? '&embed=1' : '');
+            const r = await fetch(streamUrl, { cache: 'force-cache' });
+            if (!r.ok) {
+                const body = await r.json().catch(() => ({}));
+                throw new Error(body.detail || `HTTP ${r.status}`);
+            }
+            const data = await r.json();
+            _cacheStreamData(key, data);
+            if (data.m3u8_url) {
+                const full = await _prefetchFullHls(data.m3u8_url, key, token);
+                if (full?.playlistUrl && full.failures < full.total) {
+                    data.m3u8_url = full.playlistUrl;
+                    _cacheStreamData(key, data);
+                }
+                console.log(`[Prefetch] next episode ${nextNum}: ${full.done}/${full.total} resources fetched`);
+            } else {
+                console.log(`[Prefetch] next episode ${nextNum} stream data ready`);
+            }
+        } catch(e) {
+            console.debug('[Prefetch] next episode skipped:', e.message);
+        } finally {
+            roStreamPrefetches.delete(key);
+        }
+    }
+
+    function _maybePrefetchNextEpisode(ct) {
+        if (window._offlineMode || !currentStreamData || ct < RO_PREFETCH_AFTER_SECONDS) return;
+        const nextEp = _nextEpisodeEntry();
+        if (!nextEp) return;
+        const key = _streamCacheKey(currentStreamData.mal_id, parseInt(nextEp.episode_number, 10));
+        if (roNextPrefetchedFor === key) return;
+        roNextPrefetchedFor = key;
+        _prefetchNextEpisodeStream(nextEp, roStreamToken);
     }
 
     // =========================================================================
@@ -3613,7 +3826,7 @@ document.addEventListener('mousemove', function(e) {
         _clearMegaPlayIframe();
         roResetSubtitleState();
 
-        const ck = `stream_${mal_id}_${ep}_${currentAudioTrack}_${MEGAPLAY_EMBED_ONLY ? 'embed' : 'hls'}`;
+        const ck = _streamCacheKey(mal_id, ep);
         let streamData = apiCache.has(ck) ? apiCache.get(ck) : null;
 
         if (!streamData) {
@@ -3626,8 +3839,7 @@ document.addEventListener('mousemove', function(e) {
                     throw new Error(body.detail || `HTTP ${r.status}`);
                 }
                 streamData = await r.json();
-                apiCache.set(ck, streamData);
-                setTimeout(() => apiCache.delete(ck), 120_000);
+                _cacheStreamData(ck, streamData);
             } catch(err) {
                 badge.textContent = `\u26a0 Stream failed: ${err.message}`;
                 badge.className   = 'stream-status error';
@@ -3710,8 +3922,12 @@ document.addEventListener('mousemove', function(e) {
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             hlsInstance = new Hls({
                 enableWorker: true, lowLatencyMode: false,
-                maxBufferLength: 30, maxMaxBufferLength: 90, backBufferLength: 60,
+                maxBufferLength: RO_FORWARD_BUFFER_SECONDS,
+                maxMaxBufferLength: RO_FORWARD_BUFFER_SECONDS * 2,
+                maxBufferSize: 180 * 1000 * 1000,
+                backBufferLength: 90,
                 startLevel: -1,
+                startFragPrefetch: true,
                 fragLoadingTimeOut: 20000, manifestLoadingTimeOut: 20000,
                 fragLoadingMaxRetry: 4, manifestLoadingMaxRetry: 4,
             });
@@ -4000,7 +4216,8 @@ document.addEventListener('mousemove', function(e) {
                         anime_id:    s.anime_id,
                         title:       s.title || '',
                         image_url:   s.image_url || '',
-                        episode_count: s.episode_count || 0,
+                        episode_count: s.episode_count || s.num_episodes || 0,
+                        num_episodes: s.num_episodes || s.episode_count || 0,
                     });
                 } else {
                     document.getElementById('searchInput').value = s.title || s;

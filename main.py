@@ -87,6 +87,19 @@ query($malId: Int) {
 }
 """
 
+GQL_ANIME_EPS_BATCH = """
+query($ids: [Int], $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(idMal_in: $ids, type: ANIME) {
+      idMal
+      status
+      episodes
+      nextAiringEpisode { episode }
+    }
+  }
+}
+"""
+
 NAV_HEADERS = {
     "User-Agent": ANDROID_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -698,6 +711,57 @@ async def _anilist_episodes_for(mal_id: int) -> tuple[int, str]:
 
     return count, source
 
+async def _anilist_episode_map_for_ids(mal_ids: list[int]) -> dict[int, int]:
+    """Resolve aired episode counts for many MAL ids in one AniList call."""
+    ids = sorted({int(mid) for mid in mal_ids if mid})
+    result: dict[int, int] = {}
+    pending: list[int] = []
+
+    for mid in ids:
+        cached = _anime_cache.get(f"al_eps_{mid}")
+        if cached and cached[0] > 0:
+            result[mid] = cached[0]
+        else:
+            pending.append(mid)
+
+    for i in range(0, len(pending), 50):
+        chunk = pending[i:i + 50]
+        if not chunk:
+            continue
+        try:
+            r = await _http.post(
+                ANILIST_GQL,
+                json={
+                    "query": GQL_ANIME_EPS_BATCH,
+                    "variables": {
+                        "ids": chunk,
+                        "page": 1,
+                        "perPage": len(chunk),
+                    },
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=httpx.Timeout(connect=8.0, read=16.0, write=8.0, pool=8.0),
+            )
+            r.raise_for_status()
+            media = r.json().get("data", {}).get("Page", {}).get("media", []) or []
+            for item in media:
+                try:
+                    mid = int(item.get("idMal") or 0)
+                except (TypeError, ValueError):
+                    continue
+                count = _aired_count_from_anilist_media(item)
+                if mid and count > 0:
+                    result[mid] = count
+                    _anime_cache[f"al_eps_{mid}"] = (count, "anilist")
+        except Exception as e:
+            logger.warning("AniList batch eps failed for %d ids: %s", len(chunk), e)
+            for mid in chunk:
+                count, source = await _anilist_episodes_for(mid)
+                if count > 0 and source == "anilist":
+                    result[mid] = count
+
+    return result
+
 async def _episode_overrides_for_cards(nodes: list[dict]) -> dict[int, int]:
     """Use AniList live aired counts for MAL cards that need current counts."""
     candidates: list[int] = []
@@ -713,19 +777,7 @@ async def _episode_overrides_for_cards(nodes: list[dict]) -> dict[int, int]:
         if status in ("currently_airing", "not_yet_aired") or not mal_count:
             candidates.append(mid)
 
-    sem = asyncio.Semaphore(6)
-
-    async def _one(mid: int) -> tuple[int, int]:
-        async with sem:
-            try:
-                count, source = await _anilist_episodes_for(mid)
-                return mid, count if source == "anilist" else 0
-            except Exception as e:
-                logger.warning("AniList card eps mal_id=%s failed: %s", mid, e)
-                return mid, 0
-
-    pairs = await asyncio.gather(*(_one(mid) for mid in sorted(set(candidates))))
-    return {mid: count for mid, count in pairs if count > 0}
+    return await _anilist_episode_map_for_ids(candidates)
 
 # ---------------------------------------------------------------------------
 # MAL SEASONAL
@@ -1200,11 +1252,12 @@ async def home_thumbnails():
         return _home_cache[ck]
     try:
         entries = await _mal_seasonal()
-        ep_map  = await _anilist_ep_map()
+        nodes = [e["node"] for e in entries]
+        ep_map  = await _episode_overrides_for_cards(nodes)
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
-    result = [_fmt_card(e["node"], ep_override=ep_map.get(int(e["node"].get("id", 0)), 0))
-              for e in entries]
+    result = [_fmt_card(n, ep_override=ep_map.get(int(n.get("id", 0)), 0))
+              for n in nodes]
     _home_cache[ck] = result
     return result
 
@@ -1216,13 +1269,14 @@ async def recently_added():
         return _home_cache[ck]
     try:
         entries = await _mal_seasonal()
-        ep_map  = await _anilist_ep_map()
+        nodes = [e["node"] for e in entries]
+        ep_map  = await _episode_overrides_for_cards(nodes)
     except Exception as e:
         raise HTTPException(502, f"Fetch failed: {e}")
-    airing = [e for e in entries
-              if e["node"].get("status") in ("currently_airing", "not_yet_aired")]
-    result = [_fmt_card(e["node"], ep_override=ep_map.get(int(e["node"].get("id", 0)), 0))
-              for e in airing[:30]]
+    airing = [n for n in nodes
+              if n.get("status") in ("currently_airing", "not_yet_aired")]
+    result = [_fmt_card(n, ep_override=ep_map.get(int(n.get("id", 0)), 0))
+              for n in airing[:30]]
     _home_cache[ck] = result
     return result
 
@@ -1303,15 +1357,17 @@ async def suggest_anime(query: str):
         return {"results": _suggest_cache[ck]}
     try:
         data = await _mal_get("/anime", q=query, limit=10,
-                              fields="id,title,alternative_titles")
+                              fields=_SEARCH_FIELDS)
     except Exception:
         return {"results": []}
+    nodes = [e["node"] for e in data.get("data", [])]
+    ep_map = await _episode_overrides_for_cards(nodes)
     results = []
-    for e in data.get("data", []):
-        n  = e["node"]; alt = n.get("alternative_titles") or {}
-        en = (alt.get("en") or "").strip()
-        results.append({"title": en if en else n.get("title", ""),
-                        "anime_id": str(n.get("id", ""))})
+    for n in nodes:
+        card = _fmt_card(n, ep_override=ep_map.get(int(n.get("id", 0)), 0))
+        card["image_url"] = card.get("poster", "")
+        card["episode_count"] = card.get("num_episodes", 0)
+        results.append(card)
     _suggest_cache[ck] = results
     return {"results": results}
 
