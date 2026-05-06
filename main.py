@@ -171,7 +171,7 @@ DESKTOP_UA = (
 # host substring -> (referer, user_agent, impersonate_profile)
 _UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
     ("watching.onl",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
-    ("cinewave",          f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
+    ("cinewave",          f"{MEGAPLAY_BASE}/", ANDROID_UA, IMPERSONATE),
     ("vidwish.live",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
     # Moon stack — DESKTOP UA mandatory
     ("r66nv9ed.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
@@ -2231,7 +2231,10 @@ def _get_scrape_lock(slug: str) -> asyncio.Lock:
     return _scrape_locks[slug]
 
 
-_WATCH_URL_TMPL = "https://9animetv.org.lv/watch/{}"
+_WATCH_URL_TMPLS = (
+    "https://9animetv.org.lv/{}/",
+    "https://9animetv.org.lv/watch/{}",
+)
 _MIRROR_RE      = re.compile(r'<select[^>]*class="mirror"[^>]*>(.*?)</select>', re.S)
 _OPTION_RE      = re.compile(r'<option[^>]*value="([^"]+)"[^>]*>([^<]*)</option>')
 _BIG_VALUE_RE   = re.compile(r'<option[^>]*value="[A-Za-z0-9+/=]{20,}"')
@@ -2239,19 +2242,34 @@ _WORKERS_RE     = re.compile(r'https://[^"\'<>\s]*workers\.dev[^"\'<>\s]+')
 _MOON_ID_RE     = re.compile(r'/e/([A-Za-z0-9_-]+)')
 
 
+async def _fetch_watch_page(slug_with_ep: str, read_timeout: float = 10.0):
+    """Fetch a real 9anime watch page, trying both current and legacy URL shapes."""
+    headers = {"User-Agent": MOON_UA, "Accept": "text/html"}
+    timeout = httpx.Timeout(connect=4.0, read=read_timeout, write=4.0, pool=4.0)
+    last_error = None
+    for tmpl in _WATCH_URL_TMPLS:
+        url = tmpl.format(slug_with_ep)
+        try:
+            r = await _http.get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            if r.status_code == 200 and _MIRROR_RE.search(r.text):
+                return r
+            last_error = f"HTTP {r.status_code} for {url}"
+        except Exception as e:
+            last_error = e
+    if last_error:
+        logger.warning("Watch page fetch failed for %s: %s", slug_with_ep, last_error)
+    return None
+
+
 async def _verify_watch_url(slug_with_ep: str) -> bool:
-    """True iff /watch/{slug} returns a real player page with a populated mirror."""
-    url = _WATCH_URL_TMPL.format(slug_with_ep)
-    try:
-        r = await _http.get(
-            url,
-            headers={"User-Agent": MOON_UA, "Accept": "text/html"},
-            timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0),
-            follow_redirects=True,
-        )
-    except Exception:
-        return False
-    if r.status_code != 200:
+    """True iff the watch page returns a populated mirror selector."""
+    r = await _fetch_watch_page(slug_with_ep, read_timeout=8.0)
+    if not r:
         return False
     m = _MIRROR_RE.search(r.text)
     if not m:
@@ -2343,17 +2361,8 @@ def _decode_iframe_from_option_value(b64: str) -> str | None:
 
 async def _fetch_watch_servers(slug_with_ep: str) -> dict[str, str]:
     """Single httpx GET on the watch page; returns {'hd': iframe, 'moon': iframe, 'omega': iframe}."""
-    url = _WATCH_URL_TMPL.format(slug_with_ep)
-    try:
-        r = await _http.get(
-            url,
-            headers={"User-Agent": MOON_UA, "Accept": "text/html"},
-            timeout=httpx.Timeout(connect=4.0, read=10.0, write=4.0, pool=4.0),
-            follow_redirects=True,
-        )
-        r.raise_for_status()
-    except Exception as e:
-        logger.warning("Watch page fetch failed for %s: %s", slug_with_ep, e)
+    r = await _fetch_watch_page(slug_with_ep)
+    if not r:
         return {}
 
     out: dict[str, str] = {}
