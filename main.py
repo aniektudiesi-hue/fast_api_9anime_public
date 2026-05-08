@@ -31,6 +31,13 @@ MEGAPLAY_BASE = "https://megaplay.buzz"
 SOURCES_EP    = f"{MEGAPLAY_BASE}/stream/getSources"
 VIDWISH_BASE  = "https://vidwish.live"
 VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
+# Optional edge proxy base for HLS playlists, chunks, captions, and HD media.
+# Keep empty to preserve the existing direct-backend proxy behavior.
+CLOUDFLARE_PROXY_BASE = (
+    os.getenv("CLOUDFLARE_PROXY_BASE")
+    or os.getenv("RO_PROXY_BASE")
+    or ""
+).rstrip("/")
 IMPERSONATE   = "chrome131_android"
 ANDROID_UA    = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
@@ -1146,6 +1153,9 @@ def _backend_base(req: Request) -> str:
     host   = req.headers.get("x-forwarded-host")  or req.url.netloc
     return f"{scheme}://{host}"
 
+def _stream_proxy_base(req: Request) -> str:
+    return CLOUDFLARE_PROXY_BASE or _backend_base(req)
+
 # --- root -------------------------------------------------------------------
 @app.get("/")
 async def root():
@@ -1437,7 +1447,7 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
             except MegaPlayError as e:
                 raise HTTPException(500, str(e))
 
-    backend = _backend_base(request)
+    backend = _stream_proxy_base(request)
     result  = data.to_dict()
     if data.m3u8_url:
         result["m3u8_url"] = _proxy_url(backend, data.m3u8_url, "/proxy/m3u8")
@@ -1460,7 +1470,7 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
         raise HTTPException(502, f"Upstream fetch failed: {e}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _backend_base(request))
+    rewritten = rewrite_m3u8(r.text, url, _stream_proxy_base(request))
     body, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
@@ -1482,7 +1492,7 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
         raise HTTPException(502, f"Upstream fetch failed: {e}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _backend_base(request))
+    rewritten = rewrite_m3u8(r.text, url, _stream_proxy_base(request))
     _, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
@@ -2565,7 +2575,7 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     # so we cannot let the browser fetch master.m3u8 directly. Wrap it in
     # /proxy/m3u8 — same path the megaplay endpoint uses — so the proxy can
     # add the right upstream headers and serve our origin to the browser.
-    backend = _backend_base(request)
+    backend = _stream_proxy_base(request)
     response = {
         "url":          _proxy_url(backend, result["url"], "/proxy/m3u8"),
         # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
@@ -2580,7 +2590,7 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
 
 # --- hd1 stream endpoint ----------------------------------------------------
 @app.get("/api/hd1/{mal_id}/{episode_num}")
-async def get_hd1_stream(mal_id: str, episode_num: str):
+async def get_hd1_stream(mal_id: str, episode_num: str, request: Request):
     ck = f"hd1:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
@@ -2599,7 +2609,8 @@ async def get_hd1_stream(mal_id: str, episode_num: str):
     if not mp4_url:
         raise HTTPException(502, "HD1: workers.dev URL extraction from gogoanime failed")
 
-    response = {"url": mp4_url, "server": "hd1"}
+    hd_url = _proxy_url(_stream_proxy_base(request), mp4_url, "/proxy/chunk") if CLOUDFLARE_PROXY_BASE else mp4_url
+    response = {"url": hd_url, "server": "hd1"}
     _anime_cache[ck] = response
     return response
 
