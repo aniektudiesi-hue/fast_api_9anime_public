@@ -33,7 +33,7 @@ VIDWISH_BASE  = "https://vidwish.live"
 VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
 # Hardcode your deployed Worker URL here after Cloudflare creates it.
 # Example: "https://anime-tv-stream-proxy.your-subdomain.workers.dev"
-HARDCODED_CLOUDFLARE_PROXY_BASE = ""
+HARDCODED_CLOUDFLARE_PROXY_BASE = "https://anime-tv-stream-proxy.kamuri-anime.workers.dev"
 
 # Edge proxy base for HLS playlists, chunks, captions, and HD media.
 # Falls back to the current backend proxy until the Worker URL is known.
