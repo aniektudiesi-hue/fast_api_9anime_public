@@ -1161,6 +1161,22 @@ def _backend_base(req: Request) -> str:
 def _stream_proxy_base(req: Request) -> str:
     return CLOUDFLARE_PROXY_BASE or _backend_base(req)
 
+def _requires_backend_proxy(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(needle in host for needle in (
+        "r66nv9ed.com",
+        "sprintcdn",
+        "bysesayeveum.com",
+        "398fitus.com",
+    ))
+
+def _playlist_proxy_base(req: Request, upstream_url: str) -> str:
+    # Moon's CDN rejects Cloudflare Worker fetches but accepts our curl_cffi
+    # backend proxy with the desktop Chrome impersonation profile.
+    if _requires_backend_proxy(upstream_url):
+        return _backend_base(req)
+    return _stream_proxy_base(req)
+
 # --- root -------------------------------------------------------------------
 @app.get("/")
 async def root():
@@ -1475,7 +1491,7 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
         raise HTTPException(502, f"Upstream fetch failed: {e}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _stream_proxy_base(request))
+    rewritten = rewrite_m3u8(r.text, url, _playlist_proxy_base(request, url))
     body, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
@@ -1497,7 +1513,7 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
         raise HTTPException(502, f"Upstream fetch failed: {e}")
     if r.status_code != 200:
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _stream_proxy_base(request))
+    rewritten = rewrite_m3u8(r.text, url, _playlist_proxy_base(request, url))
     _, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
@@ -2580,7 +2596,7 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     # so we cannot let the browser fetch master.m3u8 directly. Wrap it in
     # /proxy/m3u8 — same path the megaplay endpoint uses — so the proxy can
     # add the right upstream headers and serve our origin to the browser.
-    backend = _stream_proxy_base(request)
+    backend = _backend_base(request)
     response = {
         "url":          _proxy_url(backend, result["url"], "/proxy/m3u8"),
         # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
