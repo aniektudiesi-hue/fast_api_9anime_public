@@ -31,10 +31,15 @@ MEGAPLAY_BASE = "https://megaplay.buzz"
 SOURCES_EP    = f"{MEGAPLAY_BASE}/stream/getSources"
 VIDWISH_BASE  = "https://vidwish.live"
 VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
-# Optional edge proxy base for HLS playlists, chunks, captions, and HD media.
-# Keep empty to preserve the existing direct-backend proxy behavior.
+# Hardcode your deployed Worker URL here after Cloudflare creates it.
+# Example: "https://anime-tv-stream-proxy.your-subdomain.workers.dev"
+HARDCODED_CLOUDFLARE_PROXY_BASE = ""
+
+# Edge proxy base for HLS playlists, chunks, captions, and HD media.
+# Falls back to the current backend proxy until the Worker URL is known.
 CLOUDFLARE_PROXY_BASE = (
-    os.getenv("CLOUDFLARE_PROXY_BASE")
+    HARDCODED_CLOUDFLARE_PROXY_BASE
+    or os.getenv("CLOUDFLARE_PROXY_BASE")
     or os.getenv("RO_PROXY_BASE")
     or ""
 ).rstrip("/")
