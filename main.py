@@ -2,7 +2,7 @@
 RO-ANIME Backend v3
 """
 from __future__ import annotations
-import asyncio, base64, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid
+import asyncio, base64, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
@@ -832,7 +832,24 @@ if _DATABASE_URL.startswith("postgres://"):
     _DATABASE_URL = "postgresql://" + _DATABASE_URL[len("postgres://"):]
 IS_PG = _DATABASE_URL.startswith("postgresql")
 
-_DB_PATH = Path(__file__).parent / "ro_anime_users.db"
+_LEGACY_DB_PATH = Path(__file__).parent / "ro_anime_users.db"
+_SQLITE_PATH_ENV = os.environ.get("SQLITE_PATH", "").strip()
+_SQLITE_DIR_ENV = os.environ.get("SQLITE_DIR", "").strip()
+_RENDER_DISK_DIR = Path("/var/data")
+
+if _SQLITE_PATH_ENV:
+    _DB_PATH = Path(_SQLITE_PATH_ENV)
+elif _SQLITE_DIR_ENV:
+    _DB_PATH = Path(_SQLITE_DIR_ENV) / "ro_anime_users.db"
+elif _RENDER_DISK_DIR.exists():
+    _DB_PATH = _RENDER_DISK_DIR / "ro_anime_users.db"
+else:
+    _DB_PATH = _LEGACY_DB_PATH
+
+if not IS_PG:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _DB_PATH != _LEGACY_DB_PATH and not _DB_PATH.exists() and _LEGACY_DB_PATH.exists():
+        shutil.copy2(_LEGACY_DB_PATH, _DB_PATH)
 
 if IS_PG:
     import psycopg
