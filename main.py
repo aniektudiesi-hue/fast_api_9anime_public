@@ -985,11 +985,9 @@ def _get_current_user(request: Request) -> dict:
 async def auth_register(request: Request):
     data = await request.json()
     username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
+    password = (data.get("password") or username).strip()
     if len(username) < 3:
         raise HTTPException(400, "Username must be at least 3 characters")
-    if len(password) < 4:
-        raise HTTPException(400, "Password must be at least 4 characters")
     token = secrets.token_hex(32)
     try:
         conn = _db()
@@ -1009,13 +1007,19 @@ async def auth_login(request: Request):
     username = (data.get("username") or "").strip()
     password = (data.get("password") or "").strip()
     conn = _db()
-    row  = conn.execute(
-        "SELECT id, token FROM users WHERE username=? AND password_hash=?",
-        (username, _hash_pw(password))
-    ).fetchone()
+    if password:
+        row  = conn.execute(
+            "SELECT id, token FROM users WHERE username=? AND password_hash=?",
+            (username, _hash_pw(password))
+        ).fetchone()
+    else:
+        row  = conn.execute(
+            "SELECT id, token FROM users WHERE username=?",
+            (username,)
+        ).fetchone()
     conn.close()
     if not row:
-        raise HTTPException(401, "Wrong username or password")
+        raise HTTPException(401, "Username not found")
     return {"token": row["token"], "username": username}
 
 @app.get("/auth/me")
