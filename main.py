@@ -1038,26 +1038,53 @@ async def auth_me(request: Request):
 # ---------------------------------------------------------------------------
 # HISTORY
 # ---------------------------------------------------------------------------
+def _normalize_history_payload(d: dict) -> dict:
+    mal_id = str(d.get("mal_id") or d.get("anime_id") or "").strip()
+    if not mal_id:
+        raise ValueError("mal_id is required")
+    title = str(d.get("title") or f"Anime {mal_id}").strip() or f"Anime {mal_id}"
+    image_url = str(d.get("image_url") or d.get("poster") or d.get("thumbnail") or "").strip()
+    episode = int(float(d.get("episode") or d.get("episode_num") or 1))
+    playback_pos = float(d.get("playback_pos") or d.get("progress") or d.get("timestamp") or 0)
+    return {
+        "mal_id": mal_id,
+        "title": title,
+        "image_url": image_url,
+        "episode": max(1, episode),
+        "playback_pos": max(0.0, playback_pos),
+    }
+
+
+def _save_history_for_user(user_id: int, d: dict) -> dict:
+    payload = _normalize_history_payload(d)
+    conn = _db()
+    try:
+        # Keeps one row per (user, anime, episode) and updates the exact resume point.
+        conn.execute(
+            """INSERT INTO watch_history (user_id, mal_id, title, image_url, episode, playback_pos, watched_at)
+               VALUES (?,?,?,?,?,?,strftime('%s','now'))
+               ON CONFLICT(user_id, mal_id, episode)
+               DO UPDATE SET playback_pos=excluded.playback_pos,
+                             watched_at=excluded.watched_at,
+                             title=excluded.title,
+                             image_url=excluded.image_url""",
+            (user_id, payload["mal_id"], payload["title"], payload["image_url"],
+             payload["episode"], payload["playback_pos"])
+        )
+        conn.commit()
+        return payload
+    finally:
+        conn.close()
+
+
 @app.post("/user/history")
 async def history_add(request: Request):
     user = _get_current_user(request)
-    d    = await request.json()
-    conn = _db()
-    # INSERT OR REPLACE keeps one row per (user, anime, episode) — updates on re-watch
-    conn.execute(
-        """INSERT INTO watch_history (user_id, mal_id, title, image_url, episode, playback_pos, watched_at)
-           VALUES (?,?,?,?,?,?,strftime('%s','now'))
-           ON CONFLICT(user_id, mal_id, episode)
-           DO UPDATE SET playback_pos=excluded.playback_pos,
-                         watched_at=excluded.watched_at,
-                         title=excluded.title,
-                         image_url=excluded.image_url""",
-        (user["id"], d["mal_id"], d["title"], d.get("image_url",""),
-         int(d["episode"]), float(d.get("playback_pos", 0)))
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True}
+    try:
+        saved = _save_history_for_user(user["id"], await request.json())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, **saved}
 
 @app.get("/user/history")
 async def history_get(request: Request):
@@ -1079,6 +1106,37 @@ async def history_clear(request: Request):
     conn.execute("DELETE FROM watch_history WHERE user_id=?", (user["id"],))
     conn.commit(); conn.close()
     return {"ok": True}
+
+
+@app.websocket("/ws/user/history")
+async def history_ws(websocket: WebSocket):
+    """Receive live watch progress updates for synced resume history."""
+    token = websocket.query_params.get("token", "").strip()
+    user = _user_from_token(token)
+    if not user:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("history payload must be an object")
+                saved = _save_history_for_user(user["id"], data)
+                await websocket.send_json({"ok": True, **saved})
+            except Exception as e:
+                await websocket.send_json({"ok": False, "error": str(e)})
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.warning("History websocket error: %s", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # WATCHLIST
