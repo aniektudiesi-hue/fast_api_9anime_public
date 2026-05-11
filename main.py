@@ -16,6 +16,8 @@ from fastapi import FastAPI, HTTPException, Query, Request, Depends, BackgroundT
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 
+from app.config import settings
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("ro-anime")
@@ -23,26 +25,16 @@ logger = logging.getLogger("ro-anime")
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-MAL_CLIENT_ID = "b7718fb862ae30f4ba64bc9a4f90d2ea"
-MAL_BASE      = "https://api.myanimelist.net/v2"
+MAL_CLIENT_ID = settings.mal_client_id
+MAL_BASE      = settings.mal_base
 MAL_HEADERS   = {"X-MAL-CLIENT-ID": MAL_CLIENT_ID}
-ANILIST_GQL   = "https://graphql.anilist.co"
-MEGAPLAY_BASE = "https://megaplay.buzz"
+ANILIST_GQL   = settings.anilist_gql
+MEGAPLAY_BASE = settings.megaplay_base
 SOURCES_EP    = f"{MEGAPLAY_BASE}/stream/getSources"
-VIDWISH_BASE  = "https://vidwish.live"
+VIDWISH_BASE  = settings.vidwish_base
 VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
-# Hardcode your deployed Worker URL here after Cloudflare creates it.
-# Example: "https://anime-tv-stream-proxy.your-subdomain.workers.dev"
-HARDCODED_CLOUDFLARE_PROXY_BASE = "https://anime-tv-stream-proxy.kamuri-anime.workers.dev"
-
 # Edge proxy base for HLS playlists, chunks, captions, and HD media.
-# Falls back to the current backend proxy until the Worker URL is known.
-CLOUDFLARE_PROXY_BASE = (
-    HARDCODED_CLOUDFLARE_PROXY_BASE
-    or os.getenv("CLOUDFLARE_PROXY_BASE")
-    or os.getenv("RO_PROXY_BASE")
-    or ""
-).rstrip("/")
+CLOUDFLARE_PROXY_BASE = settings.cloudflare_proxy_base
 IMPERSONATE   = "chrome131_android"
 ANDROID_UA    = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
@@ -827,15 +819,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # ---------------------------------------------------------------------------
 # DATABASE  (PostgreSQL on Render via DATABASE_URL, SQLite locally)
 # ---------------------------------------------------------------------------
-_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_DATABASE_URL = settings.database_url
 if _DATABASE_URL.startswith("postgres://"):
     _DATABASE_URL = "postgresql://" + _DATABASE_URL[len("postgres://"):]
 IS_PG = _DATABASE_URL.startswith("postgresql")
 
 _LEGACY_DB_PATH = Path(__file__).parent / "ro_anime_users.db"
-_SQLITE_PATH_ENV = os.environ.get("SQLITE_PATH", "").strip()
-_SQLITE_DIR_ENV = os.environ.get("SQLITE_DIR", "").strip()
-_RENDER_DISK_DIR = Path("/var/data")
+_SQLITE_PATH_ENV = settings.sqlite_path
+_SQLITE_DIR_ENV = settings.sqlite_dir
+_RENDER_DISK_DIR = settings.render_disk_dir
 
 if _SQLITE_PATH_ENV:
     _DB_PATH = Path(_SQLITE_PATH_ENV)

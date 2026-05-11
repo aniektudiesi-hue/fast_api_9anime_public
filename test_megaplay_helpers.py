@@ -153,11 +153,11 @@ class MegaplayHelperTests(unittest.TestCase):
         self.assertEqual(headers["Referer"], f"{VIDWISH_BASE}/")
         self.assertEqual(impersonate, "chrome131_android")
 
-    def test_vidwish_cinewave_proxy_headers_use_vidwish_referer(self):
+    def test_cinewave_proxy_headers_use_megaplay_referer(self):
         headers, impersonate = _proxy_call_for("https://s2.cinewave2.site/anime/hash/index-f1.m3u8")
 
-        self.assertEqual(headers["Origin"], VIDWISH_BASE)
-        self.assertEqual(headers["Referer"], f"{VIDWISH_BASE}/")
+        self.assertEqual(headers["Origin"], MEGAPLAY_BASE)
+        self.assertEqual(headers["Referer"], f"{MEGAPLAY_BASE}/")
         self.assertEqual(impersonate, "chrome131_android")
 
 
