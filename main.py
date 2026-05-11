@@ -2617,9 +2617,9 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     # so we cannot let the browser fetch master.m3u8 directly. Wrap it in
     # /proxy/m3u8 — same path the megaplay endpoint uses — so the proxy can
     # add the right upstream headers and serve our origin to the browser.
-    backend = _backend_base(request)
+    backend = _stream_proxy_base(request)
     response = {
-        "url":          _proxy_url(backend, result["url"], "/proxy/m3u8"),
+        "url":          f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/m3u8",
         # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
         # already CORS-friendly for the browser; proxying it through /proxy/vtt
         # would break the JSON-vs-VTT content type assumption.
