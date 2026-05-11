@@ -1059,15 +1059,15 @@ def _save_history_for_user(user_id: int, d: dict) -> dict:
     payload = _normalize_history_payload(d)
     conn = _db()
     try:
-        # Keeps one row per (user, anime, episode) and updates the exact resume point.
+        # Keep one visible history row per anime; the newest episode/resume point wins.
+        conn.execute(
+            "DELETE FROM watch_history WHERE user_id=? AND mal_id=?",
+            (user_id, payload["mal_id"])
+        )
         conn.execute(
             """INSERT INTO watch_history (user_id, mal_id, title, image_url, episode, playback_pos, watched_at)
                VALUES (?,?,?,?,?,?,strftime('%s','now'))
-               ON CONFLICT(user_id, mal_id, episode)
-               DO UPDATE SET playback_pos=excluded.playback_pos,
-                             watched_at=excluded.watched_at,
-                             title=excluded.title,
-                             image_url=excluded.image_url""",
+            """,
             (user_id, payload["mal_id"], payload["title"], payload["image_url"],
              payload["episode"], payload["playback_pos"])
         )
@@ -1093,11 +1093,22 @@ async def history_get(request: Request):
     rows = conn.execute(
         """SELECT mal_id, title, image_url, episode, playback_pos, watched_at
            FROM watch_history WHERE user_id=?
-           ORDER BY watched_at DESC LIMIT 200""",
+           ORDER BY watched_at DESC LIMIT 500""",
         (user["id"],)
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    out = []
+    seen = set()
+    for r in rows:
+        item = dict(r)
+        mal_id = item.get("mal_id")
+        if mal_id in seen:
+            continue
+        seen.add(mal_id)
+        out.append(item)
+        if len(out) >= 200:
+            break
+    return out
 
 @app.delete("/user/history")
 async def history_clear(request: Request):
