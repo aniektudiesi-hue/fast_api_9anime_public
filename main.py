@@ -1019,11 +1019,7 @@ def _get_current_user(request: Request) -> dict:
     return {"id": row["id"], "username": row["username"]}
 
 
-_ADMIN_USERNAMES = {
-    name.strip().lower()
-    for name in os.getenv("ADMIN_USERNAMES", "kali").split(",")
-    if name.strip()
-}
+_ADMIN_USERNAMES = {"kali"}
 _ADMIN_ACCESS_KEY = os.getenv("ADMIN_ACCESS_KEY", "").strip()
 
 
