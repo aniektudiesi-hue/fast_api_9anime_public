@@ -3183,23 +3183,11 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
         return None
 
 # --- moon stream endpoint ---------------------------------------------------
-async def _warm_moon_worker(url: str) -> None:
-    try:
-        timeout = httpx.Timeout(connect=1.5, read=2.5, write=1.5, pool=1.5)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            await client.get(url)
-    except Exception as exc:
-        logger.debug("Moon worker warm skipped: %s", exc)
-
 @app.get("/api/moon/{mal_id}/{episode_num}")
-async def get_moon_stream(mal_id: str, episode_num: str, request: Request,
-                          background_tasks: BackgroundTasks):
+async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     ck = f"moon:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
-        preload_url = cached.get("preload_url") if isinstance(cached, dict) else None
-        if preload_url:
-            background_tasks.add_task(_warm_moon_worker, preload_url)
         return cached
 
     slug = await _resolve_real_slug(mal_id, episode_num)
@@ -3222,9 +3210,8 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request,
     )
     preload_url = (
         f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
-        f"?segments=6"
+        f"?segments=2"
     )
-    background_tasks.add_task(_warm_moon_worker, preload_url)
     response = {
         "url":          moon_url,
         "m3u8_url":     moon_url,
