@@ -3215,23 +3215,14 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request,
     if not video_id:
         raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
 
-    loop   = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _moon_fetch_playback_sync, video_id)
-    if not result:
-        raise HTTPException(502, "Moon: playback decryption failed")
-
-    # Seed the Worker with the already-decrypted Moon source. This avoids doing
-    # the expensive Moon playback/decrypt step twice while keeping browser
-    # traffic on the same /proxy/moon endpoint.
     backend = _stream_proxy_base(request)
-    encoded_source = quote(result["url"], safe="")
     moon_url = (
-        f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/m3u8"
-        f"?src={encoded_source}&fast=1"
+        f"{backend}/proxy/moon/{quote(video_id, safe='')}/m3u8"
+        f"?fast=1"
     )
     preload_url = (
-        f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/warm"
-        f"?src={encoded_source}&segments=6"
+        f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
+        f"?segments=6"
     )
     background_tasks.add_task(_warm_moon_worker, preload_url)
     response = {
@@ -3240,8 +3231,8 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request,
         # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
         # already CORS-friendly for the browser; proxying it through /proxy/vtt
         # would break the JSON-vs-VTT content type assumption.
-        "subtitle_url": result["subtitle_url"],
-        "video_id":     result["video_id"],
+        "subtitle_url": f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
+        "video_id":     video_id,
         "server":       "moon",
         "preload_url":  preload_url,
     }
