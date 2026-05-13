@@ -3183,11 +3183,23 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
         return None
 
 # --- moon stream endpoint ---------------------------------------------------
+async def _warm_moon_worker(url: str) -> None:
+    try:
+        timeout = httpx.Timeout(connect=1.5, read=2.5, write=1.5, pool=1.5)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+            await client.get(url)
+    except Exception as exc:
+        logger.debug("Moon worker warm skipped: %s", exc)
+
 @app.get("/api/moon/{mal_id}/{episode_num}")
-async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
+async def get_moon_stream(mal_id: str, episode_num: str, request: Request,
+                          background_tasks: BackgroundTasks):
     ck = f"moon:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
+        preload_url = cached.get("preload_url") if isinstance(cached, dict) else None
+        if preload_url:
+            background_tasks.add_task(_warm_moon_worker, preload_url)
         return cached
 
     slug = await _resolve_real_slug(mal_id, episode_num)
@@ -3208,19 +3220,30 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     if not result:
         raise HTTPException(502, "Moon: playback decryption failed")
 
-    # The CDN behind Moon is locked down with strict CORS / Referer checks,
-    # so we cannot let the browser fetch master.m3u8 directly. Wrap it in
-    # /proxy/m3u8 — same path the megaplay endpoint uses — so the proxy can
-    # add the right upstream headers and serve our origin to the browser.
+    # Seed the Worker with the already-decrypted Moon source. This avoids doing
+    # the expensive Moon playback/decrypt step twice while keeping browser
+    # traffic on the same /proxy/moon endpoint.
     backend = _stream_proxy_base(request)
+    encoded_source = quote(result["url"], safe="")
+    moon_url = (
+        f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/m3u8"
+        f"?src={encoded_source}&fast=1"
+    )
+    preload_url = (
+        f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/warm"
+        f"?src={encoded_source}&segments=6"
+    )
+    background_tasks.add_task(_warm_moon_worker, preload_url)
     response = {
-        "url":          f"{backend}/proxy/moon/{quote(result['video_id'], safe='')}/m3u8",
+        "url":          moon_url,
+        "m3u8_url":     moon_url,
         # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
         # already CORS-friendly for the browser; proxying it through /proxy/vtt
         # would break the JSON-vs-VTT content type assumption.
         "subtitle_url": result["subtitle_url"],
         "video_id":     result["video_id"],
         "server":       "moon",
+        "preload_url":  preload_url,
     }
     _anime_cache[ck] = response
     return response
