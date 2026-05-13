@@ -949,6 +949,37 @@ def _db_init() -> None:
         UNIQUE(user_id, mal_id, episode)
     );
     """)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS login_events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER,
+        username      TEXT    DEFAULT '',
+        event_type    TEXT    NOT NULL,
+        success       INTEGER DEFAULT 0,
+        ip_address    TEXT    DEFAULT '',
+        user_agent    TEXT    DEFAULT '',
+        device        TEXT    DEFAULT '',
+        created_at    INTEGER DEFAULT (strftime('%s','now'))
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_login_events_time ON login_events(created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events(username, created_at DESC);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS visitor_events (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        visitor_key   TEXT    NOT NULL,
+        user_id       INTEGER,
+        username      TEXT    DEFAULT '',
+        path          TEXT    DEFAULT '/',
+        referrer      TEXT    DEFAULT '',
+        ip_address    TEXT    DEFAULT '',
+        user_agent    TEXT    DEFAULT '',
+        device        TEXT    DEFAULT '',
+        created_at    INTEGER DEFAULT (strftime('%s','now'))
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_time ON visitor_events(created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_key ON visitor_events(visitor_key, created_at DESC);")
     conn.commit()
     conn.close()
 
@@ -987,6 +1018,121 @@ def _get_current_user(request: Request) -> dict:
         raise HTTPException(401, "Invalid or expired token")
     return {"id": row["id"], "username": row["username"]}
 
+
+_ADMIN_USERNAMES = {
+    name.strip().lower()
+    for name in os.getenv("ADMIN_USERNAMES", "kali").split(",")
+    if name.strip()
+}
+_ADMIN_ACCESS_KEY = os.getenv("ADMIN_ACCESS_KEY", "").strip()
+
+
+def _row_dict(row) -> dict:
+    if not row:
+        return {}
+    if isinstance(row, dict):
+        return row
+    return dict(row)
+
+
+def _get_admin_user(request: Request) -> dict:
+    user = _get_current_user(request)
+    if user["username"].strip().lower() not in _ADMIN_USERNAMES:
+        raise HTTPException(403, "Admin access required")
+    if _ADMIN_ACCESS_KEY:
+        supplied = request.headers.get("x-admin-key", "").strip()
+        if not secrets.compare_digest(supplied, _ADMIN_ACCESS_KEY):
+            raise HTTPException(403, "Admin key required")
+    return user
+
+
+def _client_ip(request: Request) -> str:
+    for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        value = request.headers.get(header, "")
+        if value:
+            return value.split(",")[0].strip()[:96]
+    return (request.client.host if request.client else "")[:96]
+
+
+def _device_label(user_agent: str) -> str:
+    ua = (user_agent or "").lower()
+    if "edg/" in ua or "edga/" in ua:
+        browser = "Edge"
+    elif "chrome/" in ua or "crios/" in ua:
+        browser = "Chrome"
+    elif "firefox/" in ua:
+        browser = "Firefox"
+    elif "safari/" in ua:
+        browser = "Safari"
+    else:
+        browser = "Browser"
+
+    if "android" in ua:
+        os_name = "Android"
+    elif "iphone" in ua or "ipad" in ua:
+        os_name = "iOS"
+    elif "windows" in ua:
+        os_name = "Windows"
+    elif "mac os" in ua or "macintosh" in ua:
+        os_name = "macOS"
+    elif "linux" in ua:
+        os_name = "Linux"
+    else:
+        os_name = "Unknown"
+
+    kind = "Mobile" if any(token in ua for token in ("mobile", "android", "iphone")) else "Desktop"
+    return f"{kind} / {os_name} / {browser}"
+
+
+def _optional_user_from_request(request: Request) -> dict | None:
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    conn = _db()
+    row = conn.execute("SELECT id, username FROM users WHERE token=?", (token,)).fetchone()
+    conn.close()
+    return _row_dict(row) if row else None
+
+
+def _record_login_event(username: str, event_type: str, success: bool, request: Request, user_id: int | None = None) -> None:
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")[:1000]
+    conn = _db()
+    conn.execute(
+        """INSERT INTO login_events
+           (user_id, username, event_type, success, ip_address, user_agent, device)
+           VALUES (?,?,?,?,?,?,?)""",
+        (user_id, username[:255], event_type[:40], 1 if success else 0, ip, ua, _device_label(ua)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _record_visit_event(request: Request, path: str, referrer: str = "", user: dict | None = None) -> dict:
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")[:1000]
+    visitor_key = hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:32]
+    conn = _db()
+    conn.execute(
+        """INSERT INTO visitor_events
+           (visitor_key, user_id, username, path, referrer, ip_address, user_agent, device)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            visitor_key,
+            user.get("id") if user else None,
+            (user.get("username", "") if user else "")[:255],
+            (path or "/")[:500],
+            (referrer or "")[:500],
+            ip,
+            ua,
+            _device_label(ua),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"visitor_key": visitor_key, "ip_address": ip, "device": _device_label(ua)}
+
 # ---------------------------------------------------------------------------
 # AUTH ENDPOINTS
 # ---------------------------------------------------------------------------
@@ -996,6 +1142,7 @@ async def auth_register(request: Request):
     username = (data.get("username") or "").strip()
     password = (data.get("password") or username).strip()
     if len(username) < 3:
+        _record_login_event(username, "register", False, request)
         raise HTTPException(400, "Username must be at least 3 characters")
     token = secrets.token_hex(32)
     try:
@@ -1004,10 +1151,13 @@ async def auth_register(request: Request):
             "INSERT INTO users (username, password_hash, token) VALUES (?,?,?)",
             (username, _hash_pw(password), token)
         )
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
         conn.commit()
         conn.close()
     except _INTEGRITY_ERRORS:
+        _record_login_event(username, "register", False, request)
         raise HTTPException(409, "Username already taken")
+    _record_login_event(username, "register", True, request, _row_dict(row).get("id"))
     return {"token": token, "username": username}
 
 @app.post("/auth/login")
@@ -1028,12 +1178,128 @@ async def auth_login(request: Request):
         ).fetchone()
     conn.close()
     if not row:
+        _record_login_event(username, "login", False, request)
         raise HTTPException(401, "Username not found")
+    _record_login_event(username, "login", True, request, row["id"])
     return {"token": row["token"], "username": username}
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
     return _get_current_user(request)
+
+
+# ---------------------------------------------------------------------------
+# VISITOR ANALYTICS + ADMIN
+# ---------------------------------------------------------------------------
+@app.post("/analytics/visit")
+async def analytics_visit(request: Request):
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    path = str(data.get("path") or request.headers.get("referer") or "/")
+    referrer = str(data.get("referrer") or request.headers.get("referer") or "")
+    user = _optional_user_from_request(request)
+    saved = _record_visit_event(request, path, referrer, user)
+    return {"ok": True, "visitor_key": saved["visitor_key"]}
+
+
+@app.get("/admin/overview")
+async def admin_overview(request: Request):
+    admin = _get_admin_user(request)
+    since_24h = int(time.time()) - 86400
+    conn = _db()
+    total_users = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()).get("c", 0)
+    total_visits = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM visitor_events").fetchone()).get("c", 0)
+    unique_visitors = _row_dict(conn.execute("SELECT COUNT(DISTINCT visitor_key) AS c FROM visitor_events").fetchone()).get("c", 0)
+    visits_24h = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM visitor_events WHERE created_at>=?", (since_24h,)).fetchone()).get("c", 0)
+    unique_24h = _row_dict(conn.execute("SELECT COUNT(DISTINCT visitor_key) AS c FROM visitor_events WHERE created_at>=?", (since_24h,)).fetchone()).get("c", 0)
+    login_success = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=1").fetchone()).get("c", 0)
+    login_failed = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=0").fetchone()).get("c", 0)
+    top_paths = [
+        _row_dict(row)
+        for row in conn.execute(
+            """SELECT path, COUNT(*) AS visits, COUNT(DISTINCT visitor_key) AS unique_visitors
+               FROM visitor_events GROUP BY path ORDER BY visits DESC LIMIT 10"""
+        ).fetchall()
+    ]
+    conn.close()
+    return {
+        "admin": admin["username"],
+        "total_users": total_users,
+        "total_visits": total_visits,
+        "unique_visitors": unique_visitors,
+        "visits_24h": visits_24h,
+        "unique_24h": unique_24h,
+        "login_success": login_success,
+        "login_failed": login_failed,
+        "top_paths": top_paths,
+    }
+
+
+@app.get("/admin/users")
+async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
+    _get_admin_user(request)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT
+              u.id, u.username, u.created_at,
+              (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count,
+              (SELECT COUNT(*) FROM watchlist w WHERE w.user_id=u.id) AS watchlist_count,
+              (SELECT COUNT(*) FROM downloads d WHERE d.user_id=u.id) AS downloads_count,
+              (SELECT MAX(watched_at) FROM watch_history h WHERE h.user_id=u.id) AS last_watched_at,
+              (SELECT MAX(added_at) FROM watchlist w WHERE w.user_id=u.id) AS last_watchlist_at,
+              (SELECT MAX(created_at) FROM login_events l WHERE l.user_id=u.id AND l.success=1) AS last_login_at
+           FROM users u
+           ORDER BY u.created_at DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return {"items": [_row_dict(row) for row in rows]}
+
+
+@app.get("/admin/logins")
+async def admin_logins(request: Request, limit: int = Query(200, ge=1, le=1000)):
+    _get_admin_user(request)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT id, user_id, username, event_type, success, ip_address, device, user_agent, created_at
+           FROM login_events ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return {"items": [_row_dict(row) for row in rows]}
+
+
+@app.get("/admin/visits")
+async def admin_visits(request: Request, limit: int = Query(300, ge=1, le=2000)):
+    _get_admin_user(request)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT id, visitor_key, user_id, username, path, referrer, ip_address, device, user_agent, created_at
+           FROM visitor_events ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return {"items": [_row_dict(row) for row in rows]}
+
+
+@app.get("/admin/search-visibility")
+async def admin_search_visibility(request: Request):
+    _get_admin_user(request)
+    return {
+        "note": "Google ranking data should be verified through Google Search Console. These links help you inspect live visibility without scraping Google.",
+        "links": [
+            {"label": "Google Search Console", "url": "https://search.google.com/search-console"},
+            {"label": "Indexed pages", "url": "https://www.google.com/search?q=site%3Aanimetvplus.xyz"},
+            {"label": "Brand keyword", "url": "https://www.google.com/search?q=animetvplus"},
+            {"label": "Free anime keyword", "url": "https://www.google.com/search?q=animetvplus+free+anime"},
+            {"label": "Hindi anime keyword", "url": "https://www.google.com/search?q=animetvplus+hindi+anime"},
+        ],
+    }
 
 # ---------------------------------------------------------------------------
 # HISTORY
