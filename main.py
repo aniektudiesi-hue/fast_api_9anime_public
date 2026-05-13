@@ -922,6 +922,7 @@ def _db_init() -> None:
     );
     """)
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_hist_user ON watch_history(user_id, watched_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_hist_user_mal ON watch_history(user_id, mal_id);")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS watchlist (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -934,6 +935,7 @@ def _db_init() -> None:
         UNIQUE(user_id, mal_id)
     );
     """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id, added_at DESC);")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS downloads (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -949,6 +951,7 @@ def _db_init() -> None:
         UNIQUE(user_id, mal_id, episode)
     );
     """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id, downloaded_at DESC);")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS login_events (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1396,23 +1399,60 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
     _get_admin_user(request)
     conn = _db()
     rows = conn.execute(
-        """SELECT
-              u.id, u.username, u.created_at,
-              (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count,
-              (SELECT COUNT(*) FROM watchlist w WHERE w.user_id=u.id) AS watchlist_count,
-              (SELECT COUNT(*) FROM downloads d WHERE d.user_id=u.id) AS downloads_count,
-              (SELECT MAX(watched_at) FROM watch_history h WHERE h.user_id=u.id) AS last_watched_at,
-              (SELECT MAX(added_at) FROM watchlist w WHERE w.user_id=u.id) AS last_watchlist_at,
-              (SELECT MAX(created_at) FROM login_events l WHERE l.user_id=u.id AND l.success=1) AS last_login_at,
-              (SELECT MAX(created_at) FROM visitor_events v WHERE v.user_id=u.id) AS last_seen_at,
-              (SELECT ip_address FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS last_ip,
-              (SELECT device FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS last_device,
-              (SELECT country FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS country,
-              (SELECT region FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS region,
-              (SELECT city FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS city,
-              (SELECT timezone FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS timezone
+        """WITH
+             hist AS (
+               SELECT user_id, COUNT(*) AS history_count, MAX(watched_at) AS last_watched_at
+               FROM watch_history GROUP BY user_id
+             ),
+             watch AS (
+               SELECT user_id, COUNT(*) AS watchlist_count, MAX(added_at) AS last_watchlist_at
+               FROM watchlist GROUP BY user_id
+             ),
+             down AS (
+               SELECT user_id, COUNT(*) AS downloads_count
+               FROM downloads GROUP BY user_id
+             ),
+             login AS (
+               SELECT user_id, MAX(created_at) AS last_login_at
+               FROM login_events WHERE success=1 GROUP BY user_id
+             ),
+             visit_counts AS (
+               SELECT user_id, MAX(created_at) AS last_seen_at
+               FROM visitor_events GROUP BY user_id
+             ),
+             last_visit AS (
+               SELECT user_id, ip_address, device, country, region, city, timezone
+               FROM (
+                 SELECT user_id, ip_address, device, country, region, city, timezone,
+                        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+                 FROM visitor_events
+                 WHERE user_id IS NOT NULL
+               ) ranked
+               WHERE rn=1
+             )
+           SELECT
+             u.id, u.username, u.created_at,
+             COALESCE(hist.history_count, 0) AS history_count,
+             COALESCE(watch.watchlist_count, 0) AS watchlist_count,
+             COALESCE(down.downloads_count, 0) AS downloads_count,
+             hist.last_watched_at,
+             watch.last_watchlist_at,
+             login.last_login_at,
+             visit_counts.last_seen_at,
+             last_visit.ip_address AS last_ip,
+             last_visit.device AS last_device,
+             last_visit.country,
+             last_visit.region,
+             last_visit.city,
+             last_visit.timezone
            FROM users u
-           ORDER BY u.created_at DESC
+           LEFT JOIN hist ON hist.user_id=u.id
+           LEFT JOIN watch ON watch.user_id=u.id
+           LEFT JOIN down ON down.user_id=u.id
+           LEFT JOIN login ON login.user_id=u.id
+           LEFT JOIN visit_counts ON visit_counts.user_id=u.id
+           LEFT JOIN last_visit ON last_visit.user_id=u.id
+           ORDER BY COALESCE(visit_counts.last_seen_at, login.last_login_at, u.created_at) DESC
            LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -1421,7 +1461,7 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
 
 
 @app.get("/admin/users/{user_id}/activity")
-async def admin_user_activity(user_id: int, request: Request, limit: int = Query(80, ge=1, le=500)):
+async def admin_user_activity(user_id: int, request: Request, limit: int = Query(300, ge=1, le=2000)):
     _get_admin_user(request)
     conn = _db()
     user = _row_dict(conn.execute(
@@ -1438,6 +1478,17 @@ async def admin_user_activity(user_id: int, request: Request, limit: int = Query
     if not user:
         conn.close()
         raise HTTPException(404, "User not found")
+
+    totals = _row_dict(conn.execute(
+        """SELECT
+             (SELECT COUNT(*) FROM watch_history WHERE user_id=?) AS history,
+             (SELECT COUNT(*) FROM watchlist WHERE user_id=?) AS watchlist,
+             (SELECT COUNT(*) FROM downloads WHERE user_id=?) AS downloads,
+             (SELECT COUNT(*) FROM login_events WHERE user_id=? OR username=?) AS logins,
+             (SELECT COUNT(*) FROM visitor_events WHERE user_id=? OR username=?) AS visits
+        """,
+        (user_id, user_id, user_id, user_id, user["username"], user_id, user["username"]),
+    ).fetchone())
 
     history = [_row_dict(row) for row in conn.execute(
         """SELECT mal_id, title, image_url, episode, playback_pos, watched_at
@@ -1474,6 +1525,7 @@ async def admin_user_activity(user_id: int, request: Request, limit: int = Query
         "downloads": downloads,
         "logins": logins,
         "visits": visits,
+        "totals": totals,
     }
 
 
