@@ -959,11 +959,17 @@ def _db_init() -> None:
         ip_address    TEXT    DEFAULT '',
         user_agent    TEXT    DEFAULT '',
         device        TEXT    DEFAULT '',
+        country       TEXT    DEFAULT '',
+        region        TEXT    DEFAULT '',
+        city          TEXT    DEFAULT '',
+        timezone      TEXT    DEFAULT '',
+        language      TEXT    DEFAULT '',
         created_at    INTEGER DEFAULT (strftime('%s','now'))
     );
     """)
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_login_events_time ON login_events(created_at DESC);")
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events(username, created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_login_events_user_id ON login_events(user_id, created_at DESC);")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS visitor_events (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -975,24 +981,75 @@ def _db_init() -> None:
         ip_address    TEXT    DEFAULT '',
         user_agent    TEXT    DEFAULT '',
         device        TEXT    DEFAULT '',
+        country       TEXT    DEFAULT '',
+        region        TEXT    DEFAULT '',
+        city          TEXT    DEFAULT '',
+        timezone      TEXT    DEFAULT '',
+        language      TEXT    DEFAULT '',
+        screen        TEXT    DEFAULT '',
         created_at    INTEGER DEFAULT (strftime('%s','now'))
     );
     """)
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_time ON visitor_events(created_at DESC);")
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_key ON visitor_events(visitor_key, created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_user ON visitor_events(user_id, created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_username ON visitor_events(username, created_at DESC);")
     conn.commit()
     conn.close()
 
 
 def _db_migrate() -> None:
-    """Add playback_pos column to legacy SQLite databases."""
-    if IS_PG:
-        return
     conn = _db()
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(watch_history)")}
-    if "playback_pos" not in cols:
-        conn.execute("ALTER TABLE watch_history ADD COLUMN playback_pos REAL DEFAULT 0")
+    if IS_PG:
+        for table, columns in {
+            "login_events": {
+                "country": "TEXT DEFAULT ''",
+                "region": "TEXT DEFAULT ''",
+                "city": "TEXT DEFAULT ''",
+                "timezone": "TEXT DEFAULT ''",
+                "language": "TEXT DEFAULT ''",
+            },
+            "visitor_events": {
+                "country": "TEXT DEFAULT ''",
+                "region": "TEXT DEFAULT ''",
+                "city": "TEXT DEFAULT ''",
+                "timezone": "TEXT DEFAULT ''",
+                "language": "TEXT DEFAULT ''",
+                "screen": "TEXT DEFAULT ''",
+            },
+        }.items():
+            for name, definition in columns.items():
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
         conn.commit()
+        conn.close()
+        return
+
+    def ensure_column(table: str, name: str, definition: str) -> None:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if name not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    ensure_column("watch_history", "playback_pos", "REAL DEFAULT 0")
+    for table, columns in {
+        "login_events": {
+            "country": "TEXT DEFAULT ''",
+            "region": "TEXT DEFAULT ''",
+            "city": "TEXT DEFAULT ''",
+            "timezone": "TEXT DEFAULT ''",
+            "language": "TEXT DEFAULT ''",
+        },
+        "visitor_events": {
+            "country": "TEXT DEFAULT ''",
+            "region": "TEXT DEFAULT ''",
+            "city": "TEXT DEFAULT ''",
+            "timezone": "TEXT DEFAULT ''",
+            "language": "TEXT DEFAULT ''",
+            "screen": "TEXT DEFAULT ''",
+        },
+    }.items():
+        for name, definition in columns.items():
+            ensure_column(table, name, definition)
+    conn.commit()
     conn.close()
 
 
@@ -1050,6 +1107,62 @@ def _client_ip(request: Request) -> str:
     return (request.client.host if request.client else "")[:96]
 
 
+def _first_header(request: Request, *names: str) -> str:
+    for name in names:
+        value = request.headers.get(name, "")
+        if value:
+            return unquote(value.split(",")[0].strip())[:160]
+    return ""
+
+
+_TZ_COUNTRY_HINTS = {
+    "Asia/Calcutta": "IN",
+    "Asia/Kolkata": "IN",
+    "Asia/Tokyo": "JP",
+    "Asia/Seoul": "KR",
+    "Asia/Shanghai": "CN",
+    "Asia/Singapore": "SG",
+    "Asia/Dubai": "AE",
+    "Europe/London": "GB",
+    "Europe/Paris": "FR",
+    "Europe/Berlin": "DE",
+    "America/New_York": "US",
+    "America/Chicago": "US",
+    "America/Denver": "US",
+    "America/Los_Angeles": "US",
+    "America/Toronto": "CA",
+    "America/Vancouver": "CA",
+    "America/Sao_Paulo": "BR",
+    "Australia/Sydney": "AU",
+    "Australia/Melbourne": "AU",
+    "Africa/Johannesburg": "ZA",
+}
+
+
+def _request_location(request: Request, payload: dict | None = None) -> dict:
+    payload = payload or {}
+    language = str(payload.get("language") or request.headers.get("accept-language", "")).split(",")[0].strip()[:80]
+    timezone = str(payload.get("timezone") or _first_header(request, "x-vercel-ip-timezone", "cf-timezone"))[:120]
+    country = _first_header(request, "cf-ipcountry", "x-vercel-ip-country", "x-appengine-country") or _TZ_COUNTRY_HINTS.get(timezone, "")
+    city = _first_header(request, "x-vercel-ip-city", "x-appengine-city", "cf-ipcity")
+    if not city and "/" in timezone:
+        city = timezone.rsplit("/", 1)[-1].replace("_", " ")[:160]
+    return {
+        "country": country,
+        "region": _first_header(request, "x-vercel-ip-country-region", "x-appengine-region", "cf-region"),
+        "city": city,
+        "timezone": timezone,
+        "language": language,
+        "screen": str(payload.get("screen") or "")[:80],
+    }
+
+
+def _location_label(row: dict) -> str:
+    parts = [row.get("city"), row.get("region"), row.get("country")]
+    label = ", ".join(str(part) for part in parts if part)
+    return label or str(row.get("timezone") or row.get("language") or "Unknown")
+
+
 def _device_label(user_agent: str) -> str:
     ua = (user_agent or "").lower()
     if "edg/" in ua or "edga/" in ua:
@@ -1094,26 +1207,41 @@ def _optional_user_from_request(request: Request) -> dict | None:
 def _record_login_event(username: str, event_type: str, success: bool, request: Request, user_id: int | None = None) -> None:
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")[:1000]
+    loc = _request_location(request)
     conn = _db()
     conn.execute(
         """INSERT INTO login_events
-           (user_id, username, event_type, success, ip_address, user_agent, device)
-           VALUES (?,?,?,?,?,?,?)""",
-        (user_id, username[:255], event_type[:40], 1 if success else 0, ip, ua, _device_label(ua)),
+           (user_id, username, event_type, success, ip_address, user_agent, device, country, region, city, timezone, language)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            user_id,
+            username[:255],
+            event_type[:40],
+            1 if success else 0,
+            ip,
+            ua,
+            _device_label(ua),
+            loc["country"],
+            loc["region"],
+            loc["city"],
+            loc["timezone"],
+            loc["language"],
+        ),
     )
     conn.commit()
     conn.close()
 
 
-def _record_visit_event(request: Request, path: str, referrer: str = "", user: dict | None = None) -> dict:
+def _record_visit_event(request: Request, path: str, referrer: str = "", user: dict | None = None, payload: dict | None = None) -> dict:
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")[:1000]
+    loc = _request_location(request, payload)
     visitor_key = hashlib.sha256(f"{ip}|{ua}".encode("utf-8")).hexdigest()[:32]
     conn = _db()
     conn.execute(
         """INSERT INTO visitor_events
-           (visitor_key, user_id, username, path, referrer, ip_address, user_agent, device)
-           VALUES (?,?,?,?,?,?,?,?)""",
+           (visitor_key, user_id, username, path, referrer, ip_address, user_agent, device, country, region, city, timezone, language, screen)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             visitor_key,
             user.get("id") if user else None,
@@ -1123,11 +1251,17 @@ def _record_visit_event(request: Request, path: str, referrer: str = "", user: d
             ip,
             ua,
             _device_label(ua),
+            loc["country"],
+            loc["region"],
+            loc["city"],
+            loc["timezone"],
+            loc["language"],
+            loc["screen"],
         ),
     )
     conn.commit()
     conn.close()
-    return {"visitor_key": visitor_key, "ip_address": ip, "device": _device_label(ua)}
+    return {"visitor_key": visitor_key, "ip_address": ip, "device": _device_label(ua), **loc}
 
 # ---------------------------------------------------------------------------
 # AUTH ENDPOINTS
@@ -1198,7 +1332,7 @@ async def analytics_visit(request: Request):
     path = str(data.get("path") or request.headers.get("referer") or "/")
     referrer = str(data.get("referrer") or request.headers.get("referer") or "")
     user = _optional_user_from_request(request)
-    saved = _record_visit_event(request, path, referrer, user)
+    saved = _record_visit_event(request, path, referrer, user, data)
     return {"ok": True, "visitor_key": saved["visitor_key"]}
 
 
@@ -1214,11 +1348,30 @@ async def admin_overview(request: Request):
     unique_24h = _row_dict(conn.execute("SELECT COUNT(DISTINCT visitor_key) AS c FROM visitor_events WHERE created_at>=?", (since_24h,)).fetchone()).get("c", 0)
     login_success = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=1").fetchone()).get("c", 0)
     login_failed = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=0").fetchone()).get("c", 0)
+    known_locations = _row_dict(conn.execute(
+        "SELECT COUNT(DISTINCT country || '|' || region || '|' || city || '|' || timezone) AS c FROM visitor_events WHERE country<>'' OR region<>'' OR city<>'' OR timezone<>''"
+    ).fetchone()).get("c", 0)
     top_paths = [
         _row_dict(row)
         for row in conn.execute(
             """SELECT path, COUNT(*) AS visits, COUNT(DISTINCT visitor_key) AS unique_visitors
                FROM visitor_events GROUP BY path ORDER BY visits DESC LIMIT 10"""
+        ).fetchall()
+    ]
+    top_locations = [
+        {**_row_dict(row), "label": _location_label(_row_dict(row))}
+        for row in conn.execute(
+            """SELECT country, region, city, timezone, COUNT(*) AS visits, COUNT(DISTINCT visitor_key) AS unique_visitors
+               FROM visitor_events
+               GROUP BY country, region, city, timezone
+               ORDER BY visits DESC LIMIT 10"""
+        ).fetchall()
+    ]
+    top_devices = [
+        _row_dict(row)
+        for row in conn.execute(
+            """SELECT device, COUNT(*) AS visits, COUNT(DISTINCT visitor_key) AS unique_visitors
+               FROM visitor_events GROUP BY device ORDER BY visits DESC LIMIT 10"""
         ).fetchall()
     ]
     conn.close()
@@ -1231,7 +1384,10 @@ async def admin_overview(request: Request):
         "unique_24h": unique_24h,
         "login_success": login_success,
         "login_failed": login_failed,
+        "known_locations": known_locations,
         "top_paths": top_paths,
+        "top_locations": top_locations,
+        "top_devices": top_devices,
     }
 
 
@@ -1247,7 +1403,14 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
               (SELECT COUNT(*) FROM downloads d WHERE d.user_id=u.id) AS downloads_count,
               (SELECT MAX(watched_at) FROM watch_history h WHERE h.user_id=u.id) AS last_watched_at,
               (SELECT MAX(added_at) FROM watchlist w WHERE w.user_id=u.id) AS last_watchlist_at,
-              (SELECT MAX(created_at) FROM login_events l WHERE l.user_id=u.id AND l.success=1) AS last_login_at
+              (SELECT MAX(created_at) FROM login_events l WHERE l.user_id=u.id AND l.success=1) AS last_login_at,
+              (SELECT MAX(created_at) FROM visitor_events v WHERE v.user_id=u.id) AS last_seen_at,
+              (SELECT ip_address FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS last_ip,
+              (SELECT device FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS last_device,
+              (SELECT country FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS country,
+              (SELECT region FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS region,
+              (SELECT city FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS city,
+              (SELECT timezone FROM visitor_events v WHERE v.user_id=u.id ORDER BY created_at DESC LIMIT 1) AS timezone
            FROM users u
            ORDER BY u.created_at DESC
            LIMIT ?""",
@@ -1257,12 +1420,69 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
     return {"items": [_row_dict(row) for row in rows]}
 
 
+@app.get("/admin/users/{user_id}/activity")
+async def admin_user_activity(user_id: int, request: Request, limit: int = Query(80, ge=1, le=500)):
+    _get_admin_user(request)
+    conn = _db()
+    user = _row_dict(conn.execute(
+        """SELECT
+              u.id, u.username, u.created_at,
+              (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count,
+              (SELECT COUNT(*) FROM watchlist w WHERE w.user_id=u.id) AS watchlist_count,
+              (SELECT COUNT(*) FROM downloads d WHERE d.user_id=u.id) AS downloads_count,
+              (SELECT MAX(created_at) FROM visitor_events v WHERE v.user_id=u.id) AS last_seen_at,
+              (SELECT MAX(created_at) FROM login_events l WHERE l.user_id=u.id AND l.success=1) AS last_login_at
+           FROM users u WHERE u.id=?""",
+        (user_id,),
+    ).fetchone())
+    if not user:
+        conn.close()
+        raise HTTPException(404, "User not found")
+
+    history = [_row_dict(row) for row in conn.execute(
+        """SELECT mal_id, title, image_url, episode, playback_pos, watched_at
+           FROM watch_history WHERE user_id=? ORDER BY watched_at DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()]
+    watchlist = [_row_dict(row) for row in conn.execute(
+        """SELECT mal_id, title, image_url, episodes, added_at
+           FROM watchlist WHERE user_id=? ORDER BY added_at DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()]
+    downloads = [_row_dict(row) for row in conn.execute(
+        """SELECT mal_id, title, episode, image_url, size_bytes, has_subs, downloaded_at
+           FROM downloads WHERE user_id=? ORDER BY downloaded_at DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()]
+    logins = [_row_dict(row) for row in conn.execute(
+        """SELECT id, event_type, success, ip_address, device, country, region, city, timezone, language, created_at
+           FROM login_events WHERE user_id=? OR username=?
+           ORDER BY created_at DESC LIMIT ?""",
+        (user_id, user["username"], limit),
+    ).fetchall()]
+    visits = [_row_dict(row) for row in conn.execute(
+        """SELECT id, path, referrer, ip_address, device, country, region, city, timezone, language, screen, created_at
+           FROM visitor_events WHERE user_id=? OR username=?
+           ORDER BY created_at DESC LIMIT ?""",
+        (user_id, user["username"], limit),
+    ).fetchall()]
+    conn.close()
+    return {
+        "user": user,
+        "history": history,
+        "watchlist": watchlist,
+        "downloads": downloads,
+        "logins": logins,
+        "visits": visits,
+    }
+
+
 @app.get("/admin/logins")
 async def admin_logins(request: Request, limit: int = Query(200, ge=1, le=1000)):
     _get_admin_user(request)
     conn = _db()
     rows = conn.execute(
-        """SELECT id, user_id, username, event_type, success, ip_address, device, user_agent, created_at
+        """SELECT id, user_id, username, event_type, success, ip_address, device, country, region, city, timezone, language, user_agent, created_at
            FROM login_events ORDER BY created_at DESC LIMIT ?""",
         (limit,),
     ).fetchall()
@@ -1275,7 +1495,7 @@ async def admin_visits(request: Request, limit: int = Query(300, ge=1, le=2000))
     _get_admin_user(request)
     conn = _db()
     rows = conn.execute(
-        """SELECT id, visitor_key, user_id, username, path, referrer, ip_address, device, user_agent, created_at
+        """SELECT id, visitor_key, user_id, username, path, referrer, ip_address, device, country, region, city, timezone, language, screen, user_agent, created_at
            FROM visitor_events ORDER BY created_at DESC LIMIT ?""",
         (limit,),
     ).fetchall()
