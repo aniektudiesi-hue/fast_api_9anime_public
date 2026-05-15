@@ -1444,6 +1444,36 @@ async def chat_rooms(request: Request):
     return {"items": items}
 
 
+@app.get("/chat/online")
+async def chat_online(request: Request, seconds: int = Query(240, ge=30, le=1800)):
+    _get_current_user(request)
+    since = int(time.time()) - seconds
+    conn = _db()
+    rows = conn.execute(
+        """SELECT user_id AS id, username, MAX(created_at) AS last_seen_at,
+                  MAX(path) AS path, MAX(device) AS device, MAX(country) AS country,
+                  MAX(region) AS region, MAX(city) AS city
+           FROM visitor_events
+           WHERE user_id IS NOT NULL AND username<>'' AND created_at>=?
+           GROUP BY user_id, username
+           ORDER BY last_seen_at DESC
+           LIMIT 200""",
+        (since,),
+    ).fetchall()
+    conn.close()
+
+    by_id = {str(row["id"]): _row_dict(row) for row in rows}
+    for users in _CHAT_USERS.values():
+        by_id[str(users["id"])] = {
+            **by_id.get(str(users["id"]), {}),
+            "id": users["id"],
+            "username": users["username"],
+            "last_seen_at": int(time.time()),
+            "source": "chat",
+        }
+    return {"items": list(by_id.values()), "count": len(by_id)}
+
+
 @app.get("/chat/messages/{room}")
 async def chat_messages(room: str, request: Request, limit: int = Query(60, ge=1, le=200)):
     _get_current_user(request)
