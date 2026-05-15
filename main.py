@@ -997,6 +997,31 @@ def _db_init() -> None:
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_key ON visitor_events(visitor_key, created_at DESC);")
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_user ON visitor_events(user_id, created_at DESC);")
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_visitor_events_username ON visitor_events(username, created_at DESC);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        room          TEXT    NOT NULL,
+        user_id       INTEGER NOT NULL REFERENCES users(id),
+        username      TEXT    NOT NULL,
+        message       TEXT    NOT NULL,
+        kind          TEXT    DEFAULT 'text',
+        meta          TEXT    DEFAULT '{}',
+        created_at    INTEGER DEFAULT (strftime('%s','now'))
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_chat_room_time ON chat_messages(room, created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_chat_user_time ON chat_messages(user_id, created_at DESC);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS user_follows (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        follower_id    INTEGER NOT NULL REFERENCES users(id),
+        following_id   INTEGER NOT NULL REFERENCES users(id),
+        created_at     INTEGER DEFAULT (strftime('%s','now')),
+        UNIQUE(follower_id, following_id)
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_user_follows_follower ON user_follows(follower_id, created_at DESC);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_user_follows_following ON user_follows(following_id, created_at DESC);")
     conn.commit()
     conn.close()
 
@@ -1319,6 +1344,228 @@ async def auth_login(request: Request):
 @app.get("/auth/me")
 async def auth_me(request: Request):
     return _get_current_user(request)
+
+
+# ---------------------------------------------------------------------------
+# REAL-TIME CHAT
+# ---------------------------------------------------------------------------
+_CHAT_ROOMS: dict[str, set[WebSocket]] = {}
+_CHAT_USERS: dict[WebSocket, dict] = {}
+_CHAT_LOCK = asyncio.Lock()
+
+
+def _normalize_room(room: str) -> str:
+    room = re.sub(r"[^a-zA-Z0-9:_\\- ]+", "", (room or "global").strip())[:80]
+    return room or "global"
+
+
+def _chat_row(row) -> dict:
+    item = _row_dict(row)
+    try:
+        item["meta"] = json.loads(item.get("meta") or "{}")
+    except Exception:
+        item["meta"] = {}
+    return item
+
+
+async def _chat_broadcast(room: str, payload: dict) -> None:
+    dead: list[WebSocket] = []
+    async with _CHAT_LOCK:
+        sockets = list(_CHAT_ROOMS.get(room, set()))
+    for socket in sockets:
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            dead.append(socket)
+    if dead:
+        async with _CHAT_LOCK:
+            for socket in dead:
+                _CHAT_ROOMS.get(room, set()).discard(socket)
+                _CHAT_USERS.pop(socket, None)
+
+
+async def _chat_online_payload(room: str) -> dict:
+    async with _CHAT_LOCK:
+        users = [_CHAT_USERS[socket] for socket in _CHAT_ROOMS.get(room, set()) if socket in _CHAT_USERS]
+    unique = {}
+    for user in users:
+        unique[user["id"]] = user
+    return {"type": "online", "room": room, "users": list(unique.values()), "count": len(unique)}
+
+
+def _save_chat_message(room: str, user: dict, message: str, kind: str = "text", meta: dict | None = None) -> dict:
+    message = str(message or "").strip()
+    if not message:
+        raise ValueError("Message required")
+    if len(message) > 800:
+        message = message[:800]
+    kind = re.sub(r"[^a-z_\\-]", "", str(kind or "text").lower())[:32] or "text"
+    meta_text = json.dumps(meta or {}, separators=(",", ":"))[:2000]
+    conn = _db()
+    row = conn.execute(
+        """INSERT INTO chat_messages (room, user_id, username, message, kind, meta)
+           VALUES (?,?,?,?,?,?)
+           RETURNING id, room, user_id, username, message, kind, meta, created_at""",
+        (room, user["id"], user["username"], message, kind, meta_text),
+    ).fetchone()
+    if not row:
+        row = conn.execute(
+            """SELECT id, room, user_id, username, message, kind, meta, created_at
+               FROM chat_messages WHERE room=? AND user_id=? ORDER BY id DESC LIMIT 1""",
+            (room, user["id"]),
+        ).fetchone()
+    conn.commit()
+    conn.close()
+    return _chat_row(row)
+
+
+@app.get("/chat/rooms")
+async def chat_rooms(request: Request):
+    _get_current_user(request)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT room, COUNT(*) AS messages, MAX(created_at) AS last_message_at
+           FROM chat_messages GROUP BY room ORDER BY last_message_at DESC LIMIT 40"""
+    ).fetchall()
+    conn.close()
+    defaults = [
+        {"room": "global", "messages": 0, "last_message_at": None},
+        {"room": "anime", "messages": 0, "last_message_at": None},
+        {"room": "recommendations", "messages": 0, "last_message_at": None},
+        {"room": "spoilers", "messages": 0, "last_message_at": None},
+    ]
+    seen = set()
+    items = []
+    for item in defaults + [_row_dict(row) for row in rows]:
+        if item["room"] in seen:
+            continue
+        seen.add(item["room"])
+        items.append(item)
+    return {"items": items}
+
+
+@app.get("/chat/messages/{room}")
+async def chat_messages(room: str, request: Request, limit: int = Query(60, ge=1, le=200)):
+    _get_current_user(request)
+    room = _normalize_room(room)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT id, room, user_id, username, message, kind, meta, created_at
+           FROM chat_messages WHERE room=? ORDER BY created_at DESC, id DESC LIMIT ?""",
+        (room, limit),
+    ).fetchall()
+    conn.close()
+    return {"items": list(reversed([_chat_row(row) for row in rows]))}
+
+
+@app.post("/chat/messages/{room}")
+async def chat_message_add(room: str, request: Request):
+    user = _get_current_user(request)
+    room = _normalize_room(room)
+    data = await request.json()
+    item = _save_chat_message(room, user, data.get("message", ""), data.get("kind", "text"), data.get("meta") or {})
+    await _chat_broadcast(room, {"type": "message", "room": room, "message": item})
+    return {"ok": True, "message": item}
+
+
+@app.get("/chat/users/search")
+async def chat_user_search(request: Request, q: str = Query("", min_length=1), limit: int = Query(20, ge=1, le=50)):
+    current = _get_current_user(request)
+    query = f"%{q.strip()}%"
+    conn = _db()
+    rows = conn.execute(
+        """SELECT u.id, u.username, u.created_at,
+                  (SELECT MAX(created_at) FROM visitor_events v WHERE v.user_id=u.id) AS last_seen_at,
+                  EXISTS(SELECT 1 FROM user_follows f WHERE f.follower_id=? AND f.following_id=u.id) AS following
+           FROM users u
+           WHERE u.username LIKE ? AND u.id<>?
+           ORDER BY u.username ASC LIMIT ?""",
+        (current["id"], query, current["id"], limit),
+    ).fetchall()
+    conn.close()
+    return {"items": [_row_dict(row) for row in rows]}
+
+
+@app.post("/chat/users/{user_id}/follow")
+async def chat_follow_user(user_id: int, request: Request):
+    current = _get_current_user(request)
+    if current["id"] == user_id:
+        raise HTTPException(400, "You cannot follow yourself")
+    conn = _db()
+    exists = conn.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+    if not exists:
+        conn.close()
+        raise HTTPException(404, "User not found")
+    conn.execute(
+        "INSERT INTO user_follows (follower_id, following_id) VALUES (?,?) ON CONFLICT(follower_id, following_id) DO NOTHING",
+        (current["id"], user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.delete("/chat/users/{user_id}/follow")
+async def chat_unfollow_user(user_id: int, request: Request):
+    current = _get_current_user(request)
+    conn = _db()
+    conn.execute("DELETE FROM user_follows WHERE follower_id=? AND following_id=?", (current["id"], user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.get("/chat/following")
+async def chat_following(request: Request):
+    current = _get_current_user(request)
+    conn = _db()
+    rows = conn.execute(
+        """SELECT u.id, u.username,
+                  (SELECT MAX(created_at) FROM visitor_events v WHERE v.user_id=u.id) AS last_seen_at
+           FROM user_follows f
+           JOIN users u ON u.id=f.following_id
+           WHERE f.follower_id=?
+           ORDER BY f.created_at DESC LIMIT 100""",
+        (current["id"],),
+    ).fetchall()
+    conn.close()
+    return {"items": [_row_dict(row) for row in rows]}
+
+
+@app.websocket("/ws/chat/{room}")
+async def chat_ws(websocket: WebSocket, room: str):
+    room = _normalize_room(room)
+    token = websocket.query_params.get("token", "").strip()
+    user = _user_from_token(token)
+    if not user:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    async with _CHAT_LOCK:
+        _CHAT_ROOMS.setdefault(room, set()).add(websocket)
+        _CHAT_USERS[websocket] = {"id": user["id"], "username": user["username"]}
+    await _chat_broadcast(room, await _chat_online_payload(room))
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong", "room": room})
+                continue
+            item = _save_chat_message(room, user, data.get("message", ""), data.get("kind", "text"), data.get("meta") or {})
+            await _chat_broadcast(room, {"type": "message", "room": room, "message": item})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning("Chat websocket error: %s", e)
+    finally:
+        async with _CHAT_LOCK:
+            _CHAT_ROOMS.get(room, set()).discard(websocket)
+            _CHAT_USERS.pop(websocket, None)
+        await _chat_broadcast(room, await _chat_online_payload(room))
 
 
 # ---------------------------------------------------------------------------
