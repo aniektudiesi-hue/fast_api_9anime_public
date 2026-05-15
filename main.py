@@ -1398,6 +1398,18 @@ def _chat_row(row) -> dict:
     return item
 
 
+def _recent_chat_messages(room: str, limit: int = 80) -> list[dict]:
+    limit = max(1, min(int(limit or 80), 200))
+    conn = _db()
+    rows = conn.execute(
+        """SELECT id, room, user_id, username, message, kind, meta, created_at
+           FROM chat_messages WHERE room=? ORDER BY created_at DESC, id DESC LIMIT ?""",
+        (room, limit),
+    ).fetchall()
+    conn.close()
+    return list(reversed([_chat_row(row) for row in rows]))
+
+
 async def _chat_broadcast(room: str, payload: dict) -> None:
     dead: list[WebSocket] = []
     async with _CHAT_LOCK:
@@ -1506,14 +1518,7 @@ async def chat_online(request: Request, seconds: int = Query(240, ge=30, le=1800
 async def chat_messages(room: str, request: Request, limit: int = Query(60, ge=1, le=200)):
     _get_current_user(request)
     room = _normalize_room(room)
-    conn = _db()
-    rows = conn.execute(
-        """SELECT id, room, user_id, username, message, kind, meta, created_at
-           FROM chat_messages WHERE room=? ORDER BY created_at DESC, id DESC LIMIT ?""",
-        (room, limit),
-    ).fetchall()
-    conn.close()
-    return {"items": list(reversed([_chat_row(row) for row in rows]))}
+    return {"items": _recent_chat_messages(room, limit)}
 
 
 @app.post("/chat/messages/{room}")
@@ -1603,6 +1608,7 @@ async def chat_ws(websocket: WebSocket, room: str):
     async with _CHAT_LOCK:
         _CHAT_ROOMS.setdefault(room, set()).add(websocket)
         _CHAT_USERS[websocket] = {"id": user["id"], "username": user["username"]}
+    await websocket.send_json({"type": "history", "room": room, "messages": _recent_chat_messages(room, 80)})
     await _chat_broadcast(room, await _chat_online_payload(room))
     try:
         while True:
