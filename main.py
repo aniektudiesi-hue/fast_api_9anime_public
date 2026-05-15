@@ -1323,23 +1323,53 @@ async def auth_login(request: Request):
     data = await request.json()
     username = (data.get("username") or "").strip()
     password = (data.get("password") or "").strip()
+    if not password:
+        _record_login_event(username, "login", False, request)
+        raise HTTPException(400, "Password required. Use recover if this is an old username.")
     conn = _db()
-    if password:
-        row  = conn.execute(
-            "SELECT id, token FROM users WHERE username=? AND password_hash=?",
-            (username, _hash_pw(password))
-        ).fetchone()
-    else:
-        row  = conn.execute(
-            "SELECT id, token FROM users WHERE username=?",
-            (username,)
-        ).fetchone()
+    row  = conn.execute(
+        "SELECT id, token FROM users WHERE username=? AND password_hash=?",
+        (username, _hash_pw(password))
+    ).fetchone()
     conn.close()
     if not row:
         _record_login_event(username, "login", False, request)
-        raise HTTPException(401, "Username not found")
+        raise HTTPException(401, "Invalid username or password")
     _record_login_event(username, "login", True, request, row["id"])
     return {"token": row["token"], "username": username}
+
+
+@app.post("/auth/recover")
+async def auth_recover(request: Request):
+    """Recover an existing username without deleting any data.
+
+    This is intentionally separate from normal login so future accounts can use
+    strict password auth while older users can still regain their preserved
+    history/watchlist and then set a password immediately.
+    """
+    data = await request.json()
+    username = (data.get("username") or "").strip()
+    new_password = (data.get("new_password") or data.get("password") or "").strip()
+    if len(username) < 3:
+        _record_login_event(username, "recover", False, request)
+        raise HTTPException(400, "Username must be at least 3 characters")
+    conn = _db()
+    row = conn.execute("SELECT id, token FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        conn.close()
+        _record_login_event(username, "recover", False, request)
+        raise HTTPException(404, "Username not found")
+    if len(new_password) >= 4:
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_pw(new_password), row["id"]))
+        conn.commit()
+    conn.close()
+    _record_login_event(username, "recover", True, request, row["id"])
+    return {
+        "token": row["token"],
+        "username": username,
+        "recovered": True,
+        "password_set": len(new_password) >= 4,
+    }
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
@@ -1402,18 +1432,16 @@ def _save_chat_message(room: str, user: dict, message: str, kind: str = "text", 
     kind = re.sub(r"[^a-z_\\-]", "", str(kind or "text").lower())[:32] or "text"
     meta_text = json.dumps(meta or {}, separators=(",", ":"))[:2000]
     conn = _db()
-    row = conn.execute(
+    conn.execute(
         """INSERT INTO chat_messages (room, user_id, username, message, kind, meta)
-           VALUES (?,?,?,?,?,?)
-           RETURNING id, room, user_id, username, message, kind, meta, created_at""",
+           VALUES (?,?,?,?,?,?)""",
         (room, user["id"], user["username"], message, kind, meta_text),
+    )
+    row = conn.execute(
+        """SELECT id, room, user_id, username, message, kind, meta, created_at
+           FROM chat_messages WHERE room=? AND user_id=? ORDER BY id DESC LIMIT 1""",
+        (room, user["id"]),
     ).fetchone()
-    if not row:
-        row = conn.execute(
-            """SELECT id, room, user_id, username, message, kind, meta, created_at
-               FROM chat_messages WHERE room=? AND user_id=? ORDER BY id DESC LIMIT 1""",
-            (room, user["id"]),
-        ).fetchone()
     conn.commit()
     conn.close()
     return _chat_row(row)
