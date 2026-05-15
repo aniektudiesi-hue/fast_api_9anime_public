@@ -1091,6 +1091,48 @@ _db_migrate()
 def _hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
 
+
+def _clean_username(username: str) -> str:
+    return re.sub(r"\s+", " ", str(username or "").strip())[:255]
+
+
+def _find_user_by_username(conn: _Conn, username: str):
+    username = _clean_username(username)
+    return conn.execute(
+        "SELECT id, username, password_hash, token, created_at FROM users WHERE lower(username)=lower(?) LIMIT 1",
+        (username,),
+    ).fetchone()
+
+
+def _legacy_username_seen(conn: _Conn, username: str) -> str:
+    username = _clean_username(username)
+    if len(username) < 3:
+        return ""
+    row = conn.execute(
+        """SELECT username FROM login_events
+           WHERE lower(username)=lower(?) AND username<>'' ORDER BY created_at DESC LIMIT 1""",
+        (username,),
+    ).fetchone()
+    if row:
+        return str(row["username"] or username).strip()
+    row = conn.execute(
+        """SELECT username FROM visitor_events
+           WHERE lower(username)=lower(?) AND username<>'' ORDER BY created_at DESC LIMIT 1""",
+        (username,),
+    ).fetchone()
+    return str(row["username"] or username).strip() if row else ""
+
+
+def _create_recovered_user(conn: _Conn, username: str, password: str) -> dict:
+    username = _clean_username(username)
+    token = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO users (username, password_hash, token) VALUES (?,?,?)",
+        (username, _hash_pw(password or username), token),
+    )
+    row = _find_user_by_username(conn, username)
+    return _row_dict(row)
+
 def _get_current_user(request: Request) -> dict:
     auth  = request.headers.get("Authorization", "")
     token = auth.removeprefix("Bearer ").strip()
@@ -1297,22 +1339,27 @@ def _record_visit_event(request: Request, path: str, referrer: str = "", user: d
 @app.post("/auth/register")
 async def auth_register(request: Request):
     data = await request.json()
-    username = (data.get("username") or "").strip()
+    username = _clean_username(data.get("username") or "")
     password = (data.get("password") or username).strip()
     if len(username) < 3:
         _record_login_event(username, "register", False, request)
         raise HTTPException(400, "Username must be at least 3 characters")
     token = secrets.token_hex(32)
+    conn = _db()
+    if _find_user_by_username(conn, username):
+        conn.close()
+        _record_login_event(username, "register", False, request)
+        raise HTTPException(409, "Username already taken")
     try:
-        conn = _db()
         conn.execute(
             "INSERT INTO users (username, password_hash, token) VALUES (?,?,?)",
             (username, _hash_pw(password), token)
         )
-        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        row = _find_user_by_username(conn, username)
         conn.commit()
         conn.close()
     except _INTEGRITY_ERRORS:
+        conn.close()
         _record_login_event(username, "register", False, request)
         raise HTTPException(409, "Username already taken")
     _record_login_event(username, "register", True, request, _row_dict(row).get("id"))
@@ -1321,22 +1368,30 @@ async def auth_register(request: Request):
 @app.post("/auth/login")
 async def auth_login(request: Request):
     data = await request.json()
-    username = (data.get("username") or "").strip()
+    username = _clean_username(data.get("username") or "")
     password = (data.get("password") or "").strip()
     if not password:
         _record_login_event(username, "login", False, request)
         raise HTTPException(400, "Password required. Use recover if this is an old username.")
     conn = _db()
-    row  = conn.execute(
-        "SELECT id, token FROM users WHERE username=? AND password_hash=?",
-        (username, _hash_pw(password))
-    ).fetchone()
-    conn.close()
+    row = _find_user_by_username(conn, username)
     if not row:
+        legacy_username = _legacy_username_seen(conn, username)
+        if legacy_username:
+            row = _create_recovered_user(conn, legacy_username, password)
+            conn.commit()
+            conn.close()
+            _record_login_event(legacy_username, "login_recovered", True, request, row["id"])
+            return {"token": row["token"], "username": row["username"], "recovered": True}
+        conn.close()
+        _record_login_event(username, "login", False, request)
+        raise HTTPException(404, "Username not found. Register or recover your old username.")
+    conn.close()
+    if row["password_hash"] != _hash_pw(password):
         _record_login_event(username, "login", False, request)
         raise HTTPException(401, "Invalid username or password")
     _record_login_event(username, "login", True, request, row["id"])
-    return {"token": row["token"], "username": username}
+    return {"token": row["token"], "username": row["username"]}
 
 
 @app.post("/auth/recover")
@@ -1348,14 +1403,27 @@ async def auth_recover(request: Request):
     history/watchlist and then set a password immediately.
     """
     data = await request.json()
-    username = (data.get("username") or "").strip()
+    username = _clean_username(data.get("username") or "")
     new_password = (data.get("new_password") or data.get("password") or "").strip()
     if len(username) < 3:
         _record_login_event(username, "recover", False, request)
         raise HTTPException(400, "Username must be at least 3 characters")
     conn = _db()
-    row = conn.execute("SELECT id, token FROM users WHERE username=?", (username,)).fetchone()
+    row = _find_user_by_username(conn, username)
     if not row:
+        legacy_username = _legacy_username_seen(conn, username)
+        if legacy_username:
+            row = _create_recovered_user(conn, legacy_username, new_password or legacy_username)
+            conn.commit()
+            conn.close()
+            _record_login_event(legacy_username, "recover_recreated", True, request, row["id"])
+            return {
+                "token": row["token"],
+                "username": row["username"],
+                "recovered": True,
+                "recreated": True,
+                "password_set": len(new_password) >= 4,
+            }
         conn.close()
         _record_login_event(username, "recover", False, request)
         raise HTTPException(404, "Username not found")
@@ -1366,7 +1434,7 @@ async def auth_recover(request: Request):
     _record_login_event(username, "recover", True, request, row["id"])
     return {
         "token": row["token"],
-        "username": username,
+        "username": row["username"],
         "recovered": True,
         "password_set": len(new_password) >= 4,
     }
@@ -1767,8 +1835,50 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
            LIMIT ?""",
         (limit,),
     ).fetchall()
+    items = [_row_dict(row) for row in rows]
+    seen_names = {str(item.get("username", "")).strip().lower() for item in items}
+    if len(items) < limit:
+        legacy_rows = conn.execute(
+            """SELECT username,
+                      MAX(created_at) AS last_login_at,
+                      COUNT(*) AS login_events
+               FROM login_events
+               WHERE username<>'' AND success=1
+               GROUP BY lower(username), username
+               ORDER BY last_login_at DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        for row in legacy_rows:
+            item = _row_dict(row)
+            key = str(item.get("username", "")).strip().lower()
+            if not key or key in seen_names:
+                continue
+            seen_names.add(key)
+            items.append({
+                "id": None,
+                "username": item["username"],
+                "created_at": item.get("last_login_at"),
+                "history_count": 0,
+                "watchlist_count": 0,
+                "downloads_count": 0,
+                "last_watched_at": None,
+                "last_watchlist_at": None,
+                "last_login_at": item.get("last_login_at"),
+                "last_seen_at": item.get("last_login_at"),
+                "last_ip": "",
+                "last_device": "",
+                "country": "",
+                "region": "",
+                "city": "",
+                "timezone": "",
+                "legacy_only": True,
+                "note": "Legacy username seen in login logs. User can recover it to recreate the account.",
+            })
+            if len(items) >= limit:
+                break
     conn.close()
-    return {"items": [_row_dict(row) for row in rows]}
+    return {"items": items}
 
 
 @app.get("/admin/users/{user_id}/activity")
