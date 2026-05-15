@@ -1385,7 +1385,7 @@ _CHAT_LOCK = asyncio.Lock()
 
 
 def _normalize_room(room: str) -> str:
-    room = re.sub(r"[^a-zA-Z0-9:_\\- ]+", "", (room or "global").strip())[:80]
+    room = re.sub(r"[^a-zA-Z0-9:_ -]+", "", (room or "global").strip())[:80]
     return room or "global"
 
 
@@ -1441,7 +1441,7 @@ def _save_chat_message(room: str, user: dict, message: str, kind: str = "text", 
         raise ValueError("Message required")
     if len(message) > 800:
         message = message[:800]
-    kind = re.sub(r"[^a-z_\\-]", "", str(kind or "text").lower())[:32] or "text"
+    kind = re.sub(r"[^a-z_-]", "", str(kind or "text").lower())[:32] or "text"
     meta_text = json.dumps(meta or {}, separators=(",", ":"))[:2000]
     conn = _db()
     conn.execute(
