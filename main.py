@@ -897,7 +897,12 @@ class _Conn:
     """Thin wrapper that exposes a SQLite-like API on top of psycopg or sqlite3."""
     def __init__(self):
         if IS_PG:
-            self._c = psycopg.connect(_DATABASE_URL, row_factory=dict_row, autocommit=False)
+            self._c = psycopg.connect(
+                _DATABASE_URL,
+                row_factory=dict_row,
+                autocommit=False,
+                prepare_threshold=None,
+            )
         else:
             self._c = sqlite3.connect(_DB_PATH)
             self._c.row_factory = sqlite3.Row
