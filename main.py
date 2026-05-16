@@ -967,7 +967,7 @@ def _db_init() -> None:
         episode      INTEGER NOT NULL,
         playback_pos REAL    DEFAULT 0,
         watched_at   INTEGER DEFAULT (strftime('%s','now')),
-        UNIQUE(user_id, mal_id, episode)
+        UNIQUE(user_id, mal_id)
     );
     """)
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_hist_user ON watch_history(user_id, watched_at DESC);")
@@ -1077,6 +1077,23 @@ def _db_init() -> None:
 
 def _db_migrate() -> None:
     conn = _db()
+    def compact_history() -> None:
+        conn.execute("""
+            DELETE FROM watch_history
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id, mal_id
+                               ORDER BY watched_at DESC, id DESC
+                           ) AS rn
+                    FROM watch_history
+                ) ranked
+                WHERE rn > 1
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_history_user_mal_unique ON watch_history(user_id, mal_id)")
+
     if IS_PG:
         for table, columns in {
             "login_events": {
@@ -1097,6 +1114,7 @@ def _db_migrate() -> None:
         }.items():
             for name, definition in columns.items():
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
+        compact_history()
         conn.commit()
         conn.close()
         return
@@ -1126,6 +1144,7 @@ def _db_migrate() -> None:
     }.items():
         for name, definition in columns.items():
             ensure_column(table, name, definition)
+    compact_history()
     conn.commit()
     conn.close()
 
@@ -2121,14 +2140,22 @@ def _save_history_for_user(user_id: int, d: dict) -> dict:
     payload = _normalize_history_payload(d)
     conn = _db()
     try:
-        # Keep one visible history row per anime; the newest episode/resume point wins.
-        conn.execute(
-            "DELETE FROM watch_history WHERE user_id=? AND mal_id=?",
-            (user_id, payload["mal_id"])
-        )
         conn.execute(
             """INSERT INTO watch_history (user_id, mal_id, title, image_url, episode, playback_pos, watched_at)
                VALUES (?,?,?,?,?,?,strftime('%s','now'))
+               ON CONFLICT(user_id, mal_id) DO UPDATE SET
+                 title = CASE
+                   WHEN excluded.title='' OR excluded.title LIKE 'Anime %' OR excluded.title='Untitled'
+                   THEN watch_history.title
+                   ELSE excluded.title
+                 END,
+                 image_url = CASE
+                   WHEN excluded.image_url='' THEN watch_history.image_url
+                   ELSE excluded.image_url
+                 END,
+                 episode = excluded.episode,
+                 playback_pos = excluded.playback_pos,
+                 watched_at = excluded.watched_at
             """,
             (user_id, payload["mal_id"], payload["title"], payload["image_url"],
              payload["episode"], payload["playback_pos"])
