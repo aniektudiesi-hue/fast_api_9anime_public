@@ -835,6 +835,18 @@ def _is_render_runtime() -> bool:
         return True
     return str(Path.cwd()).replace("\\", "/").startswith("/opt/render/")
 
+
+def _can_prepare_sqlite_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".ro_anime_write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception as exc:
+        logger.error("SQLite directory is not writable: %s (%s)", path, exc)
+        return False
+
 if _SQLITE_PATH_ENV:
     _DB_PATH = Path(_SQLITE_PATH_ENV)
 elif _SQLITE_DIR_ENV:
@@ -845,11 +857,17 @@ else:
     _DB_PATH = _LEGACY_DB_PATH
 
 if not IS_PG:
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if _is_render_runtime() and not str(_DB_PATH).replace("\\", "/").startswith(str(_RENDER_DISK_DIR).replace("\\", "/")):
-        raise RuntimeError(f"Refusing to use ephemeral SQLite on Render: {_DB_PATH}. Attach /var/data disk or set DATABASE_URL.")
-    if _is_render_runtime() and not os.access(_DB_PATH.parent, os.W_OK):
-        raise RuntimeError(f"Persistent DB directory is not writable: {_DB_PATH.parent}. Attach the Render disk before deploy.")
+    desired_path = _DB_PATH
+    if not _can_prepare_sqlite_dir(_DB_PATH.parent):
+        logger.error(
+            "Persistent SQLite path %s is unavailable. Falling back to %s so API can start. "
+            "Attach a Render disk at %s or set DATABASE_URL to stop data resets.",
+            desired_path,
+            _LEGACY_DB_PATH,
+            _RENDER_DISK_DIR,
+        )
+        _DB_PATH = _LEGACY_DB_PATH
+        _can_prepare_sqlite_dir(_DB_PATH.parent)
     if _DB_PATH != _LEGACY_DB_PATH and not _DB_PATH.exists() and _LEGACY_DB_PATH.exists():
         shutil.copy2(_LEGACY_DB_PATH, _DB_PATH)
 
@@ -857,11 +875,11 @@ if not IS_PG:
 def _sqlite_backup_snapshot(label: str = "startup") -> None:
     if IS_PG or not _DB_PATH.exists() or _DB_PATH.stat().st_size <= 0:
         return
-    backup_root = _DB_PATH.parent / "backups"
-    backup_root.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = backup_root / f"ro_anime_users-{label}-{stamp}.db"
     try:
+        backup_root = _DB_PATH.parent / "backups"
+        backup_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = backup_root / f"ro_anime_users-{label}-{stamp}.db"
         shutil.copy2(_DB_PATH, target)
         backups = sorted(backup_root.glob("ro_anime_users-*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
         for old in backups[20:]:
