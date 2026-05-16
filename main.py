@@ -1364,10 +1364,20 @@ async def auth_register(request: Request):
         raise HTTPException(400, "Username must be at least 3 characters")
     token = secrets.token_hex(32)
     conn = _db()
-    if _find_user_by_username(conn, username):
+    existing = _find_user_by_username(conn, username)
+    if existing:
+        password_hash = _hash_pw(password)
+        legacy_hashes = {_hash_pw(existing["username"]), _hash_pw(username)}
+        if existing["password_hash"] == password_hash or existing["password_hash"] in legacy_hashes:
+            if existing["password_hash"] != password_hash and len(password) >= 4:
+                conn.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, existing["id"]))
+                conn.commit()
+            conn.close()
+            _record_login_event(existing["username"], "register_existing_login", True, request, existing["id"])
+            return {"token": existing["token"], "username": existing["username"], "existing": True}
         conn.close()
         _record_login_event(username, "register", False, request)
-        raise HTTPException(409, "Username already taken")
+        raise HTTPException(409, "Username already exists. Login with the correct password.")
     try:
         conn.execute(
             "INSERT INTO users (username, password_hash, token) VALUES (?,?,?)",
