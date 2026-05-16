@@ -1737,6 +1737,18 @@ async def chat_ws(websocket: WebSocket, room: str):
             if data.get("type") == "ping":
                 await websocket.send_json({"type": "pong", "room": room})
                 continue
+            if data.get("type") == "typing":
+                await _chat_broadcast(
+                    room,
+                    {
+                        "type": "typing",
+                        "room": room,
+                        "user": {"id": user["id"], "username": user["username"]},
+                        "is_typing": bool(data.get("is_typing")),
+                        "created_at": int(time.time()),
+                    },
+                )
+                continue
             item = _save_chat_message(room, user, data.get("message", ""), data.get("kind", "text"), data.get("meta") or {})
             await _chat_broadcast(room, {"type": "message", "room": room, "message": item})
     except WebSocketDisconnect:
