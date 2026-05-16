@@ -1429,13 +1429,6 @@ async def auth_login(request: Request):
     conn = _db()
     candidates = _find_users_by_username(conn, username)
     if not candidates:
-        legacy_username = _legacy_username_seen(conn, username)
-        if legacy_username:
-            row = _create_recovered_user(conn, legacy_username, password)
-            conn.commit()
-            conn.close()
-            _record_login_event(legacy_username, "login_legacy_recreated", True, request, row["id"])
-            return {"token": row["token"], "username": row["username"], "legacy_recreated": True}
         conn.close()
         _record_login_event(username, "login", False, request)
         raise HTTPException(404, "Username not found. Register this username to create it.")
