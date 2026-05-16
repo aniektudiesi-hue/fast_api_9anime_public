@@ -1096,6 +1096,10 @@ def _clean_username(username: str) -> str:
     return re.sub(r"\s+", " ", str(username or "").strip())[:255]
 
 
+def _username_key(username: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_username(username).lower())
+
+
 def _find_user_by_username(conn: _Conn, username: str):
     username = _clean_username(username)
     return conn.execute(
@@ -1111,32 +1115,53 @@ def _find_user_by_username(conn: _Conn, username: str):
 
 def _find_users_by_username(conn: _Conn, username: str) -> list[dict]:
     username = _clean_username(username)
+    key = _username_key(username)
     rows = conn.execute(
         """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
                   (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
            FROM users u
            WHERE lower(u.username)=lower(?)
+              OR lower(replace(replace(replace(u.username, ' ', ''), '_', ''), '-', ''))=?
            ORDER BY history_count DESC, u.id ASC""",
-        (username,),
+        (username, key),
     ).fetchall()
-    return [_row_dict(row) for row in rows]
+    items = [_row_dict(row) for row in rows]
+    if items or not key:
+        return items
+    rows = conn.execute(
+        """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
+           FROM users u
+           ORDER BY history_count DESC, u.id ASC
+           LIMIT 5000"""
+    ).fetchall()
+    return [_row_dict(row) for row in rows if _username_key(row["username"]) == key]
 
 
 def _legacy_username_seen(conn: _Conn, username: str) -> str:
     username = _clean_username(username)
+    key = _username_key(username)
     if len(username) < 3:
         return ""
     row = conn.execute(
         """SELECT username FROM login_events
-           WHERE lower(username)=lower(?) AND username<>'' ORDER BY created_at DESC LIMIT 1""",
-        (username,),
+           WHERE username<>'' AND (
+             lower(username)=lower(?)
+             OR lower(replace(replace(replace(username, ' ', ''), '_', ''), '-', ''))=?
+           )
+           ORDER BY created_at DESC LIMIT 1""",
+        (username, key),
     ).fetchone()
     if row:
         return str(row["username"] or username).strip()
     row = conn.execute(
         """SELECT username FROM visitor_events
-           WHERE lower(username)=lower(?) AND username<>'' ORDER BY created_at DESC LIMIT 1""",
-        (username,),
+           WHERE username<>'' AND (
+             lower(username)=lower(?)
+             OR lower(replace(replace(replace(username, ' ', ''), '_', ''), '-', ''))=?
+           )
+           ORDER BY created_at DESC LIMIT 1""",
+        (username, key),
     ).fetchone()
     return str(row["username"] or username).strip() if row else ""
 
@@ -1404,9 +1429,16 @@ async def auth_login(request: Request):
     conn = _db()
     candidates = _find_users_by_username(conn, username)
     if not candidates:
+        legacy_username = _legacy_username_seen(conn, username)
+        if legacy_username:
+            row = _create_recovered_user(conn, legacy_username, password)
+            conn.commit()
+            conn.close()
+            _record_login_event(legacy_username, "login_legacy_recreated", True, request, row["id"])
+            return {"token": row["token"], "username": row["username"], "legacy_recreated": True}
         conn.close()
         _record_login_event(username, "login", False, request)
-        raise HTTPException(404, "Username not found")
+        raise HTTPException(404, "Username not found. Register this username to create it.")
 
     password_hash = _hash_pw(password)
     row = next((item for item in candidates if item["password_hash"] == password_hash), None)
