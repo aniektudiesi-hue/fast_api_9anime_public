@@ -829,19 +829,45 @@ _SQLITE_PATH_ENV = settings.sqlite_path
 _SQLITE_DIR_ENV = settings.sqlite_dir
 _RENDER_DISK_DIR = settings.render_disk_dir
 
+
+def _is_render_runtime() -> bool:
+    if any(os.getenv(name) for name in ("RENDER", "RENDER_SERVICE_ID", "RENDER_EXTERNAL_URL", "RENDER_SERVICE_NAME")):
+        return True
+    return str(Path.cwd()).replace("\\", "/").startswith("/opt/render/")
+
 if _SQLITE_PATH_ENV:
     _DB_PATH = Path(_SQLITE_PATH_ENV)
 elif _SQLITE_DIR_ENV:
     _DB_PATH = Path(_SQLITE_DIR_ENV) / "ro_anime_users.db"
-elif _RENDER_DISK_DIR.exists() or os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
+elif _RENDER_DISK_DIR.exists() or _is_render_runtime():
     _DB_PATH = _RENDER_DISK_DIR / "ro_anime_users.db"
 else:
     _DB_PATH = _LEGACY_DB_PATH
 
 if not IS_PG:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _is_render_runtime() and not str(_DB_PATH).replace("\\", "/").startswith(str(_RENDER_DISK_DIR).replace("\\", "/")):
+        raise RuntimeError(f"Refusing to use ephemeral SQLite on Render: {_DB_PATH}. Attach /var/data disk or set DATABASE_URL.")
+    if _is_render_runtime() and not os.access(_DB_PATH.parent, os.W_OK):
+        raise RuntimeError(f"Persistent DB directory is not writable: {_DB_PATH.parent}. Attach the Render disk before deploy.")
     if _DB_PATH != _LEGACY_DB_PATH and not _DB_PATH.exists() and _LEGACY_DB_PATH.exists():
         shutil.copy2(_LEGACY_DB_PATH, _DB_PATH)
+
+
+def _sqlite_backup_snapshot(label: str = "startup") -> None:
+    if IS_PG or not _DB_PATH.exists() or _DB_PATH.stat().st_size <= 0:
+        return
+    backup_root = _DB_PATH.parent / "backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = backup_root / f"ro_anime_users-{label}-{stamp}.db"
+    try:
+        shutil.copy2(_DB_PATH, target)
+        backups = sorted(backup_root.glob("ro_anime_users-*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[20:]:
+            old.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("SQLite backup snapshot failed: %s", exc)
 
 if IS_PG:
     import psycopg
@@ -1082,8 +1108,11 @@ def _db_migrate() -> None:
 
 
 logger.info("DB backend: %s", "PostgreSQL" if IS_PG else "SQLite")
+logger.info("DB persistence: %s", "DATABASE_URL" if IS_PG else str(_DB_PATH))
+_sqlite_backup_snapshot("pre-init")
 _db_init()
 _db_migrate()
+_sqlite_backup_snapshot("post-migrate")
 
 # ---------------------------------------------------------------------------
 # AUTH HELPERS
@@ -2774,7 +2803,26 @@ async def proxy_img(src: str = Query(...)):
 # --- health -----------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "cached_keys": list(_home_cache.keys())}
+    db_stats = {}
+    try:
+        conn = _db()
+        db_stats = {
+            "users": _row_dict(conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()).get("c", 0),
+            "history": _row_dict(conn.execute("SELECT COUNT(*) AS c FROM watch_history").fetchone()).get("c", 0),
+            "watchlist": _row_dict(conn.execute("SELECT COUNT(*) AS c FROM watchlist").fetchone()).get("c", 0),
+            "chat_messages": _row_dict(conn.execute("SELECT COUNT(*) AS c FROM chat_messages").fetchone()).get("c", 0),
+        }
+        conn.close()
+    except Exception as exc:
+        db_stats = {"error": str(exc)[:160]}
+    return {
+        "status": "ok",
+        "cached_keys": list(_home_cache.keys()),
+        "db_backend": "postgres" if IS_PG else "sqlite",
+        "persistent": bool(IS_PG or str(_DB_PATH).replace("\\", "/").startswith(str(_RENDER_DISK_DIR).replace("\\", "/"))),
+        "db_file": "" if IS_PG else str(_DB_PATH),
+        "db_stats": db_stats,
+    }
 
 # ---------------------------------------------------------------------------
 # PARALLEL HLS DOWNLOAD MANAGER
