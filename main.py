@@ -833,7 +833,7 @@ if _SQLITE_PATH_ENV:
     _DB_PATH = Path(_SQLITE_PATH_ENV)
 elif _SQLITE_DIR_ENV:
     _DB_PATH = Path(_SQLITE_DIR_ENV) / "ro_anime_users.db"
-elif _RENDER_DISK_DIR.exists():
+elif _RENDER_DISK_DIR.exists() or os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
     _DB_PATH = _RENDER_DISK_DIR / "ro_anime_users.db"
 else:
     _DB_PATH = _LEGACY_DB_PATH
