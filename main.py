@@ -1099,9 +1099,27 @@ def _clean_username(username: str) -> str:
 def _find_user_by_username(conn: _Conn, username: str):
     username = _clean_username(username)
     return conn.execute(
-        "SELECT id, username, password_hash, token, created_at FROM users WHERE lower(username)=lower(?) LIMIT 1",
+        """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
+           FROM users u
+           WHERE lower(u.username)=lower(?)
+           ORDER BY history_count DESC, u.id ASC
+           LIMIT 1""",
         (username,),
     ).fetchone()
+
+
+def _find_users_by_username(conn: _Conn, username: str) -> list[dict]:
+    username = _clean_username(username)
+    rows = conn.execute(
+        """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
+           FROM users u
+           WHERE lower(u.username)=lower(?)
+           ORDER BY history_count DESC, u.id ASC""",
+        (username,),
+    ).fetchall()
+    return [_row_dict(row) for row in rows]
 
 
 def _legacy_username_seen(conn: _Conn, username: str) -> str:
@@ -1372,72 +1390,36 @@ async def auth_login(request: Request):
     password = (data.get("password") or "").strip()
     if not password:
         _record_login_event(username, "login", False, request)
-        raise HTTPException(400, "Password required. Use recover if this is an old username.")
+        raise HTTPException(400, "Password required")
     conn = _db()
-    row = _find_user_by_username(conn, username)
-    if not row:
-        legacy_username = _legacy_username_seen(conn, username)
-        if legacy_username:
-            row = _create_recovered_user(conn, legacy_username, password)
-            conn.commit()
-            conn.close()
-            _record_login_event(legacy_username, "login_recovered", True, request, row["id"])
-            return {"token": row["token"], "username": row["username"], "recovered": True}
+    candidates = _find_users_by_username(conn, username)
+    if not candidates:
         conn.close()
         _record_login_event(username, "login", False, request)
-        raise HTTPException(404, "Username not found. Register or recover your old username.")
-    conn.close()
-    if row["password_hash"] != _hash_pw(password):
+        raise HTTPException(404, "Username not found")
+
+    password_hash = _hash_pw(password)
+    row = next((item for item in candidates if item["password_hash"] == password_hash), None)
+    if not row:
+        best = candidates[0]
+        legacy_hashes = {_hash_pw(best["username"]), _hash_pw(username)}
+        if best["password_hash"] in legacy_hashes and len(password) >= 4:
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, best["id"]))
+            conn.commit()
+            conn.close()
+            _record_login_event(best["username"], "login_password_set", True, request, best["id"])
+            return {"token": best["token"], "username": best["username"], "password_set": True}
+        conn.close()
         _record_login_event(username, "login", False, request)
         raise HTTPException(401, "Invalid username or password")
+    conn.close()
     _record_login_event(username, "login", True, request, row["id"])
     return {"token": row["token"], "username": row["username"]}
 
 
 @app.post("/auth/recover")
 async def auth_recover(request: Request):
-    """Recover an existing username without deleting any data.
-
-    This is intentionally separate from normal login so future accounts can use
-    strict password auth while older users can still regain their preserved
-    history/watchlist and then set a password immediately.
-    """
-    data = await request.json()
-    username = _clean_username(data.get("username") or "")
-    new_password = (data.get("new_password") or data.get("password") or "").strip()
-    if len(username) < 3:
-        _record_login_event(username, "recover", False, request)
-        raise HTTPException(400, "Username must be at least 3 characters")
-    conn = _db()
-    row = _find_user_by_username(conn, username)
-    if not row:
-        legacy_username = _legacy_username_seen(conn, username)
-        if legacy_username:
-            row = _create_recovered_user(conn, legacy_username, new_password or legacy_username)
-            conn.commit()
-            conn.close()
-            _record_login_event(legacy_username, "recover_recreated", True, request, row["id"])
-            return {
-                "token": row["token"],
-                "username": row["username"],
-                "recovered": True,
-                "recreated": True,
-                "password_set": len(new_password) >= 4,
-            }
-        conn.close()
-        _record_login_event(username, "recover", False, request)
-        raise HTTPException(404, "Username not found")
-    if len(new_password) >= 4:
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_pw(new_password), row["id"]))
-        conn.commit()
-    conn.close()
-    _record_login_event(username, "recover", True, request, row["id"])
-    return {
-        "token": row["token"],
-        "username": row["username"],
-        "recovered": True,
-        "password_set": len(new_password) >= 4,
-    }
+    raise HTTPException(410, "Recover removed. Use login or register.")
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
@@ -1554,7 +1536,6 @@ async def chat_rooms(request: Request):
 
 @app.get("/chat/online")
 async def chat_online(request: Request, seconds: int = Query(240, ge=30, le=1800)):
-    _get_current_user(request)
     since = int(time.time()) - seconds
     conn = _db()
     rows = conn.execute(
@@ -1568,24 +1549,51 @@ async def chat_online(request: Request, seconds: int = Query(240, ge=30, le=1800
            LIMIT 200""",
         (since,),
     ).fetchall()
+    guest_rows = conn.execute(
+        """SELECT visitor_key, MAX(created_at) AS last_seen_at,
+                  MAX(path) AS path, MAX(device) AS device, MAX(country) AS country,
+                  MAX(region) AS region, MAX(city) AS city
+           FROM visitor_events
+           WHERE (user_id IS NULL OR user_id=0) AND created_at>=?
+           GROUP BY visitor_key
+           ORDER BY last_seen_at DESC
+           LIMIT 200""",
+        (since,),
+    ).fetchall()
     conn.close()
 
-    by_id = {str(row["id"]): _row_dict(row) for row in rows}
+    by_id = {f"user:{row['id']}": {**_row_dict(row), "presence_type": "User"} for row in rows}
     for users in _CHAT_USERS.values():
-        by_id[str(users["id"])] = {
-            **by_id.get(str(users["id"]), {}),
+        by_id[f"user:{users['id']}"] = {
+            **by_id.get(f"user:{users['id']}", {}),
             "id": users["id"],
             "username": users["username"],
             "last_seen_at": int(time.time()),
             "source": "chat",
+            "presence_type": "User",
+        }
+    for row in guest_rows:
+        item = _row_dict(row)
+        visitor_key = str(item.get("visitor_key") or "")[:32]
+        if not visitor_key:
+            continue
+        key = f"guest:{visitor_key}"
+        if key in by_id:
+            continue
+        by_id[key] = {
+            **item,
+            "id": key,
+            "username": f"Guest {visitor_key[:8]}",
+            "presence_type": "Guest",
         }
     return {"items": list(by_id.values()), "count": len(by_id)}
 
 
 @app.get("/chat/messages/{room}")
 async def chat_messages(room: str, request: Request, limit: int = Query(60, ge=1, le=200)):
-    _get_current_user(request)
     room = _normalize_room(room)
+    if room != "global":
+        _get_current_user(request)
     return {"items": _recent_chat_messages(room, limit)}
 
 
