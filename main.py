@@ -1262,6 +1262,27 @@ def _get_current_user(request: Request) -> dict:
 
 _ADMIN_USERNAMES = {"kali"}
 _ADMIN_ACCESS_KEY = os.getenv("ADMIN_ACCESS_KEY", "").strip()
+_ADMIN_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _admin_cache_get(key: str, ttl: int = 20) -> dict | None:
+    item = _ADMIN_CACHE.get(key)
+    if not item:
+        return None
+    ts, payload = item
+    if time.time() - ts > ttl:
+        _ADMIN_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _admin_cache_set(key: str, payload: dict) -> dict:
+    _ADMIN_CACHE[key] = (time.time(), payload)
+    if len(_ADMIN_CACHE) > 32:
+        oldest = sorted(_ADMIN_CACHE.items(), key=lambda item: item[1][0])[:8]
+        for old_key, _ in oldest:
+            _ADMIN_CACHE.pop(old_key, None)
+    return payload
 
 
 def _row_dict(row) -> dict:
@@ -1871,6 +1892,9 @@ async def analytics_visit(request: Request):
 @app.get("/admin/overview")
 async def admin_overview(request: Request):
     admin = _get_admin_user(request)
+    cached = _admin_cache_get("overview", 20)
+    if cached:
+        return cached
     since_24h = int(time.time()) - 86400
     conn = _db()
     total_users = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()).get("c", 0)
@@ -1907,7 +1931,7 @@ async def admin_overview(request: Request):
         ).fetchall()
     ]
     conn.close()
-    return {
+    return _admin_cache_set("overview", {
         "admin": admin["username"],
         "total_users": total_users,
         "total_visits": total_visits,
@@ -1920,12 +1944,16 @@ async def admin_overview(request: Request):
         "top_paths": top_paths,
         "top_locations": top_locations,
         "top_devices": top_devices,
-    }
+    })
 
 
 @app.get("/admin/users")
 async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
     _get_admin_user(request)
+    cache_key = f"users:{limit}"
+    cached = _admin_cache_get(cache_key, 20)
+    if cached:
+        return cached
     conn = _db()
     rows = conn.execute(
         """WITH
@@ -2028,7 +2056,7 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
             if len(items) >= limit:
                 break
     conn.close()
-    return {"items": items}
+    return _admin_cache_set(cache_key, {"items": items})
 
 
 @app.get("/admin/users/{user_id}/activity")
@@ -2103,6 +2131,10 @@ async def admin_user_activity(user_id: int, request: Request, limit: int = Query
 @app.get("/admin/logins")
 async def admin_logins(request: Request, limit: int = Query(200, ge=1, le=1000)):
     _get_admin_user(request)
+    cache_key = f"logins:{limit}"
+    cached = _admin_cache_get(cache_key, 20)
+    if cached:
+        return cached
     conn = _db()
     rows = conn.execute(
         """SELECT id, user_id, username, event_type, success, ip_address, device, country, region, city, timezone, language, user_agent, created_at
@@ -2110,12 +2142,16 @@ async def admin_logins(request: Request, limit: int = Query(200, ge=1, le=1000))
         (limit,),
     ).fetchall()
     conn.close()
-    return {"items": [_row_dict(row) for row in rows]}
+    return _admin_cache_set(cache_key, {"items": [_row_dict(row) for row in rows]})
 
 
 @app.get("/admin/visits")
 async def admin_visits(request: Request, limit: int = Query(300, ge=1, le=2000)):
     _get_admin_user(request)
+    cache_key = f"visits:{limit}"
+    cached = _admin_cache_get(cache_key, 20)
+    if cached:
+        return cached
     conn = _db()
     rows = conn.execute(
         """SELECT id, visitor_key, user_id, username, path, referrer, ip_address, device, country, region, city, timezone, language, screen, user_agent, created_at
@@ -2123,7 +2159,7 @@ async def admin_visits(request: Request, limit: int = Query(300, ge=1, le=2000))
         (limit,),
     ).fetchall()
     conn.close()
-    return {"items": [_row_dict(row) for row in rows]}
+    return _admin_cache_set(cache_key, {"items": [_row_dict(row) for row in rows]})
 
 
 @app.get("/admin/search-visibility")
