@@ -816,6 +816,25 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
                    allow_headers=["*"])
 
+@app.middleware("http")
+async def cache_header_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/user/") or path.startswith("/auth/") or path.startswith("/admin/") or path.startswith("/chat/"):
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    if path.startswith("/anime/episode/"):
+        response.headers.setdefault("Cache-Control", "public, s-maxage=3600, stale-while-revalidate=86400")
+    elif path.startswith("/home/") or path == "/api/v1/banners":
+        response.headers.setdefault("Cache-Control", "public, s-maxage=600, stale-while-revalidate=3600")
+    elif path.startswith("/search/") or path.startswith("/suggest/"):
+        response.headers.setdefault("Cache-Control", "public, s-maxage=300, stale-while-revalidate=900")
+    elif path.startswith("/api/stream/") or path.startswith("/api/moon/") or path.startswith("/api/hd1/"):
+        response.headers.setdefault("Cache-Control", "public, s-maxage=120, stale-while-revalidate=600")
+    if "Cache-Control" in response.headers:
+        response.headers.setdefault("Vary", "Accept-Encoding")
+    return response
+
 # ---------------------------------------------------------------------------
 # DATABASE  (PostgreSQL on Render via DATABASE_URL, SQLite locally)
 # ---------------------------------------------------------------------------
