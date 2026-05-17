@@ -1096,6 +1096,11 @@ def _db_migrate() -> None:
 
     if IS_PG:
         for table, columns in {
+            "users": {
+                "is_banned": "INTEGER DEFAULT 0",
+                "banned_at": "INTEGER DEFAULT 0",
+                "banned_reason": "TEXT DEFAULT ''",
+            },
             "login_events": {
                 "country": "TEXT DEFAULT ''",
                 "region": "TEXT DEFAULT ''",
@@ -1126,6 +1131,11 @@ def _db_migrate() -> None:
 
     ensure_column("watch_history", "playback_pos", "REAL DEFAULT 0")
     for table, columns in {
+        "users": {
+            "is_banned": "INTEGER DEFAULT 0",
+            "banned_at": "INTEGER DEFAULT 0",
+            "banned_reason": "TEXT DEFAULT ''",
+        },
         "login_events": {
             "country": "TEXT DEFAULT ''",
             "region": "TEXT DEFAULT ''",
@@ -1175,6 +1185,8 @@ def _find_user_by_username(conn: _Conn, username: str):
     username = _clean_username(username)
     return conn.execute(
         """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  COALESCE(u.is_banned,0) AS is_banned,
+                  COALESCE(u.banned_reason,'') AS banned_reason,
                   (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
            FROM users u
            WHERE lower(u.username)=lower(?)
@@ -1189,6 +1201,8 @@ def _find_users_by_username(conn: _Conn, username: str) -> list[dict]:
     key = _username_key(username)
     rows = conn.execute(
         """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  COALESCE(u.is_banned,0) AS is_banned,
+                  COALESCE(u.banned_reason,'') AS banned_reason,
                   (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
            FROM users u
            WHERE lower(u.username)=lower(?)
@@ -1201,6 +1215,8 @@ def _find_users_by_username(conn: _Conn, username: str) -> list[dict]:
         return items
     rows = conn.execute(
         """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  COALESCE(u.is_banned,0) AS is_banned,
+                  COALESCE(u.banned_reason,'') AS banned_reason,
                   (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
            FROM users u
            ORDER BY history_count DESC, u.id ASC
@@ -1253,10 +1269,16 @@ def _get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(401, "Not authenticated")
     conn = _db()
-    row  = conn.execute("SELECT id, username FROM users WHERE token=?", (token,)).fetchone()
+    row  = conn.execute(
+        "SELECT id, username, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason FROM users WHERE token=?",
+        (token,),
+    ).fetchone()
     conn.close()
     if not row:
         raise HTTPException(401, "Invalid or expired token")
+    if int(row["is_banned"] or 0):
+        reason = f": {row['banned_reason']}" if row["banned_reason"] else ""
+        raise HTTPException(403, f"Account banned{reason}")
     return {"id": row["id"], "username": row["username"]}
 
 
@@ -1285,6 +1307,10 @@ def _admin_cache_set(key: str, payload: dict) -> dict:
     return payload
 
 
+def _admin_cache_clear() -> None:
+    _ADMIN_CACHE.clear()
+
+
 def _row_dict(row) -> dict:
     if not row:
         return {}
@@ -1302,6 +1328,14 @@ def _get_admin_user(request: Request) -> dict:
         if not secrets.compare_digest(supplied, _ADMIN_ACCESS_KEY):
             raise HTTPException(403, "Admin key required")
     return user
+
+
+def _assert_admin_target_allowed(admin: dict, target: dict) -> None:
+    if not target:
+        raise HTTPException(404, "User not found")
+    username = str(target.get("username") or "").strip().lower()
+    if username in _ADMIN_USERNAMES or int(target.get("id") or 0) == int(admin.get("id") or 0):
+        raise HTTPException(400, "Owner account cannot be banned or deleted")
 
 
 def _client_ip(request: Request) -> str:
@@ -1483,6 +1517,10 @@ async def auth_register(request: Request):
     conn = _db()
     existing = _find_user_by_username(conn, username)
     if existing:
+        if int(existing.get("is_banned") or 0):
+            conn.close()
+            _record_login_event(existing["username"], "register_existing_banned", False, request, existing["id"])
+            raise HTTPException(403, "Account is banned")
         password_hash = _hash_pw(password)
         legacy_hashes = {_hash_pw(existing["username"]), _hash_pw(username)}
         if existing["password_hash"] == password_hash or existing["password_hash"] in legacy_hashes:
@@ -1539,6 +1577,11 @@ async def auth_login(request: Request):
         conn.close()
         _record_login_event(username, "login", False, request)
         raise HTTPException(401, "Invalid username or password")
+    if int(row.get("is_banned") or 0):
+        conn.close()
+        _record_login_event(row["username"], "login_banned", False, request, row["id"])
+        reason = f": {row.get('banned_reason')}" if row.get("banned_reason") else ""
+        raise HTTPException(403, f"Account banned{reason}")
     conn.close()
     _record_login_event(username, "login", True, request, row["id"])
     return {"token": row["token"], "username": row["username"]}
@@ -1561,6 +1604,10 @@ async def auth_recover(request: Request):
         raise HTTPException(404, "Username not found. Register this username to create it.")
 
     row = candidates[0]
+    if int(row.get("is_banned") or 0):
+        conn.close()
+        _record_login_event(row["username"], "recover_banned", False, request, row["id"])
+        raise HTTPException(403, "Account is banned")
     if password and len(password) < 4:
         conn.close()
         _record_login_event(row["username"], "recover", False, request, row["id"])
@@ -1904,6 +1951,7 @@ async def admin_overview(request: Request):
     unique_24h = _row_dict(conn.execute("SELECT COUNT(DISTINCT visitor_key) AS c FROM visitor_events WHERE created_at>=?", (since_24h,)).fetchone()).get("c", 0)
     login_success = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=1").fetchone()).get("c", 0)
     login_failed = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM login_events WHERE success=0").fetchone()).get("c", 0)
+    banned_users = _row_dict(conn.execute("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_banned,0)=1").fetchone()).get("c", 0)
     known_locations = _row_dict(conn.execute(
         "SELECT COUNT(DISTINCT country || '|' || region || '|' || city || '|' || timezone) AS c FROM visitor_events WHERE country<>'' OR region<>'' OR city<>'' OR timezone<>''"
     ).fetchone()).get("c", 0)
@@ -1940,6 +1988,7 @@ async def admin_overview(request: Request):
         "unique_24h": unique_24h,
         "login_success": login_success,
         "login_failed": login_failed,
+        "banned_users": banned_users,
         "known_locations": known_locations,
         "top_paths": top_paths,
         "top_locations": top_locations,
@@ -1989,6 +2038,9 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
              )
            SELECT
              u.id, u.username, u.created_at,
+             COALESCE(u.is_banned, 0) AS is_banned,
+             COALESCE(u.banned_at, 0) AS banned_at,
+             COALESCE(u.banned_reason, '') AS banned_reason,
              COALESCE(hist.history_count, 0) AS history_count,
              COALESCE(watch.watchlist_count, 0) AS watchlist_count,
              COALESCE(down.downloads_count, 0) AS downloads_count,
@@ -2037,6 +2089,9 @@ async def admin_users(request: Request, limit: int = Query(200, ge=1, le=1000)):
                 "id": None,
                 "username": item["username"],
                 "created_at": item.get("last_login_at"),
+                "is_banned": 0,
+                "banned_at": 0,
+                "banned_reason": "",
                 "history_count": 0,
                 "watchlist_count": 0,
                 "downloads_count": 0,
@@ -2126,6 +2181,66 @@ async def admin_user_activity(user_id: int, request: Request, limit: int = Query
         "visits": visits,
         "totals": totals,
     }
+
+
+@app.post("/admin/users/{user_id}/ban")
+async def admin_ban_user(user_id: int, request: Request):
+    admin = _get_admin_user(request)
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    reason = str(data.get("reason") or "Banned by admin").strip()[:300]
+    conn = _db()
+    target = _row_dict(conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone())
+    _assert_admin_target_allowed(admin, target)
+    conn.execute(
+        "UPDATE users SET is_banned=1, banned_at=?, banned_reason=? WHERE id=?",
+        (int(time.time()), reason, user_id),
+    )
+    conn.commit()
+    conn.close()
+    _admin_cache_clear()
+    return {"ok": True, "id": user_id, "username": target["username"], "is_banned": 1, "banned_reason": reason}
+
+
+@app.delete("/admin/users/{user_id}/ban")
+async def admin_unban_user(user_id: int, request: Request):
+    admin = _get_admin_user(request)
+    conn = _db()
+    target = _row_dict(conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone())
+    _assert_admin_target_allowed(admin, target)
+    conn.execute("UPDATE users SET is_banned=0, banned_at=0, banned_reason='' WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    _admin_cache_clear()
+    return {"ok": True, "id": user_id, "username": target["username"], "is_banned": 0}
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: int, request: Request):
+    admin = _get_admin_user(request)
+    conn = _db()
+    target = _row_dict(conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone())
+    _assert_admin_target_allowed(admin, target)
+    username = str(target["username"])
+    for query, params in [
+        ("DELETE FROM user_follows WHERE follower_id=? OR following_id=?", (user_id, user_id)),
+        ("DELETE FROM chat_messages WHERE user_id=?", (user_id,)),
+        ("DELETE FROM downloads WHERE user_id=?", (user_id,)),
+        ("DELETE FROM watchlist WHERE user_id=?", (user_id,)),
+        ("DELETE FROM watch_history WHERE user_id=?", (user_id,)),
+        ("DELETE FROM login_events WHERE user_id=? OR username=?", (user_id, username)),
+        ("DELETE FROM visitor_events WHERE user_id=? OR username=?", (user_id, username)),
+        ("DELETE FROM users WHERE id=?", (user_id,)),
+    ]:
+        conn.execute(query, params)
+    conn.commit()
+    conn.close()
+    _admin_cache_clear()
+    return {"ok": True, "deleted": True, "id": user_id, "username": username}
 
 
 @app.get("/admin/logins")
@@ -3154,9 +3269,12 @@ def _user_from_token(token: str) -> dict | None:
     if not token:
         return None
     conn = _db()
-    row  = conn.execute("SELECT id, username FROM users WHERE token=?", (token,)).fetchone()
+    row  = conn.execute(
+        "SELECT id, username, COALESCE(is_banned,0) AS is_banned FROM users WHERE token=?",
+        (token,),
+    ).fetchone()
     conn.close()
-    if not row:
+    if not row or int(row["is_banned"] or 0):
         return None
     return {"id": row["id"], "username": row["username"]}
 
