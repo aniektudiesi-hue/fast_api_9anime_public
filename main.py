@@ -1525,7 +1525,31 @@ async def auth_login(request: Request):
 
 @app.post("/auth/recover")
 async def auth_recover(request: Request):
-    raise HTTPException(410, "Recover removed. Use login or register.")
+    data = await request.json()
+    username = _clean_username(data.get("username") or "")
+    password = (data.get("password") or "").strip()
+    if len(username) < 3:
+        _record_login_event(username, "recover", False, request)
+        raise HTTPException(400, "Username must be at least 3 characters")
+
+    conn = _db()
+    candidates = _find_users_by_username(conn, username)
+    if not candidates:
+        conn.close()
+        _record_login_event(username, "recover", False, request)
+        raise HTTPException(404, "Username not found. Register this username to create it.")
+
+    row = candidates[0]
+    if password and len(password) < 4:
+        conn.close()
+        _record_login_event(row["username"], "recover", False, request, row["id"])
+        raise HTTPException(400, "Password must be at least 4 characters")
+    if password:
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_pw(password), row["id"]))
+        conn.commit()
+    conn.close()
+    _record_login_event(row["username"], "recover", True, request, row["id"])
+    return {"token": row["token"], "username": row["username"], "recovered": True, "password_reset": bool(password)}
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
