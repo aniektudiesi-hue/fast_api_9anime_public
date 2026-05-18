@@ -2351,7 +2351,7 @@ def _save_history_for_user(user_id: int, d: dict) -> dict:
                VALUES (?,?,?,?,?,?,strftime('%s','now'))
                ON CONFLICT(user_id, mal_id) DO UPDATE SET
                  title = CASE
-                   WHEN excluded.title='' OR excluded.title LIKE 'Anime %' OR excluded.title='Untitled'
+                   WHEN excluded.title='' OR excluded.title LIKE 'Anime %%' OR excluded.title='Untitled'
                    THEN watch_history.title
                    ELSE excluded.title
                  END,
