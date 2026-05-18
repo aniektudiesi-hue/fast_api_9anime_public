@@ -876,17 +876,18 @@ else:
     _DB_PATH = _LEGACY_DB_PATH
 
 if not IS_PG:
+    if _is_render_runtime() and not (_SQLITE_PATH_ENV or _SQLITE_DIR_ENV):
+        raise RuntimeError(
+            "Production persistence is not configured. Set DATABASE_URL to PostgreSQL "
+            "or explicitly configure SQLITE_PATH/SQLITE_DIR on a mounted Render disk. "
+            "Refusing to start on temporary storage because user history would be lost."
+        )
     desired_path = _DB_PATH
     if not _can_prepare_sqlite_dir(_DB_PATH.parent):
-        logger.error(
-            "Persistent SQLite path %s is unavailable. Falling back to %s so API can start. "
-            "Attach a Render disk at %s or set DATABASE_URL to stop data resets.",
-            desired_path,
-            _LEGACY_DB_PATH,
-            _RENDER_DISK_DIR,
+        raise RuntimeError(
+            f"Configured SQLite path {desired_path} is not writable. "
+            f"Attach a Render disk at {_RENDER_DISK_DIR} or set DATABASE_URL to PostgreSQL."
         )
-        _DB_PATH = _LEGACY_DB_PATH
-        _can_prepare_sqlite_dir(_DB_PATH.parent)
     if _DB_PATH != _LEGACY_DB_PATH and not _DB_PATH.exists() and _LEGACY_DB_PATH.exists():
         shutil.copy2(_LEGACY_DB_PATH, _DB_PATH)
 
