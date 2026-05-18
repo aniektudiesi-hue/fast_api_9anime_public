@@ -1178,11 +1178,28 @@ def _db_migrate() -> None:
     conn.close()
 
 
+_ADMIN_USERNAMES = {"kali"}
+
+
+def _ensure_owner_admin_access() -> None:
+    conn = _db()
+    try:
+        for username in _ADMIN_USERNAMES:
+            conn.execute(
+                "UPDATE users SET is_banned=0, banned_at=0, banned_reason='' WHERE LOWER(username)=?",
+                (username,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 logger.info("DB backend: %s", "PostgreSQL" if IS_PG else "SQLite")
 logger.info("DB persistence: %s", "DATABASE_URL" if IS_PG else str(_DB_PATH))
 _sqlite_backup_snapshot("pre-init")
 _db_init()
 _db_migrate()
+_ensure_owner_admin_access()
 _sqlite_backup_snapshot("post-migrate")
 
 # ---------------------------------------------------------------------------
@@ -1301,8 +1318,6 @@ def _get_current_user(request: Request) -> dict:
     return {"id": row["id"], "username": row["username"]}
 
 
-_ADMIN_USERNAMES = {"kali"}
-_ADMIN_ACCESS_KEY = os.getenv("ADMIN_ACCESS_KEY", "").strip()
 _ADMIN_CACHE: dict[str, tuple[float, dict]] = {}
 
 
@@ -1342,10 +1357,6 @@ def _get_admin_user(request: Request) -> dict:
     user = _get_current_user(request)
     if user["username"].strip().lower() not in _ADMIN_USERNAMES:
         raise HTTPException(403, "Admin access required")
-    if _ADMIN_ACCESS_KEY:
-        supplied = request.headers.get("x-admin-key", "").strip()
-        if not secrets.compare_digest(supplied, _ADMIN_ACCESS_KEY):
-            raise HTTPException(403, "Admin key required")
     return user
 
 
