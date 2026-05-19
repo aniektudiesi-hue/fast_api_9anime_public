@@ -586,6 +586,90 @@ def _fmt_card(node, *, ep_override: int = 0) -> dict:
         "status":       node.get("status", ""),
     }
 
+def _normalize_title_for_search(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+def _jikan_to_mal_node(item: dict) -> dict:
+    images = item.get("images") or {}
+    webp = images.get("webp") or {}
+    jpg = images.get("jpg") or {}
+    title_en = (item.get("title_english") or "").strip()
+    title_default = (item.get("title") or title_en or item.get("title_japanese") or "Unknown").strip()
+    status = (item.get("status") or "").lower()
+    if "finished" in status:
+        status = "finished_airing"
+    elif "airing" in status:
+        status = "currently_airing"
+    elif "not yet" in status:
+        status = "not_yet_aired"
+    return {
+        "id": item.get("mal_id"),
+        "title": title_default,
+        "main_picture": {
+            "large": webp.get("large_image_url") or jpg.get("large_image_url") or webp.get("image_url") or jpg.get("image_url") or "",
+            "medium": webp.get("image_url") or jpg.get("image_url") or "",
+        },
+        "alternative_titles": {
+            "en": title_en,
+            "ja": item.get("title_japanese") or "",
+            "synonyms": item.get("title_synonyms") or [],
+        },
+        "num_episodes": item.get("episodes") or 0,
+        "mean": item.get("score") or 0,
+        "status": status,
+        "start_season": {"year": item.get("year")} if item.get("year") else {},
+    }
+
+async def _jikan_search_nodes(query: str, *, limit: int = 10) -> list[dict]:
+    try:
+        r = await _http.get(
+            "https://api.jikan.moe/v4/anime",
+            params={"q": query, "limit": limit, "sfw": "true", "order_by": "popularity", "sort": "asc"},
+            headers={"Accept": "application/json"},
+            timeout=httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=4.0),
+        )
+        r.raise_for_status()
+        return [_jikan_to_mal_node(item) for item in (r.json().get("data") or []) if item.get("mal_id")]
+    except Exception as e:
+        logger.warning("Jikan search fallback failed for %r: %s", query, e)
+        return []
+
+def _node_titles_for_search(node: dict) -> list[str]:
+    alt = node.get("alternative_titles") or {}
+    titles = [
+        node.get("title") or "",
+        alt.get("en") or "",
+        alt.get("ja") or "",
+    ]
+    titles.extend(alt.get("synonyms") or [])
+    return [t for t in titles if t]
+
+def _has_strong_title_match(nodes: list[dict], query: str) -> bool:
+    q = _normalize_title_for_search(query)
+    if not q:
+        return True
+    q_words = [w for w in q.split() if len(w) > 1]
+    for node in nodes[:5]:
+        for title in _node_titles_for_search(node):
+            t = _normalize_title_for_search(title)
+            if t == q or t.startswith(q) or q in t:
+                return True
+            if q_words and sum(1 for word in q_words if word in t.split()) >= max(3, int(len(q_words) * 0.75)):
+                return True
+    return False
+
+def _merge_search_nodes(*sources: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for source in sources:
+        for node in source:
+            key = str(node.get("id") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(node)
+    return merged
+
 # Persistent HTTP client — reused for all MAL + AniList calls (no per-request handshake)
 _http = httpx.AsyncClient(
     timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
@@ -2734,20 +2818,28 @@ async def search_anime(query: str):
                 data  = await _try(short)
                 nodes = [e["node"] for e in data.get("data", [])]
 
+        # MAL's official search can miss exact English titles when the query is
+        # long or when the canonical MAL title is romanized. Supplement weak
+        # result sets with Jikan, which exposes title_english and synonyms.
+        if not _has_strong_title_match(nodes, query):
+            jikan_nodes = await _jikan_search_nodes(query, limit=12)
+            nodes = _merge_search_nodes(jikan_nodes, nodes)
+
     except httpx.HTTPStatusError as e:
         raise HTTPException(e.response.status_code, f"MAL {e.response.status_code}")
     except Exception as e:
         raise HTTPException(502, f"Search failed: {str(e)[:120]}")
     q_lo  = query.lower()
     def _rank(n):
-        alt = n.get("alternative_titles") or {}
-        en  = (alt.get("en") or "").lower()
-        jp  = (n.get("title") or "").lower()
-        if en == q_lo or jp == q_lo: return 0
-        if en.startswith(q_lo):      return 1
-        if jp.startswith(q_lo):      return 2
-        if q_lo in en:               return 3
-        if q_lo in jp:               return 4
+        q_norm = _normalize_title_for_search(q_lo)
+        titles = [_normalize_title_for_search(t) for t in _node_titles_for_search(n)]
+        if any(t == q_norm for t in titles): return 0
+        if any(t.startswith(q_norm) for t in titles): return 1
+        if any(q_norm and q_norm in t for t in titles): return 2
+        q_words = [w for w in q_norm.split() if len(w) > 1]
+        best_overlap = max((sum(1 for word in q_words if word in t.split()) for t in titles), default=0)
+        if q_words and best_overlap >= max(3, int(len(q_words) * 0.75)): return 3
+        if q_words and best_overlap >= max(2, int(len(q_words) * 0.45)): return 4
         return 5
     nodes.sort(key=_rank)
     ep_map = await _episode_overrides_for_cards(nodes)
