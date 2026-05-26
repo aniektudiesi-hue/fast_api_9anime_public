@@ -4079,13 +4079,24 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
         raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
 
     backend = _stream_proxy_base(request)
+    seed_query = ""
+    loop = asyncio.get_running_loop()
+    playback = await loop.run_in_executor(None, _moon_fetch_playback_sync, video_id)
+    if playback and playback.get("url"):
+        # Cloudflare Workers can be rejected by Moon's playback API. Resolve the
+        # encrypted playback payload here with curl_cffi, then seed the Worker so
+        # it only has to proxy/cache the HLS playlists and segments.
+        seed_query = f"&src={quote(str(playback['url']), safe='')}"
+    else:
+        logger.warning("Moon: playback seed unavailable for video_id=%s; Worker will resolve fallback", video_id)
+
     moon_url = (
         f"{backend}/proxy/moon/{quote(video_id, safe='')}/m3u8"
-        f"?fast=1"
+        f"?fast=1{seed_query}"
     )
     preload_url = (
         f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
-        f"?segments=2"
+        f"?segments=2{seed_query}"
     )
     response = {
         "url":          moon_url,
