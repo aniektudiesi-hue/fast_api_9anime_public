@@ -3989,6 +3989,21 @@ def _find_url(obj) -> str | None:
             if r: return r
     return None
 
+def _moon_selected_key_parts(playback: dict) -> list[str]:
+    parts = playback.get("key_parts") if isinstance(playback, dict) else None
+    if not isinstance(parts, list):
+        return []
+    parts = [part for part in parts if isinstance(part, str) and part]
+    version = str(playback.get("version") or "").strip()
+    if version.isdigit():
+        first = int(version)
+        second = 31 - first
+        if 1 <= first <= len(parts) and 1 <= second <= len(parts):
+            selected = [parts[first - 1], parts[second - 1]]
+            if all(selected):
+                return selected
+    return parts
+
 def _moon_fetch_playback_sync(video_id: str) -> dict | None:
     url          = f"https://398fitus.com/api/videos/{video_id}/embed/playback"
     subtitle_url = f"https://398fitus.com/api/videos/{video_id}/embed/timeslider"
@@ -4032,7 +4047,7 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
             return None
         api  = resp.json()
         pb   = api.get("playback", {})
-        key_parts = pb.get("key_parts", [])
+        key_parts = _moon_selected_key_parts(pb)
         if not key_parts:
             return None
         primary_key = b"".join([_b64url_decode(p) for p in key_parts])
