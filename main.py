@@ -11,7 +11,6 @@ from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
 
 import httpx
 from cachetools import TTLCache
-from curl_cffi import requests as cffi_requests
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
@@ -159,7 +158,7 @@ PROXY_HEADERS = {
 # specifically returns 404 to:
 #   - the Android-Chrome UA we use globally for megaplay
 #   - any request with Referer megaplay.buzz
-# Map upstream host -> (referer, desktop_ua_or_none, curl_cffi_impersonate).
+# Map upstream host -> (referer, desktop_ua_or_none, legacy_impersonate_name).
 #
 # Verified empirically against r66nv9ed.com:
 #   Android UA + chrome131_android impersonate -> 404
@@ -221,8 +220,23 @@ _home_cache    = TTLCache(maxsize=32,  ttl=3600)
 _search_cache  = TTLCache(maxsize=400, ttl=600)
 _suggest_cache = TTLCache(maxsize=400, ttl=300)
 _anime_cache   = TTLCache(maxsize=600, ttl=1800)
+_playlist_cache = TTLCache(maxsize=2048, ttl=24)
+_vtt_cache      = TTLCache(maxsize=512, ttl=3600)
+_watch_page_cache = TTLCache(maxsize=1024, ttl=900)
+_watch_server_cache = TTLCache(maxsize=1024, ttl=900)
 _home_lock     = asyncio.Lock()
 _toprated_lock = asyncio.Lock()
+_stream_locks: dict[str, asyncio.Lock] = {}
+_proxy_locks: dict[str, asyncio.Lock] = {}
+_watch_locks: dict[str, asyncio.Lock] = {}
+_PROXY_CHUNK_SIZE = 512 * 1024
+
+def _keyed_lock(bucket: dict[str, asyncio.Lock], key: str) -> asyncio.Lock:
+    lock = bucket.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        bucket[key] = lock
+    return lock
 
 # ---------------------------------------------------------------------------
 # MODELS
@@ -309,23 +323,20 @@ class MegaPlayScraper:
     def __init__(self, timeout=15, max_retries=3):
         self.timeout = timeout
         self.max_retries = max_retries
-        self.session = cffi_requests.Session()
-        self._bootstrap()
 
-    def _bootstrap(self):
+    async def bootstrap(self):
         try:
-            self.session.get(f"{MEGAPLAY_BASE}/",
+            await _http_get(f"{MEGAPLAY_BASE}/",
                 headers={**NAV_HEADERS, "Sec-Fetch-Site": "none", "Referer": ""},
-                impersonate=IMPERSONATE, timeout=self.timeout)
+                timeout=self.timeout)
         except Exception as e:
             logger.warning("bootstrap non-fatal: %s", e)
 
-    def _fetch_player_page(self, mal_id, ep_num, stype):
+    async def _fetch_player_page(self, mal_id, ep_num, stype):
         url = f"{MEGAPLAY_BASE}/stream/mal/{mal_id}/{ep_num}/{stype}"
         logger.info("player page -> %s", url)
         try:
-            r = self.session.get(url, headers=NAV_HEADERS,
-                impersonate=IMPERSONATE, timeout=self.timeout)
+            r = await _http_get(url, headers=NAV_HEADERS, timeout=self.timeout)
         except Exception as e:
             raise PlayerPageError(f"fetch failed: {e}")
         if r.status_code == 404:
@@ -346,9 +357,9 @@ class MegaPlayScraper:
 
         logger.info("vidwish layer -> %s", vidwish_url)
         try:
-            vr = self.session.get(vidwish_url,
+            vr = await _http_get(vidwish_url,
                 headers={**VIDWISH_NAV_HEADERS, "Referer": url},
-                impersonate=IMPERSONATE, timeout=self.timeout)
+                timeout=self.timeout)
         except Exception as e:
             raise PlayerPageError(f"Vidwish fetch failed: {e}")
         if vr.status_code == 404:
@@ -365,7 +376,7 @@ class MegaPlayScraper:
         attrs["_fallback_url"] = url
         return attrs
 
-    def _fetch_sources(self, attrs, stype):
+    async def _fetch_sources(self, attrs, stype):
         internal_id = attrs.get("id", "")
         if not internal_id:
             raise PlayerPageError("data-id missing")
@@ -382,9 +393,9 @@ class MegaPlayScraper:
         last_err = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                r = self.session.get(source_url,
+                r = await _http_get(source_url,
                     params=source_params,
-                    headers=source_headers, impersonate=IMPERSONATE, timeout=self.timeout)
+                    headers=source_headers, timeout=self.timeout)
                 if r.status_code == 200:  return r.json()
                 if r.status_code == 400:  raise InvalidRequest(r.text[:200])
                 if r.status_code == 403:  raise StreamBlocked(r.text[:200])
@@ -395,14 +406,14 @@ class MegaPlayScraper:
             except Exception as e:
                 last_err = e
                 if attempt < self.max_retries:
-                    time.sleep(0.5 * attempt)
+                    await asyncio.sleep(0.5 * attempt)
         raise MegaPlayError(f"all retries failed: {last_err}")
 
-    def get_stream(self, mal_id, episode_num, stream_type="sub"):
-        attrs = self._fetch_player_page(mal_id, episode_num, stream_type)
+    async def get_stream(self, mal_id, episode_num, stream_type="sub"):
+        attrs = await self._fetch_player_page(mal_id, episode_num, stream_type)
         fallback_url = attrs.get("_fallback_url") or attrs.get("_player_url") or ""
         try:
-            data  = self._fetch_sources(attrs, stream_type)
+            data  = await self._fetch_sources(attrs, stream_type)
             return self._parse(data, mal_id, episode_num,
                                internal_id=attrs.get("id", ""),
                                real_id=attrs.get("realid", ""),
@@ -443,8 +454,7 @@ class MegaPlayScraper:
             internal_id=internal_id, real_id=real_id, media_id=media_id)
 
     def close(self):
-        try: self.session.close()
-        except: pass
+        pass
 
 # ---------------------------------------------------------------------------
 # M3U8 REWRITER
@@ -522,7 +532,7 @@ def _range_response_headers(*, content_len: int, total_size: int | None,
                             requested: tuple[int, int | None] | None,
                             upstream_content_range: str | None = None) -> tuple[int, dict]:
     headers = {
-        "Cache-Control": "public, max-age=3600",
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
         "Access-Control-Allow-Origin": "*",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_len),
@@ -562,6 +572,39 @@ def _apply_local_range(body: bytes, range_header: str | None,
     headers["Content-Length"] = str(len(sliced))
     headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     return sliced, 206, headers
+
+def _content_type_from_headers_or_url(url: str, headers, peek: bytes = b"") -> str:
+    content_type = (headers.get("content-type") or "").split(";", 1)[0].strip()
+    if content_type and content_type != "application/octet-stream":
+        return content_type
+    return _detect_mime(url, peek)
+
+def _httpx_safe_headers(headers: dict | None) -> dict | None:
+    if not headers:
+        return headers
+    cleaned = dict(headers)
+    for key in list(cleaned.keys()):
+        if key.lower() == "accept-encoding":
+            cleaned.pop(key, None)
+    return cleaned
+
+async def _http_get(url: str, *, headers: dict | None = None, params: dict | None = None,
+                    client: httpx.AsyncClient | None = None,
+                    timeout: float | httpx.Timeout | None = None) -> httpx.Response:
+    return await (client or _http).get(url, headers=_httpx_safe_headers(headers), params=params, timeout=timeout)
+
+async def _http_post(url: str, *, headers: dict | None = None, json: dict | None = None,
+                     client: httpx.AsyncClient | None = None,
+                     timeout: float | httpx.Timeout | None = None) -> httpx.Response:
+    return await (client or _http).post(url, headers=_httpx_safe_headers(headers), json=json, timeout=timeout)
+
+async def _aiter_httpx_content(resp: httpx.Response, chunk_size: int = _PROXY_CHUNK_SIZE):
+    try:
+        async for chunk in resp.aiter_bytes(chunk_size):
+            if chunk:
+                yield chunk
+    finally:
+        await resp.aclose()
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -672,9 +715,16 @@ def _merge_search_nodes(*sources: list[dict]) -> list[dict]:
 
 # Persistent HTTP client — reused for all MAL + AniList calls (no per-request handshake)
 _http = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0),
-    limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+    timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
+    limits=httpx.Limits(max_connections=120, max_keepalive_connections=60),
     follow_redirects=True,
+    http2=True,
+)
+_media_http = httpx.AsyncClient(
+    timeout=httpx.Timeout(connect=8.0, read=60.0, write=10.0, pool=10.0),
+    limits=httpx.Limits(max_connections=400, max_keepalive_connections=120),
+    follow_redirects=True,
+    http2=True,
 )
 
 async def _mal_get(path, **params):
@@ -2632,8 +2682,8 @@ def _requires_backend_proxy(url: str) -> bool:
     ))
 
 def _playlist_proxy_base(req: Request, upstream_url: str) -> str:
-    # Moon's CDN rejects Cloudflare Worker fetches but accepts our curl_cffi
-    # backend proxy with the desktop Chrome impersonation profile.
+    # Moon's CDN rejects Cloudflare Worker fetches but accepts our backend proxy
+    # with desktop Chrome-style request headers.
     if _requires_backend_proxy(upstream_url):
         return _backend_base(req)
     return _stream_proxy_base(req)
@@ -2907,7 +2957,6 @@ async def get_episodes(mal_id: str, hint: int = 0):
 async def get_stream(request: Request, mal_id: str, episode_num: str,
                      type: Literal["sub", "dub"] = "sub",
                      embed: bool = False):
-    loop = asyncio.get_running_loop()
     if embed:
         data = StreamData(
             m3u8_url="",
@@ -2922,20 +2971,22 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
         ck = f"megaplay:{mal_id}:{episode_num}:{type}"
         data: StreamData | None = _anime_cache.get(ck)
         if data is None:
-            try:
-                data = await loop.run_in_executor(
-                    None, scraper.get_stream, mal_id, episode_num, type)
-                _anime_cache[ck] = data
-            except EpisodeNotFound:
-                raise HTTPException(404, "Episode not found on MegaPlay")
-            except InvalidRequest as e:
-                raise HTTPException(400, str(e))
-            except StreamBlocked as e:
-                raise HTTPException(503, f"Upstream blocked: {e}")
-            except PlayerPageError as e:
-                raise HTTPException(502, f"Player page error: {e}")
-            except MegaPlayError as e:
-                raise HTTPException(500, str(e))
+            async with _keyed_lock(_stream_locks, ck):
+                data = _anime_cache.get(ck)
+                if data is None:
+                    try:
+                        data = await scraper.get_stream(mal_id, episode_num, type)
+                        _anime_cache[ck] = data
+                    except EpisodeNotFound:
+                        raise HTTPException(404, "Episode not found on MegaPlay")
+                    except InvalidRequest as e:
+                        raise HTTPException(400, str(e))
+                    except StreamBlocked as e:
+                        raise HTTPException(503, f"Upstream blocked: {e}")
+                    except PlayerPageError as e:
+                        raise HTTPException(502, f"Player page error: {e}")
+                    except MegaPlayError as e:
+                        raise HTTPException(500, str(e))
 
     backend = _stream_proxy_base(request)
     result  = data.to_dict()
@@ -2951,20 +3002,26 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
 async def proxy_m3u8(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    headers, impersonate = _proxy_call_for(url)
-    try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=headers, impersonate=impersonate, timeout=15))
-    except Exception as e:
-        raise HTTPException(502, f"Upstream fetch failed: {e}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _playlist_proxy_base(request, url))
+    backend = _playlist_proxy_base(request, url)
+    cache_key = f"{backend}|{url}"
+    rewritten = _playlist_cache.get(cache_key)
+    if rewritten is None:
+        async with _keyed_lock(_proxy_locks, f"m3u8:{cache_key}"):
+            rewritten = _playlist_cache.get(cache_key)
+            if rewritten is None:
+                headers, _ = _proxy_call_for(url)
+                try:
+                    r = await _http_get(url, headers=headers, client=_media_http, timeout=15)
+                except Exception as e:
+                    raise HTTPException(502, f"Upstream fetch failed: {e}")
+                if r.status_code != 200:
+                    raise HTTPException(r.status_code, f"CDN {r.status_code}")
+                rewritten = rewrite_m3u8(r.text, url, backend)
+                _playlist_cache[cache_key] = rewritten
     body, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
-        "no-cache",
+        "public, max-age=20, stale-while-revalidate=120",
     )
     return Response(content=body, media_type="application/vnd.apple.mpegurl",
                     status_code=status_code, headers=out_headers)
@@ -2973,20 +3030,23 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
 async def proxy_m3u8_head(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    headers, impersonate = _proxy_call_for(url)
-    try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=headers, impersonate=impersonate, timeout=15))
-    except Exception as e:
-        raise HTTPException(502, f"Upstream fetch failed: {e}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    rewritten = rewrite_m3u8(r.text, url, _playlist_proxy_base(request, url))
+    backend = _playlist_proxy_base(request, url)
+    cache_key = f"{backend}|{url}"
+    rewritten = _playlist_cache.get(cache_key)
+    if rewritten is None:
+        headers, _ = _proxy_call_for(url)
+        try:
+            r = await _http_get(url, headers=headers, client=_media_http, timeout=15)
+        except Exception as e:
+            raise HTTPException(502, f"Upstream fetch failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, f"CDN {r.status_code}")
+        rewritten = rewrite_m3u8(r.text, url, backend)
+        _playlist_cache[cache_key] = rewritten
     _, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
         request.headers.get("range"),
-        "no-cache",
+        "public, max-age=20, stale-while-revalidate=120",
     )
     return Response(content=b"", media_type="application/vnd.apple.mpegurl",
                     status_code=status_code, headers=out_headers)
@@ -2996,29 +3056,36 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
 async def proxy_chunk(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    headers, impersonate = _proxy_call_for(url)
+    headers, _ = _proxy_call_for(url)
     req_range = request.headers.get("range", "").strip()
     requested = _parse_single_range(req_range) if req_range else None
     fetch_headers = {**headers}
     if requested:
         fetch_headers["Range"] = req_range
     try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=fetch_headers, impersonate=impersonate, timeout=30))
+        upstream = _media_http.build_request("GET", url, headers=_httpx_safe_headers(fetch_headers))
+        r = await _media_http.send(upstream, stream=True)
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
     if r.status_code not in (200, 206):
+        try: await r.aclose()
+        except Exception: pass
         raise HTTPException(r.status_code, f"CDN {r.status_code}")
-    body = r.content
-    if not body: raise HTTPException(502, "Empty body from upstream")
-    total_size = _response_content_length(r)
-    content_range = r.headers.get("content-range")
-    if r.status_code == 206 and content_range:
-        m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", content_range)
-        if m and m.group(1).isdigit():
-            total_size = int(m.group(1))
-    elif requested and r.status_code == 200:
+
+    # Some MP4 hosts ignore Range. Keep correctness for seeking by falling back
+    # to a bounded in-memory slice only in that rare case; all normal segment
+    # and range responses are streamed immediately.
+    if requested and r.status_code == 200:
+        try: await r.aclose()
+        except Exception: pass
+        try:
+            full = await _http_get(url, headers=headers, client=_media_http, timeout=45)
+        except Exception:
+            raise HTTPException(502, "Upstream failed while applying range")
+        if full.status_code != 200:
+            raise HTTPException(full.status_code, f"CDN {full.status_code}")
+        body = full.content
+        if not body: raise HTTPException(502, "Empty body from upstream")
         total_size = len(body)
         parsed = _parse_single_range(req_range, total_size)
         if not parsed:
@@ -3029,27 +3096,56 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
         if end is None or end >= total_size:
             end = total_size - 1
         body = body[start:end + 1]
-        requested = (start, end)
-    status_code, out_headers = _range_response_headers(
-        content_len=len(body),
-        total_size=total_size,
-        requested=requested if req_range else None,
-        upstream_content_range=content_range if r.status_code == 206 else None,
+        status_code, out_headers = _range_response_headers(
+            content_len=len(body),
+            total_size=total_size,
+            requested=(start, end),
+        )
+        return Response(content=body, media_type=_detect_mime(url, body),
+                        status_code=status_code, headers=out_headers)
+
+    total_size = _response_content_length(r)
+    content_range = r.headers.get("content-range")
+    if r.status_code == 206 and content_range:
+        m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", content_range)
+        if m and m.group(1).isdigit():
+            total_size = int(m.group(1))
+
+    status_code = 206 if r.status_code == 206 else 200
+    out_headers = {
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "X-Accel-Buffering": "no",
+    }
+    content_len = _response_content_length(r)
+    if content_len is not None:
+        out_headers["Content-Length"] = str(content_len)
+    if content_range:
+        out_headers["Content-Range"] = content_range
+    elif requested and status_code == 206:
+        start, end = requested
+        if end is None and content_len is not None:
+            end = start + max(content_len - 1, 0)
+        total = "*" if total_size is None else str(total_size)
+        out_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    media_type = _content_type_from_headers_or_url(url, r.headers)
+    return StreamingResponse(
+        _aiter_httpx_content(r),
+        media_type=media_type,
+        status_code=status_code,
+        headers=out_headers,
     )
-    return Response(content=body, media_type=_detect_mime(url, body),
-                    status_code=status_code, headers=out_headers)
 
 @app.head("/proxy/chunk")
 async def proxy_chunk_head(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    headers, impersonate = _proxy_call_for(url)
+    headers, _ = _proxy_call_for(url)
     req_range = request.headers.get("range", "").strip()
     fetch_headers = {**headers, "Range": req_range or "bytes=0-0"}
     try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=fetch_headers, impersonate=impersonate, timeout=30))
+        r = await _http_get(url, headers=fetch_headers, client=_media_http, timeout=30)
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
     if r.status_code not in (200, 206):
@@ -3063,7 +3159,7 @@ async def proxy_chunk_head(request: Request, src: str = Query(...)):
     requested = _parse_single_range(req_range, total_size) if req_range else None
     status_code = 200
     out_headers = {
-        "Cache-Control": "public, max-age=3600",
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
         "Access-Control-Allow-Origin": "*",
         "Accept-Ranges": "bytes",
     }
@@ -3093,16 +3189,21 @@ async def proxy_chunk_head(request: Request, src: str = Query(...)):
 async def proxy_vtt(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=PROXY_HEADERS, impersonate=IMPERSONATE, timeout=15))
-    except Exception as e:
-        raise HTTPException(502, f"Upstream failed: {e}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    text = _vtt_cache.get(url)
+    if text is None:
+        async with _keyed_lock(_proxy_locks, f"vtt:{url}"):
+            text = _vtt_cache.get(url)
+            if text is None:
+                try:
+                    r = await _http_get(url, headers=PROXY_HEADERS, client=_media_http, timeout=15)
+                except Exception as e:
+                    raise HTTPException(502, f"Upstream failed: {e}")
+                if r.status_code != 200:
+                    raise HTTPException(r.status_code, f"CDN {r.status_code}")
+                text = r.text
+                _vtt_cache[url] = text
     body, status_code, out_headers = _apply_local_range(
-        r.text.encode("utf-8"),
+        text.encode("utf-8"),
         request.headers.get("range"),
         "public, max-age=3600",
     )
@@ -3113,16 +3214,18 @@ async def proxy_vtt(request: Request, src: str = Query(...)):
 async def proxy_vtt_head(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    loop = asyncio.get_running_loop()
-    try:
-        r = await loop.run_in_executor(None, lambda: cffi_requests.get(
-            url, headers=PROXY_HEADERS, impersonate=IMPERSONATE, timeout=15))
-    except Exception as e:
-        raise HTTPException(502, f"Upstream failed: {e}")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    text = _vtt_cache.get(url)
+    if text is None:
+        try:
+            r = await _http_get(url, headers=PROXY_HEADERS, client=_media_http, timeout=15)
+        except Exception as e:
+            raise HTTPException(502, f"Upstream failed: {e}")
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, f"CDN {r.status_code}")
+        text = r.text
+        _vtt_cache[url] = text
     _, status_code, out_headers = _apply_local_range(
-        r.text.encode("utf-8"),
+        text.encode("utf-8"),
         request.headers.get("range"),
         "public, max-age=3600",
     )
@@ -3649,7 +3752,15 @@ async def _search_9anime_slug(title: str) -> str | None:
 _SLUG_OVERRIDES: dict[str, str] = {
     "21": "one-piece",
     "59708": "classroom-of-the-elite-iv",   # Classroom of the Elite Season 4
+    "57555": "chainsaw-man-movie-reze-hen", # Chainsaw Man Movie: Reze-hen
 }
+
+def _watch_slug_candidates(base_slug: str, episode: str) -> list[str]:
+    ep = str(episode or "1").strip()
+    candidates = [f"{base_slug}-episode-{ep}"]
+    if ep in {"1", "01"}:
+        candidates.append(base_slug)
+    return candidates
 
 async def _moon_get_slug(mal_id: str, episode: str) -> str | None:
     """
@@ -3667,11 +3778,11 @@ async def _moon_get_slug(mal_id: str, episode: str) -> str | None:
     """
     # ── 0. Hardcoded overrides ─────────────────────────────────────────────────
     if mal_id in _SLUG_OVERRIDES:
-        return f"{_SLUG_OVERRIDES[mal_id]}-episode-{episode}"
+        return _watch_slug_candidates(_SLUG_OVERRIDES[mal_id], episode)[0]
 
     slug_ck = f"slug:{mal_id}"
     if slug_ck in _anime_cache:
-        return f"{_anime_cache[slug_ck]}-episode-{episode}"
+        return _watch_slug_candidates(_anime_cache[slug_ck], episode)[0]
 
     # ── 1. Fetch all titles from Jikan ────────────────────────────────────────
     try:
@@ -3728,7 +3839,7 @@ async def _moon_get_slug(mal_id: str, episode: str) -> str | None:
     else:
         _anime_cache[slug_ck] = slug   # only cache confirmed slugs
 
-    return f"{slug}-episode-{episode}"
+    return _watch_slug_candidates(slug, episode)[0]
 
 # ---------------------------------------------------------------------------
 # MOON + HD scraper pipeline  (pure httpx, no browser)
@@ -3766,23 +3877,27 @@ _MOON_ID_RE     = re.compile(r'/e/([A-Za-z0-9_-]+)')
 
 async def _fetch_watch_page(slug_with_ep: str, read_timeout: float = 10.0):
     """Fetch a real 9anime watch page, trying both current and legacy URL shapes."""
+    cached = _watch_page_cache.get(slug_with_ep)
+    if cached:
+        return cached
+
     headers = {"User-Agent": MOON_UA, "Accept": "text/html"}
     timeout = httpx.Timeout(connect=4.0, read=read_timeout, write=4.0, pool=4.0)
     last_error = None
-    for tmpl in _WATCH_URL_TMPLS:
-        url = tmpl.format(slug_with_ep)
-        try:
-            r = await _http.get(
-                url,
-                headers=headers,
-                timeout=timeout,
-                follow_redirects=True,
-            )
-            if r.status_code == 200 and _MIRROR_RE.search(r.text):
-                return r
-            last_error = f"HTTP {r.status_code} for {url}"
-        except Exception as e:
-            last_error = e
+    async with _keyed_lock(_watch_locks, f"page:{slug_with_ep}"):
+        cached = _watch_page_cache.get(slug_with_ep)
+        if cached:
+            return cached
+        for tmpl in _WATCH_URL_TMPLS:
+            url = tmpl.format(slug_with_ep)
+            try:
+                r = await _http_get(url, headers=headers, timeout=timeout)
+                if r.status_code == 200 and _MIRROR_RE.search(r.text):
+                    _watch_page_cache[slug_with_ep] = r
+                    return r
+                last_error = f"HTTP {r.status_code} for {url}"
+            except Exception as e:
+                last_error = e
     if last_error:
         logger.warning("Watch page fetch failed for %s: %s", slug_with_ep, last_error)
     return None
@@ -3805,17 +3920,17 @@ async def _resolve_real_slug(mal_id: str, episode: str) -> str | None:
     """
     # 0. Hardcoded override
     if mal_id in _SLUG_OVERRIDES:
-        cand = f"{_SLUG_OVERRIDES[mal_id]}-episode-{episode}"
-        if await _verify_watch_url(cand):
-            return cand
+        for cand in _watch_slug_candidates(_SLUG_OVERRIDES[mal_id], episode):
+            if await _verify_watch_url(cand):
+                return cand
 
     # 1. Cache (verify before returning — site may have rerouted)
     ck = f"slug:{mal_id}"
     cached = _anime_cache.get(ck)
     if cached:
-        cand = f"{cached}-episode-{episode}"
-        if await _verify_watch_url(cand):
-            return cand
+        for cand in _watch_slug_candidates(cached, episode):
+            if await _verify_watch_url(cand):
+                return cand
         try: del _anime_cache[ck]
         except KeyError: pass
 
@@ -3883,6 +3998,21 @@ def _decode_iframe_from_option_value(b64: str) -> str | None:
 
 async def _fetch_watch_servers(slug_with_ep: str) -> dict[str, str]:
     """Single httpx GET on the watch page; returns {'hd': iframe, 'moon': iframe, 'omega': iframe}."""
+    cached = _watch_server_cache.get(slug_with_ep)
+    if cached is not None:
+        return cached
+
+    async with _keyed_lock(_watch_locks, f"servers:{slug_with_ep}"):
+        cached = _watch_server_cache.get(slug_with_ep)
+        if cached is not None:
+            return cached
+
+        parsed = await _parse_watch_servers(slug_with_ep)
+        _watch_server_cache[slug_with_ep] = parsed
+        return parsed
+
+
+async def _parse_watch_servers(slug_with_ep: str) -> dict[str, str]:
     r = await _fetch_watch_page(slug_with_ep)
     if not r:
         return {}
@@ -4004,7 +4134,7 @@ def _moon_selected_key_parts(playback: dict) -> list[str]:
                 return selected
     return parts
 
-def _moon_fetch_playback_sync(video_id: str) -> dict | None:
+async def _moon_fetch_playback(video_id: str) -> dict | None:
     url          = f"https://398fitus.com/api/videos/{video_id}/embed/playback"
     subtitle_url = f"https://398fitus.com/api/videos/{video_id}/embed/timeslider"
     headers = {
@@ -4036,11 +4166,11 @@ def _moon_fetch_playback_sync(video_id: str) -> dict | None:
             "device_id": uuid.uuid4().hex,
             "confidence": 1,
         }
-        resp = cffi_requests.post(
+        resp = await _http_post(
             url,
             headers=headers,
             json={"fingerprint": fingerprint},
-            impersonate="chrome136",
+            timeout=20,
         )
         if resp.status_code != 200:
             logger.warning("Moon playback HTTP %s", resp.status_code)
@@ -4080,52 +4210,55 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
     if cached:
         return cached
 
-    slug = await _resolve_real_slug(mal_id, episode_num)
-    if not slug:
-        raise HTTPException(404, "Moon: anime not found on 9animetv")
+    async with _keyed_lock(_stream_locks, ck):
+        cached = _anime_cache.get(ck)
+        if cached:
+            return cached
 
-    servers = await _fetch_watch_servers(slug)
-    moon_iframe = servers.get("moon")
-    if not moon_iframe:
-        raise HTTPException(404, "Moon: server not listed for this episode")
+        slug = await _resolve_real_slug(mal_id, episode_num)
+        if not slug:
+            raise HTTPException(404, "Moon: anime not found on 9animetv")
 
-    video_id = _moon_video_id_from_iframe(moon_iframe)
-    if not video_id:
-        raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
+        servers = await _fetch_watch_servers(slug)
+        moon_iframe = servers.get("moon")
+        if not moon_iframe:
+            raise HTTPException(404, "Moon: server not listed for this episode")
 
-    backend = _stream_proxy_base(request)
-    seed_query = ""
-    loop = asyncio.get_running_loop()
-    playback = await loop.run_in_executor(None, _moon_fetch_playback_sync, video_id)
-    if playback and playback.get("url"):
-        # Cloudflare Workers can be rejected by Moon's playback API. Resolve the
-        # encrypted playback payload here with curl_cffi, then seed the Worker so
-        # it only has to proxy/cache the HLS playlists and segments.
-        seed_query = f"&src={quote(str(playback['url']), safe='')}"
-    else:
-        logger.warning("Moon: playback seed unavailable for video_id=%s; Worker will resolve fallback", video_id)
+        video_id = _moon_video_id_from_iframe(moon_iframe)
+        if not video_id:
+            raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
 
-    moon_url = (
-        f"{backend}/proxy/moon/{quote(video_id, safe='')}/m3u8"
-        f"?fast=1{seed_query}"
-    )
-    preload_url = (
-        f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
-        f"?segments=2{seed_query}"
-    )
-    response = {
-        "url":          moon_url,
-        "m3u8_url":     moon_url,
-        # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
-        # already CORS-friendly for the browser; proxying it through /proxy/vtt
-        # would break the JSON-vs-VTT content type assumption.
-        "subtitle_url": f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
-        "video_id":     video_id,
-        "server":       "moon",
-        "preload_url":  preload_url,
-    }
-    _anime_cache[ck] = response
-    return response
+        backend = _stream_proxy_base(request)
+        seed_query = ""
+        playback = await _moon_fetch_playback(video_id)
+        if playback and playback.get("url"):
+            # Resolve the encrypted playback payload once here, then seed the
+            # Worker so it only has to proxy/cache playlists and segments.
+            seed_query = f"&src={quote(str(playback['url']), safe='')}"
+        else:
+            logger.warning("Moon: playback seed unavailable for video_id=%s; Worker will resolve fallback", video_id)
+
+        moon_url = (
+            f"{backend}/proxy/moon/{quote(video_id, safe='')}/m3u8"
+            f"?fast=1{seed_query}"
+        )
+        preload_url = (
+            f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
+            f"?segments=4{seed_query}"
+        )
+        response = {
+            "url":          moon_url,
+            "m3u8_url":     moon_url,
+            # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
+            # already CORS-friendly for the browser; proxying it through /proxy/vtt
+            # would break the JSON-vs-VTT content type assumption.
+            "subtitle_url": f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
+            "video_id":     video_id,
+            "server":       "moon",
+            "preload_url":  preload_url,
+        }
+        _anime_cache[ck] = response
+        return response
 
 # --- hd1 stream endpoint ----------------------------------------------------
 @app.get("/api/hd1/{mal_id}/{episode_num}")
@@ -4135,23 +4268,28 @@ async def get_hd1_stream(mal_id: str, episode_num: str, request: Request):
     if cached:
         return cached
 
-    slug = await _resolve_real_slug(mal_id, episode_num)
-    if not slug:
-        raise HTTPException(404, "HD1: anime not found on 9animetv")
+    async with _keyed_lock(_stream_locks, ck):
+        cached = _anime_cache.get(ck)
+        if cached:
+            return cached
 
-    servers = await _fetch_watch_servers(slug)
-    hd_iframe = servers.get("hd")
-    if not hd_iframe:
-        raise HTTPException(404, "HD1: server not listed for this episode")
+        slug = await _resolve_real_slug(mal_id, episode_num)
+        if not slug:
+            raise HTTPException(404, "HD1: anime not found on 9animetv")
 
-    mp4_url = await _fetch_hd_stream_url(hd_iframe)
-    if not mp4_url:
-        raise HTTPException(502, "HD1: workers.dev URL extraction from gogoanime failed")
+        servers = await _fetch_watch_servers(slug)
+        hd_iframe = servers.get("hd")
+        if not hd_iframe:
+            raise HTTPException(404, "HD1: server not listed for this episode")
 
-    hd_url = _proxy_url(_stream_proxy_base(request), mp4_url, "/proxy/chunk") if CLOUDFLARE_PROXY_BASE else mp4_url
-    response = {"url": hd_url, "server": "hd1"}
-    _anime_cache[ck] = response
-    return response
+        mp4_url = await _fetch_hd_stream_url(hd_iframe)
+        if not mp4_url:
+            raise HTTPException(502, "HD1: workers.dev URL extraction from gogoanime failed")
+
+        hd_url = _proxy_url(_stream_proxy_base(request), mp4_url, "/proxy/chunk") if CLOUDFLARE_PROXY_BASE else mp4_url
+        response = {"url": hd_url, "server": "hd1"}
+        _anime_cache[ck] = response
+        return response
 
 # ---------------------------------------------------------------------------
 # STARTUP / SHUTDOWN
@@ -4160,6 +4298,7 @@ async def get_hd1_stream(mal_id: str, episode_num: str, request: Request):
 async def _startup():
     async def _warm():
         try:
+            await scraper.bootstrap()
             media = await _anilist_spring2026()
             await _anilist_ep_map()
             await _mal_seasonal()
@@ -4171,6 +4310,7 @@ async def _startup():
 @app.on_event("shutdown")
 async def _shutdown():
     scraper.close()
+    await _media_http.aclose()
     await _http.aclose()
 
 if __name__ == "__main__":
