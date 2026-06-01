@@ -307,11 +307,18 @@ def extract_megaplay_iframe_url(page_html: str, page_url: str) -> str:
             candidate = f"https:{candidate}"
         iframe_url = urljoin(page_url, candidate)
         parsed = urlparse(iframe_url)
-        if (parsed.hostname or "").lower().endswith("vidwish.live") and "/stream/" in parsed.path:
+        host = (parsed.hostname or "").lower()
+        if host.endswith("vidwish.live") and "/stream/" in parsed.path:
+            return iframe_url
+        if host == urlparse(MEGAPLAY_BASE).hostname and "/stream/" in parsed.path:
             return iframe_url
 
     raw = (page_html or "").replace("\\/", "/")
     match = re.search(r'https?://(?:www\.)?vidwish\.live/stream/[^"\'<\s]+', raw, re.IGNORECASE)
+    if match:
+        return unescape(match.group(0))
+    base_host = re.escape(urlparse(MEGAPLAY_BASE).hostname or "megaplay.buzz")
+    match = re.search(rf'https?://{base_host}/stream/[^"\'<\s]+', raw, re.IGNORECASE)
     return unescape(match.group(0)) if match else ""
 
 
@@ -350,29 +357,34 @@ class MegaPlayScraper:
             attrs["_fallback_url"] = url
             return attrs
 
-        vidwish_url = extract_megaplay_iframe_url(r.text, url)
-        if not vidwish_url:
+        iframe_url = extract_megaplay_iframe_url(r.text, url)
+        if not iframe_url:
             logger.warning("Megaplay data-id missing; using iframe fallback for %s", url)
             return {"_source": "iframe", "_player_url": url, "_fallback_url": url}
 
-        logger.info("vidwish layer -> %s", vidwish_url)
+        iframe_host = (urlparse(iframe_url).hostname or "").lower()
+        is_vidwish_layer = iframe_host.endswith("vidwish.live")
+        layer_headers = (
+            {**VIDWISH_NAV_HEADERS, "Referer": url}
+            if is_vidwish_layer
+            else {**NAV_HEADERS, "Referer": url, "Sec-Fetch-Dest": "iframe"}
+        )
+        logger.info("%s layer -> %s", "vidwish" if is_vidwish_layer else "megaplay", iframe_url)
         try:
-            vr = await _http_get(vidwish_url,
-                headers={**VIDWISH_NAV_HEADERS, "Referer": url},
-                timeout=self.timeout)
+            vr = await _http_get(iframe_url, headers=layer_headers, timeout=self.timeout)
         except Exception as e:
-            raise PlayerPageError(f"Vidwish fetch failed: {e}")
+            raise PlayerPageError(f"iframe fetch failed: {e}")
         if vr.status_code == 404:
             raise EpisodeNotFound(f"MAL={mal_id} ep={ep_num} type={stype}")
         if vr.status_code != 200:
-            raise PlayerPageError(f"Vidwish HTTP {vr.status_code}")
+            raise PlayerPageError(f"iframe HTTP {vr.status_code}")
 
         attrs = extract_player_data_attrs(vr.text)
         if "id" not in attrs:
-            logger.warning("Vidwish data-id missing; using iframe fallback for %s", vidwish_url)
-            return {"_source": "iframe", "_player_url": vidwish_url, "_fallback_url": url}
-        attrs["_source"] = "vidwish"
-        attrs["_player_url"] = vidwish_url
+            logger.warning("iframe data-id missing; using iframe fallback for %s", iframe_url)
+            return {"_source": "iframe", "_player_url": iframe_url, "_fallback_url": url}
+        attrs["_source"] = "vidwish" if is_vidwish_layer else "megaplay"
+        attrs["_player_url"] = iframe_url
         attrs["_fallback_url"] = url
         return attrs
 
