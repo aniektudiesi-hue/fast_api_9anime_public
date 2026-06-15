@@ -2214,27 +2214,38 @@ async def analytics_visit(request: Request):
 
 @app.get("/analytics/survey")
 async def analytics_survey():
-    """Public endpoint: return survey vote counts from visitor_events."""
-    conn = _db()
-    rows = conn.execute(
-        "SELECT path, COUNT(*) as cnt FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') GROUP BY path"
-    ).fetchall()
-    voter_rows = conn.execute(
-        "SELECT path, ip_address, created_at FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') ORDER BY created_at DESC LIMIT 500"
-    ).fetchall()
-    conn.close()
-    ads = 0
-    close = 0
-    for row in rows:
-        if row[0] == "/survey/ads":
-            ads = row[1]
-        elif row[0] == "/survey/close":
-            close = row[1]
-    voters = []
-    for row in voter_rows:
-        choice = "ads" if row[0] == "/survey/ads" else "close"
-        voters.append({"choice": choice, "ip": row[1] or "?", "at": row[2] or ""})
-    return {"ads": ads, "close": close, "total": ads + close, "voters": voters}
+    """Public endpoint: return survey vote counts from visitor_events. Never 500s
+    — returns zeros (+ an error hint) if the analytics table is unavailable so the
+    admin panel still renders."""
+    conn = None
+    try:
+        conn = _db()
+        rows = conn.execute(
+            "SELECT path, COUNT(*) as cnt FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') GROUP BY path"
+        ).fetchall()
+        voter_rows = conn.execute(
+            "SELECT path, ip_address, created_at FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+        ads = 0
+        close = 0
+        for row in rows:
+            if row[0] == "/survey/ads":
+                ads = row[1]
+            elif row[0] == "/survey/close":
+                close = row[1]
+        voters = []
+        for row in voter_rows:
+            choice = "ads" if row[0] == "/survey/ads" else "close"
+            voters.append({"choice": choice, "ip": row[1] or "?", "at": row[2] or ""})
+        return {"ads": ads, "close": close, "total": ads + close, "voters": voters}
+    except Exception as exc:  # noqa: BLE001 — analytics must never break the panel
+        return {"ads": 0, "close": 0, "total": 0, "voters": [], "error": str(exc)[:160]}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.get("/analytics/registrations")
