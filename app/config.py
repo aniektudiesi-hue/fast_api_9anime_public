@@ -52,6 +52,7 @@ class Settings:
     render_disk_dir: Path
     environment: str
     debug: bool
+    mewstream_proxies: str
 
     @property
     def is_postgres(self) -> bool:
@@ -86,7 +87,26 @@ def load_settings() -> Settings:
         render_disk_dir=Path(_first_present(os.getenv("RENDER_DISK_DIR"), "/var/data")),
         environment=_first_present(os.getenv("ENVIRONMENT"), "development"),
         debug=_bool_env("DEBUG", False),
+        mewstream_proxies=_load_mewstream_proxies(),
     )
+
+
+def _load_mewstream_proxies() -> str:
+    """Comma/newline-separated host:port:user:pass proxy list used as a
+    rotating fallback for cdn.mewstream.buzz when direct (even curl_cffi)
+    fetches get a Cloudflare 403 from the deploy host's IP range.
+
+    Prefers the MEWSTREAM_PROXIES env var (set this on Render); falls back to
+    a local gitignored mewstream_proxies.txt for dev convenience.
+    """
+    env_value = _clean(os.getenv("MEWSTREAM_PROXIES"))
+    if env_value:
+        return env_value
+    proxy_file = Path(__file__).resolve().parent.parent / "mewstream_proxies.txt"
+    try:
+        return proxy_file.read_text("utf-8")
+    except OSError:
+        return ""
 
 
 settings = load_settings()

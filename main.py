@@ -2,7 +2,7 @@
 RO-ANIME Backend v3
 """
 from __future__ import annotations
-import asyncio, base64, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
+import asyncio, base64, itertools, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
@@ -206,6 +206,28 @@ _MEWSTREAM_CH_HEADERS = {
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "cross-site",
 }
+
+# mewstream is also blocked at the IP level for Render's datacenter egress
+# (curl_cffi's chrome TLS fingerprint passes, but Cloudflare still 403s based
+# on IP reputation). When the direct curl_cffi call 403s on a mewstream URL,
+# retry through a rotating residential proxy.
+def _parse_mewstream_proxies(raw: str) -> list[dict[str, str]]:
+    proxies = []
+    for line in re.split(r"[,\n]", raw or ""):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) != 4:
+            continue
+        host, port, user, pwd = parts
+        proxy_url = f"http://{user}:{pwd}@{host}:{port}"
+        proxies.append({"http": proxy_url, "https": proxy_url})
+    return proxies
+
+
+_MEWSTREAM_PROXIES = _parse_mewstream_proxies(settings.mewstream_proxies)
+_mewstream_proxy_cycle = itertools.cycle(_MEWSTREAM_PROXIES) if _MEWSTREAM_PROXIES else None
 
 
 def _proxy_call_for(url: str) -> tuple[dict, str]:
@@ -632,7 +654,7 @@ async def _http_get(url: str, *, headers: dict | None = None, params: dict | Non
 
 
 async def _cffi_get(url: str, *, headers: dict | None = None, impersonate: str = "chrome",
-                    timeout: float = 30, stream: bool = False):
+                    timeout: float = 30, stream: bool = False, proxies: dict | None = None):
     """curl_cffi GET run in a worker thread (the lib is sync). Forges a real
     browser TLS fingerprint — required by CDNs like mewstream that block httpx /
     Cloudflare-Worker fetches at the TLS layer. Returns a curl_cffi Response which
@@ -646,8 +668,41 @@ async def _cffi_get(url: str, *, headers: dict | None = None, impersonate: str =
             impersonate=impersonate or "chrome",
             timeout=timeout,
             stream=stream,
+            proxies=proxies,
         ),
     )
+
+
+async def _cffi_get_mewstream_fallback(url: str, *, headers: dict, impersonate: str = "chrome",
+                                       timeout: float = 30, stream: bool = False):
+    """curl_cffi GET with a rotating-proxy retry for cdn.mewstream.buzz.
+
+    Render's datacenter IPs get a Cloudflare 403 on mewstream even with a
+    correct curl_cffi browser fingerprint, so on a 403 for a mewstream host we
+    retry through one of the Webshare residential proxies, rotating on every
+    call. Non-mewstream hosts (or hosts when no proxies are configured) just
+    return the direct result.
+
+    Only used for the small manifest/subtitle fetches (m3u8, vtt) — NOT for
+    media segments (/proxy/chunk), to avoid routing bulk video bytes through
+    the limited residential proxy pool.
+    """
+    r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=timeout, stream=stream)
+    if r.status_code == 200:
+        return r
+    host = (urlparse(url).hostname or "").lower()
+    if "mewstream.buzz" not in host or not _mewstream_proxy_cycle:
+        return r
+    for _ in range(len(_MEWSTREAM_PROXIES)):
+        proxy = next(_mewstream_proxy_cycle)
+        try:
+            rp = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=timeout,
+                                 stream=stream, proxies=proxy)
+        except Exception:
+            continue
+        if rp.status_code == 200:
+            return rp
+    return r
 
 async def _http_post(url: str, *, headers: dict | None = None, json: dict | None = None,
                      client: httpx.AsyncClient | None = None,
@@ -3105,7 +3160,7 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
                 if r is None or r.status_code != 200:
                     # CDN blocked the httpx fetch (TLS fingerprint) — retry with
                     # curl_cffi browser impersonation (mewstream needs this).
-                    r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
+                    r = await _cffi_get_mewstream_fallback(url, headers=headers, impersonate=impersonate, timeout=15)
                 if r.status_code != 200:
                     raise HTTPException(r.status_code, f"CDN {r.status_code}")
                 rewritten = rewrite_m3u8(r.text, url, backend)
@@ -3132,7 +3187,7 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
         except Exception:
             r = None
         if r is None or r.status_code != 200:
-            r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
+            r = await _cffi_get_mewstream_fallback(url, headers=headers, impersonate=impersonate, timeout=15)
         if r.status_code != 200:
             raise HTTPException(r.status_code, f"CDN {r.status_code}")
         rewritten = rewrite_m3u8(r.text, url, backend)
@@ -3332,7 +3387,7 @@ async def proxy_vtt(request: Request, src: str = Query(...)):
                 except Exception:
                     r = None
                 if r is None or r.status_code != 200:
-                    r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
+                    r = await _cffi_get_mewstream_fallback(url, headers=headers, impersonate=impersonate, timeout=15)
                 if r.status_code != 200:
                     raise HTTPException(r.status_code, f"CDN {r.status_code}")
                 text = r.text

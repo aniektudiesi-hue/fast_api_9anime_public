@@ -7,6 +7,7 @@ __pycache__/
 *.txt.bak
 New Text Document.txt
 .env
+mewstream_proxies.txt
 .venv/
 .venv*/
 venv/
