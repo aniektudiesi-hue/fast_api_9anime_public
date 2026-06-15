@@ -10,6 +10,7 @@ from typing import Literal, Optional
 from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
 
 import httpx
+from curl_cffi import requests as cffi_requests
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -189,6 +190,24 @@ _UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
+# mewstream's Cloudflare rejects any request missing the full Chrome client-hint
+# set, and only passes with latest-chrome curl_cffi impersonation. This EXACT
+# combo (UA + sec-ch-ua/sec-fetch + impersonate="chrome") was verified to return
+# 200 with the real playlist; chrome131_android / chrome120 etc. all 403.
+_MEWSTREAM_UA = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"
+)
+_MEWSTREAM_CH_HEADERS = {
+    "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+    "sec-ch-ua-mobile": "?1",
+    "sec-ch-ua-platform": '"Android"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+}
+
+
 def _proxy_call_for(url: str) -> tuple[dict, str]:
     """Return (headers, impersonate_profile) tuned for *url*.
 
@@ -200,13 +219,18 @@ def _proxy_call_for(url: str) -> tuple[dict, str]:
     for needle, ref, ua, imp in _UPSTREAM_POLICY:
         if needle in host:
             origin = ref.rstrip("/")
-            return {
+            headers = {
                 "User-Agent":      ua,
                 "Accept":          "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Origin":          origin,
                 "Referer":         ref,
-            }, imp
+            }
+            if "mewstream.buzz" in host:
+                headers["User-Agent"] = _MEWSTREAM_UA
+                headers.update(_MEWSTREAM_CH_HEADERS)
+                return headers, "chrome"
+            return headers, imp
     return PROXY_HEADERS, IMPERSONATE
 
 
@@ -605,6 +629,25 @@ async def _http_get(url: str, *, headers: dict | None = None, params: dict | Non
                     client: httpx.AsyncClient | None = None,
                     timeout: float | httpx.Timeout | None = None) -> httpx.Response:
     return await (client or _http).get(url, headers=_httpx_safe_headers(headers), params=params, timeout=timeout)
+
+
+async def _cffi_get(url: str, *, headers: dict | None = None, impersonate: str = "chrome",
+                    timeout: float = 30, stream: bool = False):
+    """curl_cffi GET run in a worker thread (the lib is sync). Forges a real
+    browser TLS fingerprint — required by CDNs like mewstream that block httpx /
+    Cloudflare-Worker fetches at the TLS layer. Returns a curl_cffi Response which
+    exposes .status_code / .text / .content / .headers just like httpx."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: cffi_requests.get(
+            url,
+            headers=_httpx_safe_headers(headers) if headers else None,
+            impersonate=impersonate or "chrome",
+            timeout=timeout,
+            stream=stream,
+        ),
+    )
 
 async def _http_post(url: str, *, headers: dict | None = None, json: dict | None = None,
                      client: httpx.AsyncClient | None = None,
@@ -2717,6 +2760,9 @@ def _requires_backend_proxy(url: str) -> bool:
         "sprintcdn",
         "bysesayeveum.com",
         "398fitus.com",
+        # mewstream blocks Cloudflare Worker fetches (TLS fingerprint) and only
+        # accepts our curl_cffi backend proxy with browser impersonation.
+        "mewstream.buzz",
     ))
 
 def _playlist_proxy_base(req: Request, upstream_url: str) -> str:
@@ -3026,13 +3072,17 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
                     except MegaPlayError as e:
                         raise HTTPException(500, str(e))
 
-    backend = _stream_proxy_base(request)
-    result  = data.to_dict()
+    result = data.to_dict()
+    # Pick the proxy base PER URL: CDNs that block Cloudflare Workers (mewstream
+    # etc.) must go through OUR curl_cffi backend proxy; everything else can use
+    # the offloaded CF worker. _playlist_proxy_base() applies that rule.
     if data.m3u8_url:
-        result["m3u8_url"] = _proxy_url(backend, data.m3u8_url, "/proxy/m3u8")
+        m3u8_backend = _playlist_proxy_base(request, data.m3u8_url)
+        result["m3u8_url"] = _proxy_url(m3u8_backend, data.m3u8_url, "/proxy/m3u8")
     for sub in result["subtitles"]:
         if sub.get("file"):
-            sub["file"] = _proxy_url(backend, sub["file"], "/proxy/vtt")
+            sub_backend = _playlist_proxy_base(request, sub["file"])
+            sub["file"] = _proxy_url(sub_backend, sub["file"], "/proxy/vtt")
     return result
 
 # --- m3u8 proxy -------------------------------------------------------------
@@ -3047,11 +3097,15 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
         async with _keyed_lock(_proxy_locks, f"m3u8:{cache_key}"):
             rewritten = _playlist_cache.get(cache_key)
             if rewritten is None:
-                headers, _ = _proxy_call_for(url)
+                headers, impersonate = _proxy_call_for(url)
                 try:
                     r = await _http_get(url, headers=headers, client=_media_http, timeout=15)
-                except Exception as e:
-                    raise HTTPException(502, f"Upstream fetch failed: {e}")
+                except Exception:
+                    r = None
+                if r is None or r.status_code != 200:
+                    # CDN blocked the httpx fetch (TLS fingerprint) — retry with
+                    # curl_cffi browser impersonation (mewstream needs this).
+                    r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
                 if r.status_code != 200:
                     raise HTTPException(r.status_code, f"CDN {r.status_code}")
                 rewritten = rewrite_m3u8(r.text, url, backend)
@@ -3072,11 +3126,13 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
     cache_key = f"{backend}|{url}"
     rewritten = _playlist_cache.get(cache_key)
     if rewritten is None:
-        headers, _ = _proxy_call_for(url)
+        headers, impersonate = _proxy_call_for(url)
         try:
             r = await _http_get(url, headers=headers, client=_media_http, timeout=15)
-        except Exception as e:
-            raise HTTPException(502, f"Upstream fetch failed: {e}")
+        except Exception:
+            r = None
+        if r is None or r.status_code != 200:
+            r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
         if r.status_code != 200:
             raise HTTPException(r.status_code, f"CDN {r.status_code}")
         rewritten = rewrite_m3u8(r.text, url, backend)
@@ -3090,11 +3146,47 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
                     status_code=status_code, headers=out_headers)
 
 # --- chunk proxy ------------------------------------------------------------
+async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_range: str):
+    """Serve a media segment via curl_cffi (full fetch + local range slice) when
+    httpx is TLS-blocked. Segments are small, so a full fetch is fine."""
+    try:
+        cr = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=45)
+    except Exception as e:
+        raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
+    if cr.status_code not in (200, 206):
+        raise HTTPException(cr.status_code, f"CDN {cr.status_code}")
+    body = cr.content or b""
+    total_size = len(body)
+    if req_range:
+        parsed = _parse_single_range(req_range, total_size)
+        if parsed:
+            start, end = parsed
+            if start >= total_size:
+                raise HTTPException(416, "Range not satisfiable")
+            if end is None or end >= total_size:
+                end = total_size - 1
+            sliced = body[start:end + 1]
+            status_code, out_headers = _range_response_headers(
+                content_len=len(sliced), total_size=total_size, requested=(start, end),
+            )
+            return Response(content=sliced, media_type=_detect_mime(url, sliced),
+                            status_code=status_code, headers=out_headers)
+    return Response(
+        content=body, media_type=_detect_mime(url, body), status_code=200,
+        headers={
+            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(total_size),
+        },
+    )
+
+
 @app.get("/proxy/chunk")
 async def proxy_chunk(request: Request, src: str = Query(...)):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
-    headers, _ = _proxy_call_for(url)
+    headers, impersonate = _proxy_call_for(url)
     req_range = request.headers.get("range", "").strip()
     requested = _parse_single_range(req_range) if req_range else None
     fetch_headers = {**headers}
@@ -3103,12 +3195,14 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
     try:
         upstream = _media_http.build_request("GET", url, headers=_httpx_safe_headers(fetch_headers))
         r = await _media_http.send(upstream, stream=True)
-    except Exception as e:
-        raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
-    if r.status_code not in (200, 206):
-        try: await r.aclose()
-        except Exception: pass
-        raise HTTPException(r.status_code, f"CDN {r.status_code}")
+    except Exception:
+        r = None
+    if r is None or r.status_code not in (200, 206):
+        if r is not None:
+            try: await r.aclose()
+            except Exception: pass
+        # httpx blocked (TLS fingerprint) — serve the segment via curl_cffi.
+        return await _cffi_chunk_response(url, headers, impersonate, req_range)
 
     # Some MP4 hosts ignore Range. Keep correctness for seeking by falling back
     # to a bounded in-memory slice only in that rare case; all normal segment
@@ -3232,10 +3326,13 @@ async def proxy_vtt(request: Request, src: str = Query(...)):
         async with _keyed_lock(_proxy_locks, f"vtt:{url}"):
             text = _vtt_cache.get(url)
             if text is None:
+                headers, impersonate = _proxy_call_for(url)
                 try:
-                    r = await _http_get(url, headers=PROXY_HEADERS, client=_media_http, timeout=15)
-                except Exception as e:
-                    raise HTTPException(502, f"Upstream failed: {e}")
+                    r = await _http_get(url, headers=headers, client=_media_http, timeout=15)
+                except Exception:
+                    r = None
+                if r is None or r.status_code != 200:
+                    r = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=15)
                 if r.status_code != 200:
                     raise HTTPException(r.status_code, f"CDN {r.status_code}")
                 text = r.text
