@@ -173,6 +173,7 @@ DESKTOP_UA = (
 
 # host substring -> (referer, user_agent, impersonate_profile)
 _UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
+    ("mewstream.buzz",    f"{MEGAPLAY_BASE}/", ANDROID_UA, IMPERSONATE),
     ("watching.onl",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
     ("cinewave",          f"{MEGAPLAY_BASE}/", ANDROID_UA, IMPERSONATE),
     ("vidwish.live",      f"{VIDWISH_BASE}/", ANDROID_UA, IMPERSONATE),
@@ -2111,6 +2112,31 @@ async def analytics_visit(request: Request):
     user = _optional_user_from_request(request)
     saved = _record_visit_event(request, path, referrer, user, data)
     return {"ok": True, "visitor_key": saved["visitor_key"]}
+
+
+@app.get("/analytics/survey")
+async def analytics_survey():
+    """Public endpoint: return survey vote counts from visitor_events."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT path, COUNT(*) as cnt FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') GROUP BY path"
+    ).fetchall()
+    voter_rows = conn.execute(
+        "SELECT path, ip_address, created_at FROM visitor_events WHERE path IN ('/survey/ads', '/survey/close') ORDER BY created_at DESC LIMIT 500"
+    ).fetchall()
+    conn.close()
+    ads = 0
+    close = 0
+    for row in rows:
+        if row[0] == "/survey/ads":
+            ads = row[1]
+        elif row[0] == "/survey/close":
+            close = row[1]
+    voters = []
+    for row in voter_rows:
+        choice = "ads" if row[0] == "/survey/ads" else "close"
+        voters.append({"choice": choice, "ip": row[1] or "?", "at": row[2] or ""})
+    return {"ads": ads, "close": close, "total": ads + close, "voters": voters}
 
 
 @app.get("/admin/overview")
