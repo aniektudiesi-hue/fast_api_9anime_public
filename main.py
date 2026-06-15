@@ -2237,6 +2237,32 @@ async def analytics_survey():
     return {"ads": ads, "close": close, "total": ads + close, "voters": voters}
 
 
+@app.get("/analytics/registrations")
+async def analytics_registrations():
+    """Public endpoint: return app registration signups from visitor_events."""
+    conn = _db()
+    rows = conn.execute(
+        "SELECT path, COUNT(*) as cnt FROM visitor_events WHERE path LIKE '/register/%' GROUP BY path"
+    ).fetchall()
+    detail_rows = conn.execute(
+        "SELECT path, referrer, screen, ip_address, created_at FROM visitor_events WHERE path LIKE '/register/%' ORDER BY created_at DESC LIMIT 200"
+    ).fetchall()
+    conn.close()
+    counts = {}
+    total = 0
+    for row in rows:
+        platform = (row[0] or "").replace("/register/", "")
+        counts[platform] = row[1]
+        total += row[1]
+    entries = []
+    for row in detail_rows:
+        platform = (row[0] or "").replace("/register/", "")
+        email = row[1] or ""
+        errors = (row[2] or "").replace("errors:", "", 1) if (row[2] or "").startswith("errors:") else ""
+        entries.append({"platform": platform, "email": email, "errors": errors, "ip": row[3] or "?", "at": row[4] or ""})
+    return {"counts": counts, "total": total, "entries": entries}
+
+
 @app.get("/admin/overview")
 async def admin_overview(request: Request):
     admin = _get_admin_user(request)
