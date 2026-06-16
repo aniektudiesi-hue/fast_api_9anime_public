@@ -2,7 +2,7 @@
 RO-ANIME Backend v3
 """
 from __future__ import annotations
-import asyncio, base64, concurrent.futures, itertools, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
+import asyncio, base64, itertools, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import Literal, Optional
 from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
 
 import httpx
-from curl_cffi import requests as cffi_requests
+from curl_cffi.requests import AsyncSession as _CffiAsyncSession
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -278,14 +278,12 @@ _proxy_locks: dict[str, asyncio.Lock] = {}
 _watch_locks: dict[str, asyncio.Lock] = {}
 _PROXY_CHUNK_SIZE = 512 * 1024
 
-# curl_cffi is a *blocking* (sync) library, so every call is dispatched to a
-# worker thread. Using asyncio's default executor (min(32, cpu+4) threads, and
-# shared with every other blocking call) meant that under load the per-segment
-# media fetches serialised on a handful of threads — the player would stall
-# waiting for a free worker. A dedicated, generously sized pool keeps concurrent
-# segment/seek fetches flowing.
-_CFFI_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=64, thread_name_prefix="cffi")
+# IMPORTANT: a *shared* curl_cffi AsyncSession serialises concurrent streaming
+# requests — measured ~27x slower than httpx for 8 parallel segment streams
+# (they contend on the one session's curl handle). So every cffi call gets its
+# OWN AsyncSession, which parallelises correctly. curl_cffi is only used for the
+# small TLS-blocked manifests (mewstream/Moon) anyway; bulk segments go through
+# the async httpx pool, which is the fastest path.
 
 def _keyed_lock(bucket: dict[str, asyncio.Lock], key: str) -> asyncio.Lock:
     lock = bucket.get(key)
@@ -664,22 +662,30 @@ async def _http_get(url: str, *, headers: dict | None = None, params: dict | Non
 
 async def _cffi_get(url: str, *, headers: dict | None = None, impersonate: str = "chrome",
                     timeout: float = 30, stream: bool = False, proxies: dict | None = None):
-    """curl_cffi GET run in a worker thread (the lib is sync). Forges a real
-    browser TLS fingerprint — required by CDNs like mewstream that block httpx /
-    Cloudflare-Worker fetches at the TLS layer. Returns a curl_cffi Response which
-    exposes .status_code / .text / .content / .headers just like httpx."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _CFFI_EXECUTOR,
-        lambda: cffi_requests.get(
+    """Async cffi GET on a fresh AsyncSession (forges a real browser TLS
+    fingerprint for CDNs that reject httpx at the TLS layer).
+
+    Non-stream: body is fully read, so the session is closed before returning.
+    Stream: the session must outlive the streamed body — it's stashed on the
+    response and closed by _aiter_cffi_content when the stream ends. A fresh
+    session per call is deliberate: a shared one serialises concurrent streams."""
+    sess = _CffiAsyncSession(impersonate=impersonate or "chrome")
+    try:
+        resp = await sess.get(
             url,
             headers=_httpx_safe_headers(headers) if headers else None,
-            impersonate=impersonate or "chrome",
             timeout=timeout,
             stream=stream,
             proxies=proxies,
-        ),
-    )
+        )
+    except Exception:
+        await sess.close()
+        raise
+    if stream:
+        resp._owner_session = sess  # closed in _aiter_cffi_content's finally
+    else:
+        await sess.close()
+    return resp
 
 
 async def _cffi_get_mewstream_fallback(url: str, *, headers: dict, impersonate: str = "chrome",
@@ -727,32 +733,28 @@ async def _aiter_httpx_content(resp: httpx.Response, chunk_size: int = _PROXY_CH
         await resp.aclose()
 
 
-async def _aiter_cffi_content(resp, chunk_size: int = _PROXY_CHUNK_SIZE):
-    """Bridge curl_cffi's *blocking* streaming response into an async generator.
-
-    Each pull of the next chunk runs on the dedicated cffi thread pool, so the
-    body is streamed to the client as it arrives instead of being fully
-    buffered in memory before the first byte is sent. This is what lets a
-    TLS-blocked CDN (mewstream / Moon) play without the per-segment download
-    stall the old full-fetch path caused."""
-    loop = asyncio.get_running_loop()
-    gen = resp.iter_content(chunk_size=chunk_size)
-
-    def _pull():
-        try:
-            return next(gen)
-        except StopIteration:
-            return None
-
+async def _close_cffi(resp):
+    """Close a streaming cffi response and the per-request session that owns it."""
     try:
-        while True:
-            chunk = await loop.run_in_executor(_CFFI_EXECUTOR, _pull)
-            if chunk is None:
-                break
+        await resp.aclose()
+    finally:
+        sess = getattr(resp, "_owner_session", None)
+        if sess is not None:
+            try: await sess.close()
+            except Exception: pass
+
+
+async def _aiter_cffi_content(resp, chunk_size: int = _PROXY_CHUNK_SIZE):
+    """Stream a curl_cffi AsyncSession response straight to the client.
+
+    aiter_content is natively async — bytes flow to the player the instant they
+    arrive from the CDN, with no thread hop and no full-segment buffering."""
+    try:
+        async for chunk in resp.aiter_content(chunk_size):
             if chunk:
                 yield chunk
     finally:
-        await loop.run_in_executor(_CFFI_EXECUTOR, resp.close)
+        await _close_cffi(resp)
 
 
 async def _slice_aiter(aiter, start: int, end: int | None):
@@ -775,6 +777,33 @@ async def _slice_aiter(aiter, start: int, end: int | None):
             yield chunk[lo:hi]
         if end is not None and cend > end:
             break
+
+
+async def _sniff_stream(url: str, aiter):
+    """Peek the first chunk to detect the *real* media type, then return
+    (media_type, generator-that-replays-everything).
+
+    The CDNs disguise MPEG-TS segments as image/jpeg, .html, .css, .ico ...
+    (both the URL extension and the Content-Type header lie). The only reliable
+    signal is the first byte: 0x47 = MPEG-TS sync, ftyp/moof = MP4. We peek it,
+    force the correct type, then stream the peeked chunk plus the rest — so the
+    player never sees a wrong Content-Type and native (Safari/iOS) playback
+    works too. One tiny await for the first chunk; it arrives immediately."""
+    iterator = aiter.__aiter__()
+    first = b""
+    try:
+        first = await iterator.__anext__()
+    except StopAsyncIteration:
+        pass
+    media_type = _detect_mime(url, first)
+
+    async def _gen():
+        if first:
+            yield first
+        async for chunk in iterator:
+            yield chunk
+
+    return media_type, _gen()
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -3313,8 +3342,7 @@ async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_ra
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
     if cr.status_code not in (200, 206):
-        try: cr.close()
-        except Exception: pass
+        await _close_cffi(cr)
         raise HTTPException(cr.status_code, f"CDN {cr.status_code}")
 
     cr_headers = cr.headers
@@ -3332,7 +3360,6 @@ async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_ra
         "Accept-Ranges": "bytes",
         "X-Accel-Buffering": "no",
     }
-    media_type = _content_type_from_headers_or_url(url, cr_headers)
 
     # Upstream honoured the Range — pass the 206 straight through, streaming.
     if cr.status_code == 206:
@@ -3340,29 +3367,33 @@ async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_ra
             out_headers["Content-Range"] = upstream_cr
         if cl:
             out_headers["Content-Length"] = cl
-        return StreamingResponse(_aiter_cffi_content(cr), media_type=media_type,
+        media_type, body = await _sniff_stream(url, _aiter_cffi_content(cr))
+        return StreamingResponse(body, media_type=media_type,
                                  status_code=206, headers=out_headers)
 
-    # Upstream ignored the Range (200). If a window was requested, slice it on
-    # the fly while streaming so the whole file never lands in memory.
-    parsed = _parse_single_range(req_range, total_size) if req_range else None
+    # Upstream ignored the Range (200). Only slice into a 206 when we actually
+    # know the total size; otherwise (chunked, no Content-Length — the common
+    # case for these disguised .jpg/.ts segments) stream the whole thing as a
+    # clean 200. Emitting a 206 with an open/unknown Content-Range is what broke
+    # playback before.
+    parsed = _parse_single_range(req_range, total_size) if (req_range and total_size) else None
     if parsed:
         start, end = parsed
-        if end is None and total_size is not None:
+        if end is None or end >= total_size:
             end = total_size - 1
-        out_headers["Content-Range"] = (
-            f"bytes {start}-{'' if end is None else end}/"
-            f"{'*' if total_size is None else total_size}")
-        if end is not None:
-            out_headers["Content-Length"] = str(end - start + 1)
+        out_headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+        out_headers["Content-Length"] = str(end - start + 1)
+        media_type = _detect_mime(url, b"") if _detect_mime(url, b"") != "application/octet-stream" \
+            else _content_type_from_headers_or_url(url, cr_headers)
         return StreamingResponse(
             _slice_aiter(_aiter_cffi_content(cr), start, end),
             media_type=media_type, status_code=206, headers=out_headers)
 
-    # No range requested — straight passthrough stream.
+    # No usable range — straight passthrough stream as 200.
     if cl:
         out_headers["Content-Length"] = cl
-    return StreamingResponse(_aiter_cffi_content(cr), media_type=media_type,
+    media_type, body = await _sniff_stream(url, _aiter_cffi_content(cr))
+    return StreamingResponse(body, media_type=media_type,
                              status_code=200, headers=out_headers)
 
 
@@ -3388,30 +3419,28 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
         # httpx blocked (TLS fingerprint) — serve the segment via curl_cffi.
         return await _cffi_chunk_response(url, headers, impersonate, req_range)
 
-    # Some MP4 hosts ignore Range and answer 200 from byte 0. Keep seeking
-    # correct by slicing on the fly from the already-open streaming response —
-    # never buffer the whole file in memory (the old path did, which made every
-    # seek re-download the entire movie before the player got a byte).
+    # Some hosts ignore Range and answer 200 from byte 0. Only slice into a 206
+    # when we actually know the total size; otherwise (chunked, no
+    # Content-Length — the disguised .jpg/.ts segments) stream a clean 200.
     if requested and r.status_code == 200:
-        start, end = requested
         total_size = _response_content_length(r)
-        if end is None and total_size is not None:
-            end = total_size - 1
-        out_headers = {
-            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
-            "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes",
-            "X-Accel-Buffering": "no",
-            "Content-Range": (
-                f"bytes {start}-{'' if end is None else end}/"
-                f"{'*' if total_size is None else total_size}"),
-        }
-        if end is not None:
-            out_headers["Content-Length"] = str(end - start + 1)
-        media_type = _content_type_from_headers_or_url(url, r.headers)
-        return StreamingResponse(
-            _slice_aiter(_aiter_httpx_content(r), start, end),
-            media_type=media_type, status_code=206, headers=out_headers)
+        if total_size is not None:
+            start, end = requested
+            if end is None or end >= total_size:
+                end = total_size - 1
+            out_headers = {
+                "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+                "Access-Control-Allow-Origin": "*",
+                "Accept-Ranges": "bytes",
+                "X-Accel-Buffering": "no",
+                "Content-Range": f"bytes {start}-{end}/{total_size}",
+                "Content-Length": str(end - start + 1),
+            }
+            media_type = _content_type_from_headers_or_url(url, r.headers)
+            return StreamingResponse(
+                _slice_aiter(_aiter_httpx_content(r), start, end),
+                media_type=media_type, status_code=206, headers=out_headers)
+        # size unknown -> fall through and stream the whole segment as 200.
 
     total_size = _response_content_length(r)
     content_range = r.headers.get("content-range")
@@ -3438,9 +3467,9 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
             end = start + max(content_len - 1, 0)
         total = "*" if total_size is None else str(total_size)
         out_headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-    media_type = _content_type_from_headers_or_url(url, r.headers)
+    media_type, body = await _sniff_stream(url, _aiter_httpx_content(r))
     return StreamingResponse(
-        _aiter_httpx_content(r),
+        body,
         media_type=media_type,
         status_code=status_code,
         headers=out_headers,
