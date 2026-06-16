@@ -2,7 +2,7 @@
 RO-ANIME Backend v3
 """
 from __future__ import annotations
-import asyncio, base64, itertools, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
+import asyncio, base64, concurrent.futures, itertools, json, logging, os, re, time, sqlite3, hashlib, secrets, uuid, shutil
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
@@ -277,6 +277,15 @@ _stream_locks: dict[str, asyncio.Lock] = {}
 _proxy_locks: dict[str, asyncio.Lock] = {}
 _watch_locks: dict[str, asyncio.Lock] = {}
 _PROXY_CHUNK_SIZE = 512 * 1024
+
+# curl_cffi is a *blocking* (sync) library, so every call is dispatched to a
+# worker thread. Using asyncio's default executor (min(32, cpu+4) threads, and
+# shared with every other blocking call) meant that under load the per-segment
+# media fetches serialised on a handful of threads — the player would stall
+# waiting for a free worker. A dedicated, generously sized pool keeps concurrent
+# segment/seek fetches flowing.
+_CFFI_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=64, thread_name_prefix="cffi")
 
 def _keyed_lock(bucket: dict[str, asyncio.Lock], key: str) -> asyncio.Lock:
     lock = bucket.get(key)
@@ -661,7 +670,7 @@ async def _cffi_get(url: str, *, headers: dict | None = None, impersonate: str =
     exposes .status_code / .text / .content / .headers just like httpx."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None,
+        _CFFI_EXECUTOR,
         lambda: cffi_requests.get(
             url,
             headers=_httpx_safe_headers(headers) if headers else None,
@@ -716,6 +725,56 @@ async def _aiter_httpx_content(resp: httpx.Response, chunk_size: int = _PROXY_CH
                 yield chunk
     finally:
         await resp.aclose()
+
+
+async def _aiter_cffi_content(resp, chunk_size: int = _PROXY_CHUNK_SIZE):
+    """Bridge curl_cffi's *blocking* streaming response into an async generator.
+
+    Each pull of the next chunk runs on the dedicated cffi thread pool, so the
+    body is streamed to the client as it arrives instead of being fully
+    buffered in memory before the first byte is sent. This is what lets a
+    TLS-blocked CDN (mewstream / Moon) play without the per-segment download
+    stall the old full-fetch path caused."""
+    loop = asyncio.get_running_loop()
+    gen = resp.iter_content(chunk_size=chunk_size)
+
+    def _pull():
+        try:
+            return next(gen)
+        except StopIteration:
+            return None
+
+    try:
+        while True:
+            chunk = await loop.run_in_executor(_CFFI_EXECUTOR, _pull)
+            if chunk is None:
+                break
+            if chunk:
+                yield chunk
+    finally:
+        await loop.run_in_executor(_CFFI_EXECUTOR, resp.close)
+
+
+async def _slice_aiter(aiter, start: int, end: int | None):
+    """Yield only bytes [start, end] (inclusive) from an async byte iterator,
+    slicing on the fly. Used when an upstream ignores a Range request and
+    replies 200 from byte 0: we still stream — never hold the whole file in
+    memory — and stop as soon as the requested window is satisfied."""
+    pos = 0
+    async for chunk in aiter:
+        clen = len(chunk)
+        cstart, cend = pos, pos + clen
+        pos = cend
+        if cend <= start:
+            continue
+        if end is not None and cstart > end:
+            break
+        lo = max(start, cstart) - cstart
+        hi = clen if end is None else min(end + 1, cend) - cstart
+        if hi > lo:
+            yield chunk[lo:hi]
+        if end is not None and cend > end:
+            break
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -3239,39 +3298,72 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
 
 # --- chunk proxy ------------------------------------------------------------
 async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_range: str):
-    """Serve a media segment via curl_cffi (full fetch + local range slice) when
-    httpx is TLS-blocked. Segments are small, so a full fetch is fine."""
+    """Stream a media segment via curl_cffi when httpx is TLS-blocked.
+
+    The client's Range is forwarded upstream and the body is streamed straight
+    through, so the player receives first bytes immediately (and a seek only
+    pulls the requested window) instead of waiting for the whole segment/file
+    to download into the proxy's memory first."""
+    fetch_headers = {**headers}
+    if req_range:
+        fetch_headers["Range"] = req_range
     try:
-        cr = await _cffi_get(url, headers=headers, impersonate=impersonate, timeout=45)
+        cr = await _cffi_get(url, headers=fetch_headers, impersonate=impersonate,
+                             timeout=60, stream=True)
     except Exception as e:
         raise HTTPException(502, f"Upstream failed: {type(e).__name__}")
     if cr.status_code not in (200, 206):
+        try: cr.close()
+        except Exception: pass
         raise HTTPException(cr.status_code, f"CDN {cr.status_code}")
-    body = cr.content or b""
-    total_size = len(body)
-    if req_range:
-        parsed = _parse_single_range(req_range, total_size)
-        if parsed:
-            start, end = parsed
-            if start >= total_size:
-                raise HTTPException(416, "Range not satisfiable")
-            if end is None or end >= total_size:
-                end = total_size - 1
-            sliced = body[start:end + 1]
-            status_code, out_headers = _range_response_headers(
-                content_len=len(sliced), total_size=total_size, requested=(start, end),
-            )
-            return Response(content=sliced, media_type=_detect_mime(url, sliced),
-                            status_code=status_code, headers=out_headers)
-    return Response(
-        content=body, media_type=_detect_mime(url, body), status_code=200,
-        headers={
-            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
-            "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(total_size),
-        },
-    )
+
+    cr_headers = cr.headers
+    upstream_cr = cr_headers.get("content-range") or cr_headers.get("Content-Range")
+    cl = cr_headers.get("content-length") or cr_headers.get("Content-Length")
+    total_size = None
+    if upstream_cr:
+        m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", upstream_cr)
+        if m and m.group(1).isdigit():
+            total_size = int(m.group(1))
+
+    out_headers = {
+        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "bytes",
+        "X-Accel-Buffering": "no",
+    }
+    media_type = _content_type_from_headers_or_url(url, cr_headers)
+
+    # Upstream honoured the Range — pass the 206 straight through, streaming.
+    if cr.status_code == 206:
+        if upstream_cr:
+            out_headers["Content-Range"] = upstream_cr
+        if cl:
+            out_headers["Content-Length"] = cl
+        return StreamingResponse(_aiter_cffi_content(cr), media_type=media_type,
+                                 status_code=206, headers=out_headers)
+
+    # Upstream ignored the Range (200). If a window was requested, slice it on
+    # the fly while streaming so the whole file never lands in memory.
+    parsed = _parse_single_range(req_range, total_size) if req_range else None
+    if parsed:
+        start, end = parsed
+        if end is None and total_size is not None:
+            end = total_size - 1
+        out_headers["Content-Range"] = (
+            f"bytes {start}-{'' if end is None else end}/"
+            f"{'*' if total_size is None else total_size}")
+        if end is not None:
+            out_headers["Content-Length"] = str(end - start + 1)
+        return StreamingResponse(
+            _slice_aiter(_aiter_cffi_content(cr), start, end),
+            media_type=media_type, status_code=206, headers=out_headers)
+
+    # No range requested — straight passthrough stream.
+    if cl:
+        out_headers["Content-Length"] = cl
+    return StreamingResponse(_aiter_cffi_content(cr), media_type=media_type,
+                             status_code=200, headers=out_headers)
 
 
 @app.get("/proxy/chunk")
@@ -3296,37 +3388,30 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
         # httpx blocked (TLS fingerprint) — serve the segment via curl_cffi.
         return await _cffi_chunk_response(url, headers, impersonate, req_range)
 
-    # Some MP4 hosts ignore Range. Keep correctness for seeking by falling back
-    # to a bounded in-memory slice only in that rare case; all normal segment
-    # and range responses are streamed immediately.
+    # Some MP4 hosts ignore Range and answer 200 from byte 0. Keep seeking
+    # correct by slicing on the fly from the already-open streaming response —
+    # never buffer the whole file in memory (the old path did, which made every
+    # seek re-download the entire movie before the player got a byte).
     if requested and r.status_code == 200:
-        try: await r.aclose()
-        except Exception: pass
-        try:
-            full = await _http_get(url, headers=headers, client=_media_http, timeout=45)
-        except Exception:
-            raise HTTPException(502, "Upstream failed while applying range")
-        if full.status_code != 200:
-            raise HTTPException(full.status_code, f"CDN {full.status_code}")
-        body = full.content
-        if not body: raise HTTPException(502, "Empty body from upstream")
-        total_size = len(body)
-        parsed = _parse_single_range(req_range, total_size)
-        if not parsed:
-            raise HTTPException(416, "Invalid Range")
-        start, end = parsed
-        if start >= total_size:
-            raise HTTPException(416, "Range not satisfiable")
-        if end is None or end >= total_size:
+        start, end = requested
+        total_size = _response_content_length(r)
+        if end is None and total_size is not None:
             end = total_size - 1
-        body = body[start:end + 1]
-        status_code, out_headers = _range_response_headers(
-            content_len=len(body),
-            total_size=total_size,
-            requested=(start, end),
-        )
-        return Response(content=body, media_type=_detect_mime(url, body),
-                        status_code=status_code, headers=out_headers)
+        out_headers = {
+            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+            "X-Accel-Buffering": "no",
+            "Content-Range": (
+                f"bytes {start}-{'' if end is None else end}/"
+                f"{'*' if total_size is None else total_size}"),
+        }
+        if end is not None:
+            out_headers["Content-Length"] = str(end - start + 1)
+        media_type = _content_type_from_headers_or_url(url, r.headers)
+        return StreamingResponse(
+            _slice_aiter(_aiter_httpx_content(r), start, end),
+            media_type=media_type, status_code=206, headers=out_headers)
 
     total_size = _response_content_length(r)
     content_range = r.headers.get("content-range")
