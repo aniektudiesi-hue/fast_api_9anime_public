@@ -525,20 +525,27 @@ class MegaPlayScraper:
 # ---------------------------------------------------------------------------
 # M3U8 REWRITER
 # ---------------------------------------------------------------------------
-def _proxy_url(backend, cdn_url, route):
-    return f"{backend}{route}?src={quote(cdn_url, safe='')}"
+def _proxy_url(backend, cdn_url, route, extra: dict[str, str] | None = None):
+    url = f"{backend}{route}?src={quote(cdn_url, safe='')}"
+    if extra:
+        for key, value in extra.items():
+            if value:
+                url += f"&{quote(str(key), safe='')}={quote(str(value), safe='')}"
+    return url
 
 def _rewrite_attr_uri(line, base, backend, route):
     def _rep(m):
         return f'URI="{_proxy_url(backend, urljoin(base, m.group(1)), route)}"'
     return re.sub(r'URI="([^"]+)"', _rep, line)
 
-def rewrite_m3u8(text, original_url, backend):
+def rewrite_m3u8(text, original_url, backend, chunk_backend=None, chunk_mode="worker"):
+    chunk_backend = chunk_backend or backend
     base, out, next_is_pl = original_url, [], False
+    m3u8_extra = {"chunk_mode": chunk_mode} if chunk_mode else None
     for raw in text.splitlines():
         line = raw.rstrip("\r")
         if line.startswith("#EXT-X-KEY") or line.startswith("#EXT-X-MAP"):
-            out.append(_rewrite_attr_uri(line, base, backend, "/proxy/chunk")); continue
+            out.append(_rewrite_attr_uri(line, base, chunk_backend, "/proxy/chunk")); continue
         if line.startswith("#EXT-X-STREAM-INF") or line.startswith("#EXT-X-I-FRAME-STREAM-INF"):
             if "#EXT-X-I-FRAME-STREAM-INF" in line:
                 line = _rewrite_attr_uri(line, base, backend, "/proxy/m3u8")
@@ -546,8 +553,11 @@ def rewrite_m3u8(text, original_url, backend):
         if line.startswith("#") or not line.strip():
             out.append(line); continue
         absolute = urljoin(base, line)
-        route = "/proxy/m3u8" if next_is_pl else "/proxy/chunk"
-        out.append(_proxy_url(backend, absolute, route)); next_is_pl = False
+        if next_is_pl:
+            out.append(_proxy_url(backend, absolute, "/proxy/m3u8", m3u8_extra))
+        else:
+            out.append(_proxy_url(chunk_backend, absolute, "/proxy/chunk"))
+        next_is_pl = False
     return "\n".join(out) + "\n"
 
 def _detect_mime(url, body):
@@ -2945,12 +2955,22 @@ def _requires_backend_proxy(url: str) -> bool:
         "mewstream.buzz",
     ))
 
+def _is_mewstream_playlist(url: str) -> bool:
+    return "mewstream.buzz" in ((urlparse(url).hostname or "").lower())
+
 def _playlist_proxy_base(req: Request, upstream_url: str) -> str:
     # Moon's CDN rejects Cloudflare Worker fetches but accepts our backend proxy
     # with desktop Chrome-style request headers.
     if _requires_backend_proxy(upstream_url):
         return _backend_base(req)
     return _stream_proxy_base(req)
+
+def _chunk_proxy_base_for_playlist(req: Request, upstream_url: str, chunk_mode: str) -> str:
+    if chunk_mode == "render":
+        return _backend_base(req)
+    if _is_mewstream_playlist(upstream_url) and CLOUDFLARE_PROXY_BASE:
+        return _stream_proxy_base(req)
+    return _playlist_proxy_base(req, upstream_url)
 
 # --- root -------------------------------------------------------------------
 @app.get("/")
@@ -3258,7 +3278,16 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
     # the offloaded CF worker. _playlist_proxy_base() applies that rule.
     if data.m3u8_url:
         m3u8_backend = _playlist_proxy_base(request, data.m3u8_url)
-        result["m3u8_url"] = _proxy_url(m3u8_backend, data.m3u8_url, "/proxy/m3u8")
+        if _is_mewstream_playlist(data.m3u8_url):
+            fast_url = _proxy_url(m3u8_backend, data.m3u8_url, "/proxy/m3u8", {"chunk_mode": "worker"})
+            render_url = _proxy_url(_backend_base(request), data.m3u8_url, "/proxy/m3u8", {"chunk_mode": "render"})
+            result["m3u8_url"] = fast_url
+            result["fast_m3u8_url"] = fast_url
+            result["render_m3u8_url"] = render_url
+            result["fallback_m3u8_url"] = render_url
+            result["mewstream_chunk_mode"] = "worker"
+        else:
+            result["m3u8_url"] = _proxy_url(m3u8_backend, data.m3u8_url, "/proxy/m3u8")
     for sub in result["subtitles"]:
         if sub.get("file"):
             sub_backend = _playlist_proxy_base(request, sub["file"])
@@ -3267,11 +3296,13 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
 
 # --- m3u8 proxy -------------------------------------------------------------
 @app.get("/proxy/m3u8")
-async def proxy_m3u8(request: Request, src: str = Query(...)):
+async def proxy_m3u8(request: Request, src: str = Query(...), chunk_mode: str = Query("worker")):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
+    chunk_mode = "render" if str(chunk_mode).lower() == "render" else "worker"
     backend = _playlist_proxy_base(request, url)
-    cache_key = f"{backend}|{url}"
+    chunk_backend = _chunk_proxy_base_for_playlist(request, url, chunk_mode)
+    cache_key = f"{backend}|{chunk_backend}|{chunk_mode}|{url}"
     rewritten = _playlist_cache.get(cache_key)
     if rewritten is None:
         async with _keyed_lock(_proxy_locks, f"m3u8:{cache_key}"):
@@ -3288,7 +3319,7 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
                     r = await _cffi_get_mewstream_fallback(url, headers=headers, impersonate=impersonate, timeout=15)
                 if r.status_code != 200:
                     raise HTTPException(r.status_code, f"CDN {r.status_code}")
-                rewritten = rewrite_m3u8(r.text, url, backend)
+                rewritten = rewrite_m3u8(r.text, url, backend, chunk_backend, chunk_mode)
                 _playlist_cache[cache_key] = rewritten
     body, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),
@@ -3299,11 +3330,13 @@ async def proxy_m3u8(request: Request, src: str = Query(...)):
                     status_code=status_code, headers=out_headers)
 
 @app.head("/proxy/m3u8")
-async def proxy_m3u8_head(request: Request, src: str = Query(...)):
+async def proxy_m3u8_head(request: Request, src: str = Query(...), chunk_mode: str = Query("worker")):
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
+    chunk_mode = "render" if str(chunk_mode).lower() == "render" else "worker"
     backend = _playlist_proxy_base(request, url)
-    cache_key = f"{backend}|{url}"
+    chunk_backend = _chunk_proxy_base_for_playlist(request, url, chunk_mode)
+    cache_key = f"{backend}|{chunk_backend}|{chunk_mode}|{url}"
     rewritten = _playlist_cache.get(cache_key)
     if rewritten is None:
         headers, impersonate = _proxy_call_for(url)
@@ -3315,7 +3348,7 @@ async def proxy_m3u8_head(request: Request, src: str = Query(...)):
             r = await _cffi_get_mewstream_fallback(url, headers=headers, impersonate=impersonate, timeout=15)
         if r.status_code != 200:
             raise HTTPException(r.status_code, f"CDN {r.status_code}")
-        rewritten = rewrite_m3u8(r.text, url, backend)
+        rewritten = rewrite_m3u8(r.text, url, backend, chunk_backend, chunk_mode)
         _playlist_cache[cache_key] = rewritten
     _, status_code, out_headers = _apply_local_range(
         rewritten.encode("utf-8"),

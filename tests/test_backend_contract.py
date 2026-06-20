@@ -84,6 +84,46 @@ class BackendContractTests(unittest.TestCase):
         self.assertIn("Windows NT 10.0", headers["User-Agent"])
         self.assertEqual(impersonate, "chrome120")
 
+    def test_mewstream_playlist_can_route_chunks_to_worker(self):
+        playlist = "\n".join(
+            [
+                "#EXTM3U",
+                "#EXT-X-TARGETDURATION:10",
+                "#EXTINF:4.0,",
+                "https://q8jl.flarestorm.buzz/anime/example/seg-1.jpg",
+                "#EXTINF:4.0,",
+                "seg-2.html",
+            ]
+        )
+        render = "https://anime-search-api-burw.onrender.com"
+        worker = main.CLOUDFLARE_PROXY_BASE
+
+        rewritten = main.rewrite_m3u8(
+            playlist,
+            "https://cdn.mewstream.buzz/anime/example/index-f1-v1-a1.m3u8",
+            render,
+            worker,
+            "worker",
+        )
+
+        self.assertIn(f"{worker}/proxy/chunk?src=", rewritten)
+        self.assertNotIn(f"{render}/proxy/chunk?src=", rewritten)
+        self.assertIn("flarestorm.buzz", rewritten)
+
+    def test_mewstream_playlist_can_keep_chunks_on_render_fallback(self):
+        playlist = "#EXTM3U\n#EXTINF:4.0,\nseg-1.jpg\n"
+        render = "https://anime-search-api-burw.onrender.com"
+
+        rewritten = main.rewrite_m3u8(
+            playlist,
+            "https://cdn.mewstream.buzz/anime/example/index-f1-v1-a1.m3u8",
+            render,
+            render,
+            "render",
+        )
+
+        self.assertIn(f"{render}/proxy/chunk?src=", rewritten)
+
     def test_moon_endpoint_returns_worker_m3u8_without_network(self):
         mal_id = "900001"
         episode = "2"
@@ -99,7 +139,7 @@ class BackendContractTests(unittest.TestCase):
             self.assertEqual(slug, "classroom-of-the-elite-iv-episode-2")
             return {"moon": "https://bysesayeveum.com/e/fakeVideo_123"}
 
-        def fake_moon_fetch_playback_sync(video_id):
+        async def fake_moon_fetch_playback(video_id):
             self.assertEqual(video_id, "fakeVideo_123")
             return {
                 "video_id": video_id,
@@ -108,16 +148,16 @@ class BackendContractTests(unittest.TestCase):
 
         real_resolve = main._resolve_real_slug
         real_fetch_servers = main._fetch_watch_servers
-        real_fetch_playback = main._moon_fetch_playback_sync
+        real_fetch_playback = main._moon_fetch_playback
         main._resolve_real_slug = fake_resolve_real_slug
         main._fetch_watch_servers = fake_fetch_watch_servers
-        main._moon_fetch_playback_sync = fake_moon_fetch_playback_sync
+        main._moon_fetch_playback = fake_moon_fetch_playback
         try:
             response = self.client.get(f"/api/moon/{mal_id}/{episode}")
         finally:
             main._resolve_real_slug = real_resolve
             main._fetch_watch_servers = real_fetch_servers
-            main._moon_fetch_playback_sync = real_fetch_playback
+            main._moon_fetch_playback = real_fetch_playback
             main._anime_cache.pop(cache_key, None)
 
         self.assertEqual(response.status_code, 200)
@@ -126,11 +166,11 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(payload["video_id"], "fakeVideo_123")
         self.assertEqual(
             payload["url"],
-            f"{main.CLOUDFLARE_PROXY_BASE}/proxy/moon/fakeVideo_123/m3u8",
+            f"{main.CLOUDFLARE_PROXY_BASE}/proxy/moon/fakeVideo_123/m3u8?fast=1",
         )
         self.assertEqual(
             payload["subtitle_url"],
-            "https://398fitus.com/api/subtitle?id=fakeVideo_123",
+            "https://398fitus.com/api/videos/fakeVideo_123/embed/timeslider",
         )
 
 

@@ -3887,13 +3887,13 @@ document.addEventListener('mousemove', function(e) {
             return;
         }
 
-        _attachHLS(streamData.m3u8_url, title, ep, 'MegaPlay');
+        _attachHLS(streamData.m3u8_url, title, ep, 'MegaPlay', streamData);
     }
 
     // =========================================================================
     //  HLS ATTACH
     // =========================================================================
-    function _attachHLS(m3u8Url, title, ep, serverLabel = 'MegaPlay') {
+    function _attachHLS(m3u8Url, title, ep, serverLabel = 'MegaPlay', streamData = null, usedRenderFallback = false) {
         const badge = document.getElementById('streamStatusBadge');
         const video = document.getElementById('roVideoEl');
         const serverKey = _serverKeyFromLabel(serverLabel);
@@ -3939,6 +3939,19 @@ document.addEventListener('mousemove', function(e) {
                 if (d.fatal) {
                     if (currentServer !== serverKey) return;
                     const failedHls = hlsInstance;
+                    const fallbackUrl = streamData && (streamData.fallback_m3u8_url || streamData.render_m3u8_url);
+                    const canTryRenderFallback = serverLabel === 'MegaPlay'
+                        && !usedRenderFallback
+                        && fallbackUrl
+                        && fallbackUrl !== m3u8Url
+                        && d.type === Hls.ErrorTypes.NETWORK_ERROR;
+                    if (canTryRenderFallback && failedHls === hlsInstance) {
+                        try { failedHls.destroy(); } catch(e) {}
+                        badge.textContent = 'Switching stream route...';
+                        badge.className = 'stream-status loading';
+                        _attachHLS(fallbackUrl, title, ep, serverLabel, streamData, true);
+                        return;
+                    }
                     badge.textContent = '\u26a0 Stream error — try another episode';
                     badge.className   = 'stream-status error';
                     if (serverLabel === 'MegaPlay') {
