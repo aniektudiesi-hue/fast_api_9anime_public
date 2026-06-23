@@ -3275,6 +3275,7 @@ async def get_episodes(mal_id: str, hint: int = 0):
 async def get_stream(request: Request, mal_id: str, episode_num: str,
                      type: Literal["sub", "dub"] = "sub",
                      embed: bool = False):
+    _require_proxy_access(request)
     if embed:
         data = StreamData(
             m3u8_url="",
@@ -3648,7 +3649,8 @@ async def proxy_vtt_head(request: Request, src: str = Query(...)):
 
 # --- image proxy ------------------------------------------------------------
 @app.get("/proxy/img")
-async def proxy_img(src: str = Query(...)):
+async def proxy_img(request: Request, src: str = Query(...)):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     try:
@@ -4619,6 +4621,7 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
 # --- moon stream endpoint ---------------------------------------------------
 @app.get("/api/moon/{mal_id}/{episode_num}")
 async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
+    _require_proxy_access(request)
     ck = f"moon:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
@@ -4677,6 +4680,7 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
 # --- hd1 stream endpoint ----------------------------------------------------
 @app.get("/api/hd1/{mal_id}/{episode_num}")
 async def get_hd1_stream(mal_id: str, episode_num: str, request: Request):
+    _require_proxy_access(request)
     ck = f"hd1:{mal_id}:{episode_num}"
     cached = _anime_cache.get(ck)
     if cached:
