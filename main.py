@@ -35,6 +35,13 @@ VIDWISH_BASE  = settings.vidwish_base
 VIDWISH_SOURCES_EP = f"{VIDWISH_BASE}/stream/getSources"
 # Edge proxy base for HLS playlists, chunks, captions, and HD media.
 CLOUDFLARE_PROXY_BASE = settings.cloudflare_proxy_base
+TRUSTED_PROXY_HOSTS = {
+    "animetvplus.xyz",
+    "www.animetvplus.xyz",
+    "animetv-player.onrender.com",
+    "localhost",
+    "127.0.0.1",
+}
 IMPERSONATE   = "chrome131_android"
 ANDROID_UA    = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
@@ -574,6 +581,33 @@ def _is_valid_url(url):
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.hostname)
     except: return False
+
+def _trusted_proxy_host(hostname: str | None) -> bool:
+    host = (hostname or "").lower()
+    return host in TRUSTED_PROXY_HOSTS or host.endswith(".vercel.app")
+
+def _proxy_access_allowed(request: Request) -> bool:
+    accept = (request.headers.get("accept") or "").lower()
+    sec_fetch_dest = (request.headers.get("sec-fetch-dest") or "").lower()
+
+    if sec_fetch_dest == "document" or "text/html" in accept:
+        return False
+
+    for header_name in ("referer", "origin"):
+        value = request.headers.get(header_name)
+        if not value:
+            continue
+        try:
+            if _trusted_proxy_host(urlparse(value).hostname):
+                return True
+        except Exception:
+            return False
+
+    return False
+
+def _require_proxy_access(request: Request):
+    if not _proxy_access_allowed(request):
+        raise HTTPException(status_code=403, detail="Sorry, you are blocked.")
 
 def _response_content_length(resp) -> int | None:
     try:
@@ -3297,6 +3331,7 @@ async def get_stream(request: Request, mal_id: str, episode_num: str,
 # --- m3u8 proxy -------------------------------------------------------------
 @app.get("/proxy/m3u8")
 async def proxy_m3u8(request: Request, src: str = Query(...), chunk_mode: str = Query("worker")):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     chunk_mode = "render" if str(chunk_mode).lower() == "render" else "worker"
@@ -3331,6 +3366,7 @@ async def proxy_m3u8(request: Request, src: str = Query(...), chunk_mode: str = 
 
 @app.head("/proxy/m3u8")
 async def proxy_m3u8_head(request: Request, src: str = Query(...), chunk_mode: str = Query("worker")):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     chunk_mode = "render" if str(chunk_mode).lower() == "render" else "worker"
@@ -3432,6 +3468,7 @@ async def _cffi_chunk_response(url: str, headers: dict, impersonate: str, req_ra
 
 @app.get("/proxy/chunk")
 async def proxy_chunk(request: Request, src: str = Query(...)):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     headers, impersonate = _proxy_call_for(url)
@@ -3510,6 +3547,7 @@ async def proxy_chunk(request: Request, src: str = Query(...)):
 
 @app.head("/proxy/chunk")
 async def proxy_chunk_head(request: Request, src: str = Query(...)):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     headers, _ = _proxy_call_for(url)
@@ -3558,6 +3596,7 @@ async def proxy_chunk_head(request: Request, src: str = Query(...)):
 # --- vtt proxy --------------------------------------------------------------
 @app.get("/proxy/vtt")
 async def proxy_vtt(request: Request, src: str = Query(...)):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     text = _vtt_cache.get(url)
@@ -3586,6 +3625,7 @@ async def proxy_vtt(request: Request, src: str = Query(...)):
 
 @app.head("/proxy/vtt")
 async def proxy_vtt_head(request: Request, src: str = Query(...)):
+    _require_proxy_access(request)
     url = unquote(src)
     if not _is_valid_url(url): raise HTTPException(400, "Invalid src URL")
     text = _vtt_cache.get(url)
