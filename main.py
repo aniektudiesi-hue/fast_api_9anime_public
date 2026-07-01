@@ -1498,6 +1498,7 @@ def _db_migrate() -> None:
                 "banned_at": "INTEGER DEFAULT 0",
                 "banned_reason": "TEXT DEFAULT ''",
                 "mal_id": "TEXT",
+                "google_id": "TEXT",
             },
             "login_events": {
                 "country": "TEXT DEFAULT ''",
@@ -1518,6 +1519,7 @@ def _db_migrate() -> None:
             for name, definition in columns.items():
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mal_id ON users(mal_id) WHERE mal_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL")
         compact_history()
         conn.commit()
         conn.close()
@@ -1535,6 +1537,7 @@ def _db_migrate() -> None:
             "banned_at": "INTEGER DEFAULT 0",
             "banned_reason": "TEXT DEFAULT ''",
             "mal_id": "TEXT",
+            "google_id": "TEXT",
         },
         "login_events": {
             "country": "TEXT DEFAULT ''",
@@ -1555,6 +1558,7 @@ def _db_migrate() -> None:
         for name, definition in columns.items():
             ensure_column(table, name, definition)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mal_id ON users(mal_id) WHERE mal_id IS NOT NULL")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL")
     compact_history()
     conn.commit()
     conn.close()
@@ -1648,6 +1652,14 @@ def _find_user_by_mal_id(conn: _Conn, mal_id: str):
         """SELECT id, username, token, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason
            FROM users WHERE mal_id=?""",
         (str(mal_id),),
+    ).fetchone()
+
+
+def _find_user_by_google_id(conn: _Conn, google_id: str):
+    return conn.execute(
+        """SELECT id, username, token, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason
+           FROM users WHERE google_id=?""",
+        (str(google_id),),
     ).fetchone()
 
 
@@ -2085,6 +2097,50 @@ async def auth_mal_login(request: Request):
         _record_login_event(username, "mal_login_register", False, request)
         raise HTTPException(409, "Could not create account, please retry.")
     _record_login_event(username, "mal_login_register", True, request, _row_dict(row).get("id"))
+    return {"token": token, "username": username, "created": True}
+
+
+@app.post("/auth/google-login")
+async def auth_google_login(request: Request):
+    data = await request.json()
+    google_id = str(data.get("google_id") or "").strip()
+    google_username = _clean_username(data.get("google_username") or "")
+    if not google_id:
+        raise HTTPException(400, "google_id is required")
+
+    conn = _db()
+    row = _find_user_by_google_id(conn, google_id)
+    if row:
+        row = _row_dict(row)
+        if int(row.get("is_banned") or 0):
+            conn.close()
+            _record_login_event(row["username"], "google_login_banned", False, request, row["id"])
+            reason = f": {row.get('banned_reason')}" if row.get("banned_reason") else ""
+            raise HTTPException(403, f"Account banned{reason}")
+        conn.close()
+        _record_login_event(row["username"], "google_login", True, request, row["id"])
+        return {"token": row["token"], "username": row["username"], "created": False}
+
+    username = google_username if len(google_username) >= 3 else f"google_{google_id}"
+    base_username, suffix = username, 1
+    while _find_user_by_username(conn, username):
+        suffix += 1
+        username = f"{base_username}{suffix}"
+
+    token = secrets.token_hex(32)
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, token, google_id) VALUES (?,?,?,?)",
+            (username, _hash_pw(secrets.token_hex(16)), token, google_id),
+        )
+        row = _find_user_by_username(conn, username)
+        conn.commit()
+        conn.close()
+    except _INTEGRITY_ERRORS:
+        conn.close()
+        _record_login_event(username, "google_login_register", False, request)
+        raise HTTPException(409, "Could not create account, please retry.")
+    _record_login_event(username, "google_login_register", True, request, _row_dict(row).get("id"))
     return {"token": token, "username": username, "created": True}
 
 
