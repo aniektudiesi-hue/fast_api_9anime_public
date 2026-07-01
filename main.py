@@ -1497,6 +1497,7 @@ def _db_migrate() -> None:
                 "is_banned": "INTEGER DEFAULT 0",
                 "banned_at": "INTEGER DEFAULT 0",
                 "banned_reason": "TEXT DEFAULT ''",
+                "mal_id": "TEXT",
             },
             "login_events": {
                 "country": "TEXT DEFAULT ''",
@@ -1516,6 +1517,7 @@ def _db_migrate() -> None:
         }.items():
             for name, definition in columns.items():
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {definition}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mal_id ON users(mal_id) WHERE mal_id IS NOT NULL")
         compact_history()
         conn.commit()
         conn.close()
@@ -1532,6 +1534,7 @@ def _db_migrate() -> None:
             "is_banned": "INTEGER DEFAULT 0",
             "banned_at": "INTEGER DEFAULT 0",
             "banned_reason": "TEXT DEFAULT ''",
+            "mal_id": "TEXT",
         },
         "login_events": {
             "country": "TEXT DEFAULT ''",
@@ -1551,6 +1554,7 @@ def _db_migrate() -> None:
     }.items():
         for name, definition in columns.items():
             ensure_column(table, name, definition)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mal_id ON users(mal_id) WHERE mal_id IS NOT NULL")
     compact_history()
     conn.commit()
     conn.close()
@@ -1637,6 +1641,14 @@ def _find_users_by_username(conn: _Conn, username: str) -> list[dict]:
            LIMIT 5000"""
     ).fetchall()
     return [_row_dict(row) for row in rows if _username_key(row["username"]) == key]
+
+
+def _find_user_by_mal_id(conn: _Conn, mal_id: str):
+    return conn.execute(
+        """SELECT id, username, token, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason
+           FROM users WHERE mal_id=?""",
+        (str(mal_id),),
+    ).fetchone()
 
 
 def _legacy_username_seen(conn: _Conn, username: str) -> str:
@@ -2030,6 +2042,90 @@ async def auth_recover(request: Request):
 @app.get("/auth/me")
 async def auth_me(request: Request):
     return _get_current_user(request)
+
+
+@app.post("/auth/mal-login")
+async def auth_mal_login(request: Request):
+    data = await request.json()
+    mal_id = str(data.get("mal_id") or "").strip()
+    mal_username = _clean_username(data.get("mal_username") or "")
+    if not mal_id:
+        raise HTTPException(400, "mal_id is required")
+
+    conn = _db()
+    row = _find_user_by_mal_id(conn, mal_id)
+    if row:
+        row = _row_dict(row)
+        if int(row.get("is_banned") or 0):
+            conn.close()
+            _record_login_event(row["username"], "mal_login_banned", False, request, row["id"])
+            reason = f": {row.get('banned_reason')}" if row.get("banned_reason") else ""
+            raise HTTPException(403, f"Account banned{reason}")
+        conn.close()
+        _record_login_event(row["username"], "mal_login", True, request, row["id"])
+        return {"token": row["token"], "username": row["username"], "created": False}
+
+    username = mal_username if len(mal_username) >= 3 else f"mal_{mal_id}"
+    base_username, suffix = username, 1
+    while _find_user_by_username(conn, username):
+        suffix += 1
+        username = f"{base_username}{suffix}"
+
+    token = secrets.token_hex(32)
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, token, mal_id) VALUES (?,?,?,?)",
+            (username, _hash_pw(secrets.token_hex(16)), token, mal_id),
+        )
+        row = _find_user_by_username(conn, username)
+        conn.commit()
+        conn.close()
+    except _INTEGRITY_ERRORS:
+        conn.close()
+        _record_login_event(username, "mal_login_register", False, request)
+        raise HTTPException(409, "Could not create account, please retry.")
+    _record_login_event(username, "mal_login_register", True, request, _row_dict(row).get("id"))
+    return {"token": token, "username": username, "created": True}
+
+
+@app.post("/auth/update-username")
+async def auth_update_username(request: Request):
+    current = _get_current_user(request)
+    data = await request.json()
+    new_username = _clean_username(data.get("username") or "")
+    if len(new_username) < 3:
+        raise HTTPException(400, "Username must be at least 3 characters")
+
+    conn = _db()
+    existing = _find_user_by_username(conn, new_username)
+    if existing and _row_dict(existing)["id"] != current["id"]:
+        conn.close()
+        raise HTTPException(409, "Username already taken")
+    try:
+        conn.execute("UPDATE users SET username=? WHERE id=?", (new_username, current["id"]))
+        conn.commit()
+    except _INTEGRITY_ERRORS:
+        conn.close()
+        raise HTTPException(409, "Username already taken")
+    conn.close()
+    _record_login_event(new_username, "update_username", True, request, current["id"])
+    return {"username": new_username}
+
+
+@app.post("/auth/update-password")
+async def auth_update_password(request: Request):
+    current = _get_current_user(request)
+    data = await request.json()
+    new_password = (data.get("password") or "").strip()
+    if len(new_password) < 4:
+        raise HTTPException(400, "Password must be at least 4 characters")
+
+    conn = _db()
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_pw(new_password), current["id"]))
+    conn.commit()
+    conn.close()
+    _record_login_event(current["username"], "update_password", True, request, current["id"])
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
