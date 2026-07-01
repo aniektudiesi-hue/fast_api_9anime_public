@@ -1499,6 +1499,7 @@ def _db_migrate() -> None:
                 "banned_reason": "TEXT DEFAULT ''",
                 "mal_id": "TEXT",
                 "google_id": "TEXT",
+                "email": "TEXT DEFAULT ''",
             },
             "login_events": {
                 "country": "TEXT DEFAULT ''",
@@ -1538,6 +1539,7 @@ def _db_migrate() -> None:
             "banned_reason": "TEXT DEFAULT ''",
             "mal_id": "TEXT",
             "google_id": "TEXT",
+            "email": "TEXT DEFAULT ''",
         },
         "login_events": {
             "country": "TEXT DEFAULT ''",
@@ -1607,6 +1609,7 @@ def _find_user_by_username(conn: _Conn, username: str):
     username = _clean_username(username)
     return conn.execute(
         """SELECT u.id, u.username, u.password_hash, u.token, u.created_at,
+                  COALESCE(u.email,'') AS email,
                   COALESCE(u.is_banned,0) AS is_banned,
                   COALESCE(u.banned_reason,'') AS banned_reason,
                   (SELECT COUNT(*) FROM watch_history h WHERE h.user_id=u.id) AS history_count
@@ -1708,7 +1711,7 @@ def _get_current_user(request: Request) -> dict:
         raise HTTPException(401, "Not authenticated")
     conn = _db()
     row  = conn.execute(
-        "SELECT id, username, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason FROM users WHERE token=?",
+        "SELECT id, username, COALESCE(email,'') AS email, COALESCE(is_banned,0) AS is_banned, COALESCE(banned_reason,'') AS banned_reason FROM users WHERE token=?",
         (token,),
     ).fetchone()
     conn.close()
@@ -1717,7 +1720,7 @@ def _get_current_user(request: Request) -> dict:
     if int(row["is_banned"] or 0):
         reason = f": {row['banned_reason']}" if row["banned_reason"] else ""
         raise HTTPException(403, f"Account banned{reason}")
-    return {"id": row["id"], "username": row["username"]}
+    return {"id": row["id"], "username": row["username"], "email": row["email"] or None}
 
 
 _ADMIN_CACHE: dict[str, tuple[float, dict]] = {}
@@ -1942,6 +1945,9 @@ async def auth_register(request: Request):
     data = await request.json()
     username = _clean_username(data.get("username") or "")
     password = (data.get("password") or username).strip()
+    email = str(data.get("email") or "").strip()[:255]
+    if email and "@" not in email:
+        email = ""
     if len(username) < 3:
         _record_login_event(username, "register", False, request)
         raise HTTPException(400, "Username must be at least 3 characters")
@@ -1958,7 +1964,9 @@ async def auth_register(request: Request):
         if existing["password_hash"] == password_hash or existing["password_hash"] in legacy_hashes:
             if existing["password_hash"] != password_hash and len(password) >= 4:
                 conn.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, existing["id"]))
-                conn.commit()
+            if email and not existing.get("email"):
+                conn.execute("UPDATE users SET email=? WHERE id=?", (email, existing["id"]))
+            conn.commit()
             conn.close()
             _record_login_event(existing["username"], "register_existing_login", True, request, existing["id"])
             return {"token": existing["token"], "username": existing["username"], "existing": True}
@@ -1967,8 +1975,8 @@ async def auth_register(request: Request):
         raise HTTPException(409, "Username already exists. Login with the correct password.")
     try:
         conn.execute(
-            "INSERT INTO users (username, password_hash, token) VALUES (?,?,?)",
-            (username, _hash_pw(password), token)
+            "INSERT INTO users (username, password_hash, token, email) VALUES (?,?,?,?)",
+            (username, _hash_pw(password), token, email)
         )
         row = _find_user_by_username(conn, username)
         conn.commit()
