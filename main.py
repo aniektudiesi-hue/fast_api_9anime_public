@@ -38,6 +38,8 @@ CLOUDFLARE_PROXY_BASE = settings.cloudflare_proxy_base
 TRUSTED_PROXY_HOSTS = {
     "animetvplus.xyz",
     "www.animetvplus.xyz",
+    "animetvplus.com",
+    "www.animetvplus.com",
     "animetv-player.onrender.com",
     "localhost",
     "127.0.0.1",
