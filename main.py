@@ -1470,6 +1470,43 @@ def _db_init() -> None:
     """)
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_user_follows_follower ON user_follows(follower_id, created_at DESC);")
     conn.executescript("CREATE INDEX IF NOT EXISTS idx_user_follows_following ON user_follows(following_id, created_at DESC);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS episode_reactions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL REFERENCES users(id),
+        mal_id        TEXT    NOT NULL,
+        episode       INTEGER NOT NULL,
+        reaction      TEXT    NOT NULL,
+        created_at    INTEGER DEFAULT (strftime('%s','now')),
+        UNIQUE(user_id, mal_id, episode)
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_ep_reactions_target ON episode_reactions(mal_id, episode);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS episode_comments (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL REFERENCES users(id),
+        username      TEXT    NOT NULL,
+        mal_id        TEXT    NOT NULL,
+        episode       INTEGER NOT NULL,
+        parent_id     INTEGER,
+        text          TEXT    NOT NULL,
+        is_deleted    INTEGER DEFAULT 0,
+        created_at    INTEGER DEFAULT (strftime('%s','now'))
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_ep_comments_target ON episode_comments(mal_id, episode, created_at);")
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_ep_comments_parent ON episode_comments(parent_id);")
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS comment_likes (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL REFERENCES users(id),
+        comment_id    INTEGER NOT NULL REFERENCES episode_comments(id),
+        created_at    INTEGER DEFAULT (strftime('%s','now')),
+        UNIQUE(user_id, comment_id)
+    );
+    """)
+    conn.executescript("CREATE INDEX IF NOT EXISTS idx_comment_likes_comment ON comment_likes(comment_id);")
     conn.commit()
     conn.close()
 
@@ -2437,6 +2474,205 @@ async def chat_following(request: Request):
     ).fetchall()
     conn.close()
     return {"items": [_row_dict(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# EPISODE REACTIONS + COMMENTS (likes are public to read, auth to write)
+# ---------------------------------------------------------------------------
+def _get_optional_user(request: Request) -> dict | None:
+    if not request.headers.get("Authorization", ""):
+        return None
+    try:
+        return _get_current_user(request)
+    except HTTPException:
+        return None
+
+
+def _episode_reaction_summary(conn: _Conn, mal_id: str, episode: int, user_id: int | None) -> dict:
+    counts = _row_dict(conn.execute(
+        """SELECT COALESCE(SUM(CASE WHEN reaction='like' THEN 1 ELSE 0 END),0) AS likes,
+                  COALESCE(SUM(CASE WHEN reaction='dislike' THEN 1 ELSE 0 END),0) AS dislikes
+           FROM episode_reactions WHERE mal_id=? AND episode=?""",
+        (mal_id, episode),
+    ).fetchone())
+    my_reaction = None
+    if user_id:
+        mine = conn.execute(
+            "SELECT reaction FROM episode_reactions WHERE user_id=? AND mal_id=? AND episode=?",
+            (user_id, mal_id, episode),
+        ).fetchone()
+        if mine:
+            my_reaction = _row_dict(mine).get("reaction")
+    comments = _row_dict(conn.execute(
+        "SELECT COUNT(*) AS n FROM episode_comments WHERE mal_id=? AND episode=? AND COALESCE(is_deleted,0)=0",
+        (mal_id, episode),
+    ).fetchone())
+    return {
+        "likes": int(counts.get("likes") or 0),
+        "dislikes": int(counts.get("dislikes") or 0),
+        "comments": int(comments.get("n") or 0),
+        "my_reaction": my_reaction,
+    }
+
+
+@app.get("/episodes/{mal_id}/{episode}/reactions")
+async def episode_reactions_get(mal_id: str, episode: int, request: Request):
+    user = _get_optional_user(request)
+    conn = _db()
+    try:
+        return _episode_reaction_summary(conn, mal_id, episode, user["id"] if user else None)
+    finally:
+        conn.close()
+
+
+@app.post("/episodes/{mal_id}/{episode}/reactions")
+async def episode_reactions_set(mal_id: str, episode: int, request: Request):
+    user = _get_current_user(request)
+    data = await request.json()
+    action = str(data.get("action") or "").strip().lower()
+    if action not in {"like", "dislike", "none"}:
+        raise HTTPException(400, "action must be like, dislike or none")
+    conn = _db()
+    try:
+        if action == "none":
+            conn.execute(
+                "DELETE FROM episode_reactions WHERE user_id=? AND mal_id=? AND episode=?",
+                (user["id"], mal_id, episode),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO episode_reactions (user_id, mal_id, episode, reaction) VALUES (?,?,?,?)
+                   ON CONFLICT(user_id, mal_id, episode) DO UPDATE SET reaction=excluded.reaction""",
+                (user["id"], mal_id, episode, action),
+            )
+        conn.commit()
+        return _episode_reaction_summary(conn, mal_id, episode, user["id"])
+    finally:
+        conn.close()
+
+
+@app.get("/episodes/{mal_id}/{episode}/comments")
+async def episode_comments_list(mal_id: str, episode: int, request: Request, limit: int = Query(300, ge=1, le=500)):
+    user = _get_optional_user(request)
+    uid = user["id"] if user else 0
+    conn = _db()
+    rows = conn.execute(
+        """SELECT c.id, c.user_id, c.username, c.parent_id, c.text, c.created_at,
+                  COALESCE(c.is_deleted,0) AS is_deleted,
+                  (SELECT COUNT(*) FROM comment_likes l WHERE l.comment_id=c.id) AS likes,
+                  EXISTS(SELECT 1 FROM comment_likes l WHERE l.comment_id=c.id AND l.user_id=?) AS my_like
+           FROM episode_comments c
+           WHERE c.mal_id=? AND c.episode=?
+           ORDER BY c.created_at ASC, c.id ASC
+           LIMIT ?""",
+        (uid, mal_id, episode, limit),
+    ).fetchall()
+    conn.close()
+    items = []
+    for row in rows:
+        item = _row_dict(row)
+        item["likes"] = int(item.get("likes") or 0)
+        item["my_like"] = bool(item.get("my_like"))
+        if int(item.get("is_deleted") or 0):
+            # Keep deleted comments as placeholders so their replies stay attached.
+            item["text"] = ""
+            item["username"] = ""
+        items.append(item)
+    return {"items": items}
+
+
+@app.post("/episodes/{mal_id}/{episode}/comments")
+async def episode_comments_add(mal_id: str, episode: int, request: Request):
+    user = _get_current_user(request)
+    data = await request.json()
+    text = str(data.get("text") or "").strip()[:1000]
+    if not text:
+        raise HTTPException(400, "Comment text is required")
+    raw_parent = data.get("parent_id")
+    parent_id = int(raw_parent) if raw_parent else None
+    conn = _db()
+    try:
+        if parent_id:
+            parent = conn.execute(
+                "SELECT id FROM episode_comments WHERE id=? AND mal_id=? AND episode=?",
+                (parent_id, mal_id, episode),
+            ).fetchone()
+            if not parent:
+                raise HTTPException(404, "Parent comment not found")
+        conn.execute(
+            "INSERT INTO episode_comments (user_id, username, mal_id, episode, parent_id, text) VALUES (?,?,?,?,?,?)",
+            (user["id"], user["username"], mal_id, episode, parent_id, text),
+        )
+        conn.commit()
+        row = _row_dict(conn.execute(
+            """SELECT id, user_id, username, parent_id, text, created_at, COALESCE(is_deleted,0) AS is_deleted
+               FROM episode_comments WHERE user_id=? AND mal_id=? AND episode=?
+               ORDER BY id DESC LIMIT 1""",
+            (user["id"], mal_id, episode),
+        ).fetchone())
+        row["likes"] = 0
+        row["my_like"] = False
+        return {"ok": True, "comment": row}
+    finally:
+        conn.close()
+
+
+@app.delete("/episodes/comments/{comment_id}")
+async def episode_comments_delete(comment_id: int, request: Request):
+    user = _get_current_user(request)
+    conn = _db()
+    try:
+        row = conn.execute("SELECT id, user_id FROM episode_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Comment not found")
+        item = _row_dict(row)
+        is_admin = user["username"].strip().lower() in _ADMIN_USERNAMES
+        if int(item["user_id"]) != int(user["id"]) and not is_admin:
+            raise HTTPException(403, "You can only delete your own comments")
+        has_replies = conn.execute(
+            "SELECT 1 FROM episode_comments WHERE parent_id=? LIMIT 1", (comment_id,)
+        ).fetchone()
+        if has_replies:
+            # Soft-delete so the reply thread underneath survives.
+            conn.execute("UPDATE episode_comments SET is_deleted=1, text='' WHERE id=?", (comment_id,))
+        else:
+            conn.execute("DELETE FROM comment_likes WHERE comment_id=?", (comment_id,))
+            conn.execute("DELETE FROM episode_comments WHERE id=?", (comment_id,))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+@app.post("/episodes/comments/{comment_id}/like")
+async def episode_comments_like(comment_id: int, request: Request):
+    user = _get_current_user(request)
+    conn = _db()
+    try:
+        exists = conn.execute(
+            "SELECT id FROM episode_comments WHERE id=? AND COALESCE(is_deleted,0)=0", (comment_id,)
+        ).fetchone()
+        if not exists:
+            raise HTTPException(404, "Comment not found")
+        mine = conn.execute(
+            "SELECT id FROM comment_likes WHERE user_id=? AND comment_id=?", (user["id"], comment_id)
+        ).fetchone()
+        if mine:
+            conn.execute("DELETE FROM comment_likes WHERE user_id=? AND comment_id=?", (user["id"], comment_id))
+            my_like = False
+        else:
+            conn.execute(
+                "INSERT INTO comment_likes (user_id, comment_id) VALUES (?,?) ON CONFLICT(user_id, comment_id) DO NOTHING",
+                (user["id"], comment_id),
+            )
+            my_like = True
+        conn.commit()
+        likes = _row_dict(conn.execute(
+            "SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id=?", (comment_id,)
+        ).fetchone())
+        return {"ok": True, "likes": int(likes.get("n") or 0), "my_like": my_like}
+    finally:
+        conn.close()
 
 
 @app.websocket("/ws/chat/{room}")
