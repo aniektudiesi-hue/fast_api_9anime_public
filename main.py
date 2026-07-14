@@ -5031,7 +5031,7 @@ async def _moon_fetch_playback_get(video_id: str, host: str) -> dict | None:
     headers = {
         "Accept":       "application/json",
         "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
-        "Referer":      f"https://{host}/e/{video_id}",
+        "Referer":      "https://byse.sx",
     }
     try:
         resp = await _http_get(url, headers=headers, timeout=20)
