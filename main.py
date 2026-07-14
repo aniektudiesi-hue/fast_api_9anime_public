@@ -4951,7 +4951,7 @@ def _moon_selected_key_parts(playback: dict) -> list[str]:
 
 # Known Moon playback API hosts. A given video_id may only resolve on
 # whichever host actually issued its embed session, so we try each in turn.
-_MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("398fitus.com", "bysetayico.com")
+_MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("bysetayico.com", "398fitus.com")
 
 
 def _moon_decrypt_playback_block(pb: dict, video_id: str, subtitle_url: str) -> dict | None:
