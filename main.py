@@ -4954,7 +4954,31 @@ def _moon_selected_key_parts(playback: dict) -> list[str]:
 _MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("398fitus.com", "bysetayico.com")
 
 
-async def _moon_fetch_playback_from_host(video_id: str, host: str) -> dict | None:
+def _moon_decrypt_playback_block(pb: dict, video_id: str, subtitle_url: str) -> dict | None:
+    key_parts = _moon_selected_key_parts(pb)
+    if not key_parts:
+        return None
+    primary_key = b"".join([_b64url_decode(p) for p in key_parts])
+    keys: dict[str, bytes] = {"primary": primary_key}
+    for k, v in (pb.get("decrypt_keys") or {}).items():
+        keys[k] = _b64url_decode(v)
+    payload = pb.get("payload")
+    iv      = pb.get("iv")
+    if not payload or not iv:
+        return None
+    for _, key in keys.items():
+        raw = _decrypt_aes_gcm(payload, key, iv)
+        if raw:
+            dec      = json.loads(raw)
+            edge_url = _find_url(dec)
+            if edge_url:
+                return {"url": edge_url, "subtitle_url": subtitle_url,
+                        "video_id": video_id, "raw": dec}
+    return None
+
+
+async def _moon_fetch_playback_post(video_id: str, host: str) -> dict | None:
+    """398fitus.com-style: POST a fingerprint to /embed/playback."""
     url          = f"https://{host}/api/videos/{video_id}/embed/playback"
     subtitle_url = f"https://{host}/api/videos/{video_id}/embed/timeslider"
     headers = {
@@ -4986,46 +5010,54 @@ async def _moon_fetch_playback_from_host(video_id: str, host: str) -> dict | Non
             "device_id": uuid.uuid4().hex,
             "confidence": 1,
         }
-        resp = await _http_post(
-            url,
-            headers=headers,
-            json={"fingerprint": fingerprint},
-            timeout=20,
-        )
+        resp = await _http_post(url, headers=headers, json={"fingerprint": fingerprint}, timeout=20)
         if resp.status_code != 200:
             logger.warning("Moon playback HTTP %s (host=%s)", resp.status_code, host)
             return None
-        api  = resp.json()
-        pb   = api.get("playback", {})
-        key_parts = _moon_selected_key_parts(pb)
-        if not key_parts:
-            return None
-        primary_key = b"".join([_b64url_decode(p) for p in key_parts])
-        keys: dict[str, bytes] = {"primary": primary_key}
-        for k, v in (pb.get("decrypt_keys") or {}).items():
-            keys[k] = _b64url_decode(v)
-        payload = pb.get("payload")
-        iv      = pb.get("iv")
-        if not payload or not iv:
-            return None
-        for _, key in keys.items():
-            raw = _decrypt_aes_gcm(payload, key, iv)
-            if raw:
-                dec      = json.loads(raw)
-                edge_url = _find_url(dec)
-                if edge_url:
-                    return {"url": edge_url, "subtitle_url": subtitle_url,
-                            "video_id": video_id, "raw": dec}
-        logger.warning("Moon decryption exhausted all keys (host=%s)", host)
-        return None
+        pb = resp.json().get("playback", {})
+        result = _moon_decrypt_playback_block(pb, video_id, subtitle_url)
+        if not result:
+            logger.warning("Moon decryption exhausted all keys (host=%s)", host)
+        return result
     except Exception as e:
         logger.warning("Moon playback failed (host=%s): %s", host, e)
         return None
 
 
+async def _moon_fetch_playback_get(video_id: str, host: str) -> dict | None:
+    """bysetayico.com-style: plain GET /api/videos/{id} returns playback inline."""
+    url          = f"https://{host}/api/videos/{video_id}"
+    subtitle_url = f"https://{host}/api/videos/{video_id}/embed/timeslider"
+    headers = {
+        "Accept":       "application/json",
+        "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+        "Referer":      f"https://{host}/e/{video_id}",
+    }
+    try:
+        resp = await _http_get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            logger.warning("Moon playback HTTP %s (host=%s)", resp.status_code, host)
+            return None
+        pb = resp.json().get("playback", {})
+        result = _moon_decrypt_playback_block(pb, video_id, subtitle_url)
+        if not result:
+            logger.warning("Moon decryption exhausted all keys (host=%s)", host)
+        return result
+    except Exception as e:
+        logger.warning("Moon playback failed (host=%s): %s", host, e)
+        return None
+
+
+_MOON_HOST_FETCHERS: dict[str, "callable"] = {
+    "398fitus.com":   _moon_fetch_playback_post,
+    "bysetayico.com": _moon_fetch_playback_get,
+}
+
+
 async def _moon_fetch_playback(video_id: str) -> dict | None:
     for host in _MOON_PLAYBACK_HOSTS:
-        result = await _moon_fetch_playback_from_host(video_id, host)
+        fetcher = _MOON_HOST_FETCHERS[host]
+        result = await fetcher(video_id, host)
         if result:
             return result
     return None
