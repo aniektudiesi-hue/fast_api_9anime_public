@@ -191,6 +191,7 @@ _UPSTREAM_POLICY: tuple[tuple[str, str, str, str], ...] = (
     ("r66nv9ed.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
     ("sprintcdn",         "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
     ("bysesayeveum.com",  "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
+    ("bysetayico.com",    "https://bysetayico.com/", DESKTOP_UA, "chrome120"),
     ("398fitus.com",      "https://bysesayeveum.com/", DESKTOP_UA, "chrome120"),
     # HD / workers stack
     ("workers.dev",       "https://9animetv.org.lv/", DESKTOP_UA, "chrome120"),
@@ -5071,6 +5072,36 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
             "video_id":     video_id,
             "server":       "moon",
             "preload_url":  preload_url,
+        }
+        _anime_cache[ck] = response
+        return response
+
+# --- moon-by-code endpoint (raw video_id in, raw CDN m3u8_url out; no proxy
+# wrapping — skips slug/mal_id resolution entirely; use when you already have
+# the video_id from an iframe src like https://bysesayeveum.com/e/<video_id>)
+@app.get("/api/moon-code/{video_id}")
+async def get_moon_stream_by_code(video_id: str, request: Request):
+    _require_proxy_access(request)
+    ck = f"mooncode:{video_id}"
+    cached = _anime_cache.get(ck)
+    if cached:
+        return cached
+
+    async with _keyed_lock(_stream_locks, ck):
+        cached = _anime_cache.get(ck)
+        if cached:
+            return cached
+
+        playback = await _moon_fetch_playback(video_id)
+        if not playback or not playback.get("url"):
+            raise HTTPException(502, f"Moon: playback resolution failed for video_id={video_id}")
+
+        response = {
+            "url":          playback["url"],
+            "m3u8_url":     playback["url"],
+            "subtitle_url": playback.get("subtitle_url") or f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
+            "video_id":     video_id,
+            "server":       "moon",
         }
         _anime_cache[ck] = response
         return response
