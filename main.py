@@ -4949,9 +4949,14 @@ def _moon_selected_key_parts(playback: dict) -> list[str]:
                 return selected
     return parts
 
-async def _moon_fetch_playback(video_id: str) -> dict | None:
-    url          = f"https://398fitus.com/api/videos/{video_id}/embed/playback"
-    subtitle_url = f"https://398fitus.com/api/videos/{video_id}/embed/timeslider"
+# Known Moon playback API hosts. A given video_id may only resolve on
+# whichever host actually issued its embed session, so we try each in turn.
+_MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("398fitus.com", "bysetayico.com")
+
+
+async def _moon_fetch_playback_from_host(video_id: str, host: str) -> dict | None:
+    url          = f"https://{host}/api/videos/{video_id}/embed/playback"
+    subtitle_url = f"https://{host}/api/videos/{video_id}/embed/timeslider"
     headers = {
         "Accept":               "*/*",
         "Accept-Encoding":      "gzip, deflate, br, zstd",
@@ -4959,9 +4964,9 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
         "Connection":           "keep-alive",
         "Content-Type":         "application/json",
         "Cookie":               "byse_viewer_id=c009923f810d4c4b9d2999ca139a4; byse_device_id=Syp8ffvQ8KSxOf4ra-Wu2g",
-        "Host":                 "398fitus.com",
-        "Origin":               "https://398fitus.com",
-        "Referer":              f"https://398fitus.com/ed4/{video_id}",
+        "Host":                 host,
+        "Origin":               f"https://{host}",
+        "Referer":              f"https://{host}/ed4/{video_id}",
         "Sec-Fetch-Dest":       "empty",
         "Sec-Fetch-Mode":       "cors",
         "Sec-Fetch-Site":       "same-origin",
@@ -4988,7 +4993,7 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
             timeout=20,
         )
         if resp.status_code != 200:
-            logger.warning("Moon playback HTTP %s", resp.status_code)
+            logger.warning("Moon playback HTTP %s (host=%s)", resp.status_code, host)
             return None
         api  = resp.json()
         pb   = api.get("playback", {})
@@ -5011,11 +5016,19 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
                 if edge_url:
                     return {"url": edge_url, "subtitle_url": subtitle_url,
                             "video_id": video_id, "raw": dec}
-        logger.warning("Moon decryption exhausted all keys")
+        logger.warning("Moon decryption exhausted all keys (host=%s)", host)
         return None
     except Exception as e:
-        logger.warning("Moon playback failed: %s", e)
+        logger.warning("Moon playback failed (host=%s): %s", host, e)
         return None
+
+
+async def _moon_fetch_playback(video_id: str) -> dict | None:
+    for host in _MOON_PLAYBACK_HOSTS:
+        result = await _moon_fetch_playback_from_host(video_id, host)
+        if result:
+            return result
+    return None
 
 # --- moon stream endpoint ---------------------------------------------------
 @app.get("/api/moon/{mal_id}/{episode_num}")
@@ -5065,10 +5078,12 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
         response = {
             "url":          moon_url,
             "m3u8_url":     moon_url,
-            # Subtitle URL kept raw — its endpoint shape (398fitus timeslider) is
-            # already CORS-friendly for the browser; proxying it through /proxy/vtt
-            # would break the JSON-vs-VTT content type assumption.
-            "subtitle_url": f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
+            # Subtitle URL kept raw — its endpoint shape (398fitus/bysetayico
+            # timeslider) is already CORS-friendly for the browser; proxying
+            # it through /proxy/vtt would break the JSON-vs-VTT content type
+            # assumption. Falls back to the primary host if playback failed.
+            "subtitle_url": (playback or {}).get("subtitle_url")
+                or f"https://{_MOON_PLAYBACK_HOSTS[0]}/api/videos/{video_id}/embed/timeslider",
             "video_id":     video_id,
             "server":       "moon",
             "preload_url":  preload_url,
@@ -5099,7 +5114,8 @@ async def get_moon_stream_by_code(video_id: str, request: Request):
         response = {
             "url":          playback["url"],
             "m3u8_url":     playback["url"],
-            "subtitle_url": playback.get("subtitle_url") or f"https://398fitus.com/api/videos/{video_id}/embed/timeslider",
+            "subtitle_url": playback.get("subtitle_url")
+                or f"https://{_MOON_PLAYBACK_HOSTS[0]}/api/videos/{video_id}/embed/timeslider",
             "video_id":     video_id,
             "server":       "moon",
         }
