@@ -4951,7 +4951,7 @@ def _moon_selected_key_parts(playback: dict) -> list[str]:
 
 # Known Moon playback API hosts. A given video_id may only resolve on
 # whichever host actually issued its embed session, so we try each in turn.
-_MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("bysetayico.com", "398fitus.com")
+_MOON_PLAYBACK_HOSTS: tuple[str, ...] = ("bysetayico.com",)
 
 
 def _moon_decrypt_playback_block(pb: dict, video_id: str, subtitle_url: str) -> dict | None:
@@ -5062,6 +5062,43 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
             return result
     return None
 
+
+async def _warm_up_moon_url(url: str, attempts: int = 4, delay: float = 0.35) -> None:
+    """SprintCDN edge tokens can 404 for a brief window right after minting
+    (not yet propagated across edge nodes) — hls.js doesn't retry a failed
+    manifest fetch, so a client hitting that window gets stuck. Ping the URL
+    server-side with a short retry loop before handing it to the frontend."""
+    for attempt in range(attempts):
+        try:
+            r = await _http.get(url, timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0))
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay)
+
+
+async def _build_moon_response(video_id: str, playback: dict | None) -> dict:
+    """Hand the browser the raw SprintCDN URL directly rather than wrapping
+    it in the Cloudflare Worker proxy — the URL/token is bound to whichever
+    network requested it (this backend's), so a Worker fetch from Cloudflare's
+    own IP range won't match and the browser (same network as this backend)
+    needs to hit it directly instead."""
+    if not playback or not playback.get("url"):
+        raise HTTPException(502, f"Moon: playback resolution failed for video_id={video_id}")
+
+    await _warm_up_moon_url(playback["url"])
+
+    return {
+        "url":          playback["url"],
+        "m3u8_url":     playback["url"],
+        "subtitle_url": playback.get("subtitle_url")
+            or f"https://{_MOON_PLAYBACK_HOSTS[0]}/api/videos/{video_id}/embed/timeslider",
+        "video_id":     video_id,
+        "server":       "moon",
+    }
+
 # --- moon stream endpoint ---------------------------------------------------
 @app.get("/api/moon/{mal_id}/{episode_num}")
 async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
@@ -5089,43 +5126,14 @@ async def get_moon_stream(mal_id: str, episode_num: str, request: Request):
         if not video_id:
             raise HTTPException(502, f"Moon: could not parse video_id from {moon_iframe}")
 
-        backend = _stream_proxy_base(request)
-        seed_query = ""
         playback = await _moon_fetch_playback(video_id)
-        if playback and playback.get("url"):
-            # Resolve the encrypted playback payload once here, then seed the
-            # Worker so it only has to proxy/cache playlists and segments.
-            seed_query = f"&src={quote(str(playback['url']), safe='')}"
-        else:
-            logger.warning("Moon: playback seed unavailable for video_id=%s; Worker will resolve fallback", video_id)
-
-        moon_url = (
-            f"{backend}/proxy/moon/{quote(video_id, safe='')}/m3u8"
-            f"?fast=1{seed_query}"
-        )
-        preload_url = (
-            f"{backend}/proxy/moon/{quote(video_id, safe='')}/warm"
-            f"?segments=4{seed_query}"
-        )
-        response = {
-            "url":          moon_url,
-            "m3u8_url":     moon_url,
-            # Subtitle URL kept raw — its endpoint shape (398fitus/bysetayico
-            # timeslider) is already CORS-friendly for the browser; proxying
-            # it through /proxy/vtt would break the JSON-vs-VTT content type
-            # assumption. Falls back to the primary host if playback failed.
-            "subtitle_url": (playback or {}).get("subtitle_url")
-                or f"https://{_MOON_PLAYBACK_HOSTS[0]}/api/videos/{video_id}/embed/timeslider",
-            "video_id":     video_id,
-            "server":       "moon",
-            "preload_url":  preload_url,
-        }
+        response = await _build_moon_response(video_id, playback)
         _anime_cache[ck] = response
         return response
 
-# --- moon-by-code endpoint (raw video_id in, raw CDN m3u8_url out; no proxy
-# wrapping — skips slug/mal_id resolution entirely; use when you already have
-# the video_id from an iframe src like https://bysesayeveum.com/e/<video_id>)
+# --- moon-by-code endpoint (raw video_id in, raw CDN m3u8_url out — skips
+# slug/mal_id resolution entirely; use when you already have the video_id
+# from an iframe src like https://bysesayeveum.com/e/<video_id>)
 @app.get("/api/moon-code/{video_id}")
 async def get_moon_stream_by_code(video_id: str, request: Request):
     _require_proxy_access(request)
@@ -5140,17 +5148,7 @@ async def get_moon_stream_by_code(video_id: str, request: Request):
             return cached
 
         playback = await _moon_fetch_playback(video_id)
-        if not playback or not playback.get("url"):
-            raise HTTPException(502, f"Moon: playback resolution failed for video_id={video_id}")
-
-        response = {
-            "url":          playback["url"],
-            "m3u8_url":     playback["url"],
-            "subtitle_url": playback.get("subtitle_url")
-                or f"https://{_MOON_PLAYBACK_HOSTS[0]}/api/videos/{video_id}/embed/timeslider",
-            "video_id":     video_id,
-            "server":       "moon",
-        }
+        response = await _build_moon_response(video_id, playback)
         _anime_cache[ck] = response
         return response
 
