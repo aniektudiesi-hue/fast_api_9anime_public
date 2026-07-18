@@ -5063,32 +5063,18 @@ async def _moon_fetch_playback(video_id: str) -> dict | None:
     return None
 
 
-async def _warm_up_moon_url(url: str, attempts: int = 4, delay: float = 0.35) -> None:
-    """SprintCDN edge tokens can 404 for a brief window right after minting
-    (not yet propagated across edge nodes) — hls.js doesn't retry a failed
-    manifest fetch, so a client hitting that window gets stuck. Ping the URL
-    server-side with a short retry loop before handing it to the frontend."""
-    for attempt in range(attempts):
-        try:
-            r = await _http.get(url, timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0))
-            if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        if attempt < attempts - 1:
-            await asyncio.sleep(delay)
-
-
 async def _build_moon_response(video_id: str, playback: dict | None) -> dict:
     """Hand the browser the raw SprintCDN URL directly rather than wrapping
     it in the Cloudflare Worker proxy — the URL/token is bound to whichever
     network requested it (this backend's), so a Worker fetch from Cloudflare's
     own IP range won't match and the browser (same network as this backend)
-    needs to hit it directly instead."""
+    needs to hit it directly instead. No server-side warm-up here: the
+    earlier "404 in player" symptom turned out to be caused by the frontend's
+    crossorigin="anonymous" attribute forcing stricter CORS handling, not a
+    CDN propagation race — the raw URL plays cleanly on the first try once
+    that's removed, so the extra warm-up round trip was pure wasted latency."""
     if not playback or not playback.get("url"):
         raise HTTPException(502, f"Moon: playback resolution failed for video_id={video_id}")
-
-    await _warm_up_moon_url(playback["url"])
 
     return {
         "url":          playback["url"],
